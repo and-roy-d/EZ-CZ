@@ -1,0 +1,38 @@
+{
+  "measure": {
+    "fs": 250000.0,
+    "channel": 13,
+    "v_norm": 9.5,
+    "awg_rate": 5000000.0,
+    "f_low": 5.0,
+    "f0": 20.0,
+    "amp_mult": 0.04,
+    "vpp": 0.02,
+    "rs": 0.00025,
+    "l": 0.000001,
+    "trigger_awg": false,
+    "srs_url": "serial:///dev/ttyUSB1?baudrate=9600",
+    "srs_port": 2,
+    "keysight_url": "vxi11://192.168.0.112:2021",
+    "bias_dense": [0.5, 1.5, 0.01],
+    "bias_medium": [1.5, 5.0, 0.1],
+    "output_dir": null
+  },
+  "analyze": {
+    "raw_dir": "/data/20250807/Complex_Z/20250807_141314",
+    "iv_file": "20250807_150622_iv.npz",
+    "channel_id": 13,
+    "zero_bias_time_shift": -0.0270625,
+    "tc": 0.12,
+    "tbath": 0.02,
+    "n_thermal": 4.0,
+    "dummy_g_tes_b": 0.0000002,
+    "g_data_file": "/home/pcuser/Runs/Cooldown_A18/Results/G_parameter_summary.csv",
+    "pixel_map": [[13, 13]],
+    "rbias_iv": 2000.0,
+    "rshunt": 0.00025,
+    "l_nyq": 7.48e-08,
+    "output_base_dir": "/home/pcuser/Runs/Complex_Z/",
+    "save_plots": true
+  }
+}

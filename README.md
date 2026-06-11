@@ -27,6 +27,20 @@ This command automatically installs all dependencies, including external, non-Py
 
 ---
 
+## Configuration File (`run_settings.json`)
+
+Both CLI commands can load their default parameters from a single JSON settings file. By default, they will search for a file named `run_settings.json` in the directory where they are executed.
+
+To use a custom settings file, pass the `--config` (or `-cfg`) flag:
+```bash
+ez-cz-measure --config custom_settings.json
+ez-cz-analyze -cfg custom_settings.json
+```
+
+*Note: Command-line arguments always override values specified in the configuration file.*
+
+---
+
 ## Command Line Interface (CLI)
 
 The package registers two command-line scripts: `ez-cz-measure` and `ez-cz-analyze`.

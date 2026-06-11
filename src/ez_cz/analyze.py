@@ -10,6 +10,7 @@ from matplotlib.colors import Normalize
 from matplotlib.cm import coolwarm
 import re
 import sys
+import json
 import argparse
 import pandas as pd
 from lmfit import Model, Parameters
@@ -141,76 +142,112 @@ def parse_pixel_map(s):
         raise argparse.ArgumentTypeError("Pixel map item must be in format channel_id:pixel_number (e.g. 13:13)")
 
 
+def load_config_defaults(config_path="run_settings.json"):
+    try:
+        if Path(config_path).exists():
+            with open(config_path, "r") as f:
+                data = json.load(f)
+                return data.get("analyze", {})
+    except Exception as e:
+        print(f"Warning: Failed to load config file {config_path}: {e}")
+    return {}
+
+
 def main():
+    # Pass 1: Parse only the --config / -cfg argument
+    config_parser = argparse.ArgumentParser(add_help=False)
+    config_parser.add_argument(
+        "--config", "-cfg", type=str, default="run_settings.json",
+        help="Path to the JSON settings file."
+    )
+    config_args, remaining_argv = config_parser.parse_known_args()
+
+    # Load settings from file
+    file_settings = load_config_defaults(config_args.config)
+
+    # Pass 2: Define and parse all other arguments with defaults merged from file
     parser = argparse.ArgumentParser(
         description="Analyze complex impedance data and fit thermal parameters."
     )
+    # Re-add --config so it shows in help
     parser.add_argument(
-        "--raw-dir", "-d", type=str, default="/data/20250807/Complex_Z/20250807_141314",
-        help="Raw data directory containing bias_* folders."
+        "--config", "-cfg", type=str, default=config_args.config,
+        help="Path to the JSON settings file (default: run_settings.json)."
+    )
+
+    def get_default(key, fallback):
+        return file_settings.get(key, fallback)
+
+    # Process pixel_map format from json (list of lists to list of tuples)
+    json_pixel_map = get_default("pixel_map", [(13, 13)])
+    default_pixel_map = [tuple(item) if isinstance(item, list) else item for item in json_pixel_map]
+
+    parser.add_argument(
+        "--raw-dir", "-d", type=str, default=get_default("raw_dir", "/data/20250807/Complex_Z/20250807_141314"),
+        help="Raw data directory containing bias_* folders (default: %(default)s)."
     )
     parser.add_argument(
-        "--iv-file", "-i", type=str, default="20250807_150622_iv.npz",
-        help="IV curve npz filename."
+        "--iv-file", "-i", type=str, default=get_default("iv_file", "20250807_150622_iv.npz"),
+        help="IV curve npz filename (default: %(default)s)."
     )
     parser.add_argument(
-        "--channel-id", "-c", type=int, default=13,
-        help="Dastard channel ID to analyze (default: 13)."
+        "--channel-id", "-c", type=int, default=get_default("channel_id", 13),
+        help="Dastard channel ID to analyze (default: %(default)s)."
     )
     parser.add_argument(
-        "--zero-bias-time-shift", "-t", type=float, default=-2.70625e-2,
-        help="Superconducting time shift value in seconds (default: -2.70625e-2)."
+        "--zero-bias-time-shift", "-t", type=float, default=get_default("zero_bias_time_shift", -2.70625e-2),
+        help="Superconducting time shift value in seconds (default: %(default)s)."
     )
     parser.add_argument(
-        "--tc", type=float, default=120e-3,
-        help="Device Tc in Kelvin (default: 120e-3)."
+        "--tc", type=float, default=get_default("tc", 120e-3),
+        help="Device Tc in Kelvin (default: %(default)s)."
     )
     parser.add_argument(
-        "--tbath", type=float, default=20e-3,
-        help="Device Tbath in Kelvin (default: 20e-3)."
+        "--tbath", type=float, default=get_default("tbath", 20e-3),
+        help="Device Tbath in Kelvin (default: %(default)s)."
     )
     parser.add_argument(
-        "--n-thermal", type=float, default=4,
-        help="Thermal exponent n (default: 4)."
+        "--n-thermal", type=float, default=get_default("n_thermal", 4.0),
+        help="Thermal exponent n (default: %(default)s)."
     )
     parser.add_argument(
-        "--dummy-g-tes-b", type=float, default=200e-9,
-        help="Dummy g_tes_b value in W/K if CSV lookup is not available (default: 200e-9)."
+        "--dummy-g-tes-b", type=float, default=get_default("dummy_g_tes_b", 200e-9),
+        help="Dummy g_tes_b value in W/K if CSV lookup is not available (default: %(default)s)."
     )
     parser.add_argument(
-        "--g-data-file", type=str, default="/home/pcuser/Runs/Cooldown_A18/Results/G_parameter_summary.csv",
-        help="CSV file path containing precomputed G data."
+        "--g-data-file", type=str, default=get_default("g_data_file", "/home/pcuser/Runs/Cooldown_A18/Results/G_parameter_summary.csv"),
+        help="CSV file path containing precomputed G data (default: %(default)s)."
     )
     parser.add_argument(
-        "--pixel-map", nargs="+", type=parse_pixel_map, default=[(13, 13)],
-        help="List of channel_id:pixel_number mapping items (default: 13:13)."
+        "--pixel-map", nargs="+", type=parse_pixel_map, default=default_pixel_map,
+        help="List of channel_id:pixel_number mapping items (default: %(default)s)."
     )
     parser.add_argument(
-        "--rbias-iv", type=float, default=2000,
-        help="Rbias used during IV curve in Ohms (default: 2000)."
+        "--rbias-iv", type=float, default=get_default("rbias_iv", 2000.0),
+        help="Rbias used during IV curve in Ohms (default: %(default)s)."
     )
     parser.add_argument(
-        "--rshunt", type=float, default=250e-6,
-        help="Rshunt in Ohms (default: 250e-6)."
+        "--rshunt", type=float, default=get_default("rshunt", 250e-6),
+        help="Rshunt in Ohms (default: %(default)s)."
     )
     parser.add_argument(
-        "--l-nyq", type=float, default=74.8e-9,
-        help="Nyquist inductor L in Henries (default: 74.8e-9)."
+        "--l-nyq", type=float, default=get_default("l_nyq", 74.8e-9),
+        help="Nyquist inductor L in Henries (default: %(default)s)."
     )
     parser.add_argument(
-        "--output-base-dir", "-o", type=str, default="/home/pcuser/Runs/Complex_Z/",
-        help="Base directory to save output results and plots."
+        "--output-base-dir", "-o", type=str, default=get_default("output_base_dir", "/home/pcuser/Runs/Complex_Z/"),
+        help="Base directory to save output results and plots (default: %(default)s)."
     )
     parser.add_argument(
-        "--save-plots", action="store_true", default=True,
-        help="Save output plots and fit summary CSV files (default: True)."
+        "--save-plots", action="store_true", default=get_default("save_plots", True),
+        help="Save output plots and fit summary CSV files (default: %(default)s)."
     )
     parser.add_argument(
         "--no-save-plots", action="store_false", dest="save_plots",
         help="Do not save plots, only display them in GUI."
     )
 
-    args = parser.parse_args()
+    args = parser.parse_args(remaining_argv)
 
     # Paths setup and Windows fallbacks
     base_dir_raw = Path(args.raw_dir)

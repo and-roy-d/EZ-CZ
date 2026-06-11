@@ -6,9 +6,11 @@ from scipy.fft import rfft, rfftfreq
 from lmfit import Model, Parameters
 import os
 import sys
+import json
 import argparse
 from pathlib import Path
 from datetime import datetime
+
 
 import qsdumux
 import qsdumux.instruments.srs_sim900 as sim900
@@ -119,81 +121,113 @@ def save_all_data_npz(save_dir, bias_val, v_stim, data_all, N_samples, N_average
     print(f"Saved dataset: {full_path}")
 
 
+def load_config_defaults(config_path="run_settings.json"):
+    try:
+        if Path(config_path).exists():
+            with open(config_path, "r") as f:
+                data = json.load(f)
+                return data.get("measure", {})
+    except Exception as e:
+        print(f"Warning: Failed to load config file {config_path}: {e}")
+    return {}
+
+
 def parse_args():
+    # Pass 1: Parse only the --config / -cfg argument
+    config_parser = argparse.ArgumentParser(add_help=False)
+    config_parser.add_argument(
+        "--config", "-cfg", type=str, default="run_settings.json",
+        help="Path to the JSON settings file."
+    )
+    config_args, remaining_argv = config_parser.parse_known_args()
+
+    # Load settings from file
+    file_settings = load_config_defaults(config_args.config)
+
+    # Pass 2: Define and parse all other arguments with defaults merged from file
     parser = argparse.ArgumentParser(
         description="Run Complex Impedance (EZ-CZ) measurements on a TES device."
     )
+    # Re-add --config so it shows in help
     parser.add_argument(
-        "--fs", type=float, default=250e3,
-        help="Global digitization sample rate in Hz (default: 250e3)."
+        "--config", "-cfg", type=str, default=config_args.config,
+        help="Path to the JSON settings file (default: run_settings.json)."
+    )
+
+    def get_default(key, fallback):
+        return file_settings.get(key, fallback)
+
+    parser.add_argument(
+        "--fs", type=float, default=get_default("fs", 250e3),
+        help="Global digitization sample rate in Hz (default: %(default)s)."
     )
     parser.add_argument(
-        "--channel", "-c", type=int, default=13,
-        help="Dastard channel ID to read data from (default: 13)."
+        "--channel", "-c", type=int, default=get_default("channel", 13),
+        help="Dastard channel ID to read data from (default: %(default)s)."
     )
     parser.add_argument(
-        "--v-norm", type=float, default=9.5,
-        help="Bias normalization voltage in Volts (default: 9.5)."
+        "--v-norm", type=float, default=get_default("v_norm", 9.5),
+        help="Bias normalization voltage in Volts (default: %(default)s)."
     )
     parser.add_argument(
-        "--awg-rate", type=float, default=5e6,
-        help="AWG sample rate in Hz (default: 5e6)."
+        "--awg-rate", type=float, default=get_default("awg_rate", 5e6),
+        help="AWG sample rate in Hz (default: %(default)s)."
     )
     parser.add_argument(
-        "--f-low", type=float, default=5,
-        help="Low frequency tone in Hz (default: 5)."
+        "--f-low", type=float, default=get_default("f_low", 5.0),
+        help="Low frequency tone in Hz (default: %(default)s)."
     )
     parser.add_argument(
-        "--f0", type=float, default=20.0,
-        help="Base frequency multiplier in Hz (default: 20.0)."
+        "--f0", type=float, default=get_default("f0", 20.0),
+        help="Base frequency multiplier in Hz (default: %(default)s)."
     )
     parser.add_argument(
-        "--amp-mult", type=float, default=0.04,
-        help="Amplitude multiplier per sine tone (default: 0.04)."
+        "--amp-mult", type=float, default=get_default("amp_mult", 0.04),
+        help="Amplitude multiplier per sine tone (default: %(default)s)."
     )
     parser.add_argument(
-        "--vpp", type=float, default=0.02,
-        help="Final AWG amplitude in Vpp (default: 0.02)."
+        "--vpp", type=float, default=get_default("vpp", 0.02),
+        help="Final AWG amplitude in Vpp (default: %(default)s)."
     )
     parser.add_argument(
-        "--rs", type=float, default=250e-6,
-        help="Shunt resistance Rs in Ohms (default: 250e-6)."
+        "--rs", type=float, default=get_default("rs", 250e-6),
+        help="Shunt resistance Rs in Ohms (default: %(default)s)."
     )
     parser.add_argument(
-        "--l", type=float, default=1000e-9,
-        help="Nyquist inductor L in Henries (default: 1000e-9)."
+        "--l", type=float, default=get_default("l", 1000e-9),
+        help="Nyquist inductor L in Henries (default: %(default)s)."
     )
     parser.add_argument(
-        "--trigger-awg", action="store_true", default=False,
-        help="Connect to Keysight AWG and send waveform (default: False)."
+        "--trigger-awg", action="store_true", default=get_default("trigger_awg", False),
+        help="Connect to Keysight AWG and send waveform (default: %(default)s)."
     )
     parser.add_argument(
-        "--srs-url", type=str, default="serial:///dev/ttyUSB1?baudrate=9600",
-        help="SRS SIM900 mainframe connection string."
+        "--srs-url", type=str, default=get_default("srs_url", "serial:///dev/ttyUSB1?baudrate=9600"),
+        help="SRS SIM900 mainframe connection string (default: %(default)s)."
     )
     parser.add_argument(
-        "--srs-port", type=int, default=2,
-        help="SRS SIM928 card port slot (default: 2)."
+        "--srs-port", type=int, default=get_default("srs_port", 2),
+        help="SRS SIM928 card port slot (default: %(default)s)."
     )
     parser.add_argument(
-        "--keysight-url", type=str, default="vxi11://192.168.0.112:2021",
-        help="Keysight function generator connection URL."
+        "--keysight-url", type=str, default=get_default("keysight_url", "vxi11://192.168.0.112:2021"),
+        help="Keysight function generator connection URL (default: %(default)s)."
     )
     parser.add_argument(
         "--bias-dense", nargs=3, type=float, metavar=("START", "STOP", "STEP"),
-        default=[0.5, 1.5, 0.01],
-        help="Dense bias values configuration (default: 0.5 1.5 0.01)."
+        default=get_default("bias_dense", [0.5, 1.5, 0.01]),
+        help="Dense bias values configuration (default: %(default)s)."
     )
     parser.add_argument(
         "--bias-medium", nargs=3, type=float, metavar=("START", "STOP", "STEP"),
-        default=[1.5, 5.0, 0.1],
-        help="Medium bias values configuration (default: 1.5 5.0 0.1)."
+        default=get_default("bias_medium", [1.5, 5.0, 0.1]),
+        help="Medium bias values configuration (default: %(default)s)."
     )
     parser.add_argument(
-        "--output-dir", type=str, default=None,
-        help="Directory path to save the npz files and plots."
+        "--output-dir", type=str, default=get_default("output_dir", None),
+        help="Directory path to save the npz files and plots (default: %(default)s)."
     )
-    return parser.parse_args()
+    return parser.parse_args(remaining_argv)
 
 
 def main():
