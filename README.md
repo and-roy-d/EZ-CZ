@@ -55,8 +55,8 @@ ez-cz-measure --channel 13 --fs 250000 --trigger-awg
 * `--fs`: Digitization sample rate in Hz (default: `250000`).
 * `--channel` / `-c`: Dastard channel ID to read data from (default: `13`).
 * `--v-norm`: Bias normalization voltage in Volts (default: `9.5`).
-* `--rs`: Shunt resistance $R_s$ in Ohms (default: `250e-6`).
-* `--l`: Nyquist inductor $L$ in Henries (default: `1000e-9`).
+* `--rs-uohm`: Shunt resistance $R_s$ in micro-Ohms (default: `250.0`).
+* `--l-nh`: Nyquist inductor $L$ in nano-Henries (default: `1000.0`).
 * `--trigger-awg`: Connect to the Keysight AWG and load the waveforms (default: `False`).
 * `--srs-url`: SRS SIM900 mainframe serial connection string (default: `"serial:///dev/ttyUSB1?baudrate=9600"`).
 * `--keysight-url`: Keysight function generator connection URL (default: `"vxi11://192.168.0.112:2021"`).
@@ -81,6 +81,8 @@ ez-cz-analyze --channel-id 13 --raw-dir ./data/20250807/Complex_Z/20250807_14131
 * `--g-data-file`: CSV file path containing precomputed G data (default: `/home/pcuser/Runs/Cooldown_A18/Results/G_parameter_summary.csv`).
 * `--dummy-g-tes-b`: Fallback $g_{tes,b}$ in W/K if G CSV is not found or mapping is missing (default: `200e-9`).
 * `--pixel-map`: Space-separated list of `channel_id:pixel_number` mappings (default: `13:13`).
+* `--rshunt-uohm`: Shunt resistance $R_{shunt}$ in micro-Ohms (default: `250.0`).
+* `--l-nyq-nh`: Nyquist inductor $L_{nyq}$ in nano-Henries (default: `74.8`).
 * `--output-base-dir` / `-o`: Directory to save plots and CSV parameter tables.
 * `--no-save-plots`: Do not save plot files on disk (only displays them on screen).
 

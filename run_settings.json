@@ -8,8 +8,8 @@
     "f0": 20.0,
     "amp_mult": 0.04,
     "vpp": 0.02,
-    "rs": 0.00025,
-    "l": 0.000001,
+    "rs_uOhm": 250.0,
+    "l_nH": 1000.0,
     "trigger_awg": false,
     "srs_url": "serial:///dev/ttyUSB1?baudrate=9600",
     "srs_port": 2,
@@ -30,8 +30,8 @@
     "g_data_file": "/home/pcuser/Runs/Cooldown_A18/Results/G_parameter_summary.csv",
     "pixel_map": [[13, 13]],
     "rbias_iv": 2000.0,
-    "rshunt": 0.00025,
-    "l_nyq": 7.48e-08,
+    "rshunt_uOhm": 250.0,
+    "l_nyq_nH": 74.8,
     "output_base_dir": "/home/pcuser/Runs/Complex_Z/",
     "save_plots": true
   }

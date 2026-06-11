@@ -227,12 +227,12 @@ def main():
         help="Rbias used during IV curve in Ohms (default: %(default)s)."
     )
     parser.add_argument(
-        "--rshunt", type=float, default=get_default("rshunt", 250e-6),
-        help="Rshunt in Ohms (default: %(default)s)."
+        "--rshunt-uohm", type=float, default=get_default("rshunt_uOhm", 250.0),
+        help="Rshunt in micro-Ohms (default: %(default)s)."
     )
     parser.add_argument(
-        "--l-nyq", type=float, default=get_default("l_nyq", 74.8e-9),
-        help="Nyquist inductor L in Henries (default: %(default)s)."
+        "--l-nyq-nh", type=float, default=get_default("l_nyq_nH", 74.8),
+        help="Nyquist inductor L in nano-Henries (default: %(default)s)."
     )
     parser.add_argument(
         "--output-base-dir", "-o", type=str, default=get_default("output_base_dir", "/home/pcuser/Runs/Complex_Z/"),
@@ -334,7 +334,7 @@ def main():
         print(f"IV-Curve Loaded for Ch {CHANNEL_ID} from: {iv_path}")
 
         ibias_iv_full = convert_vbias_to_ibias(vbias_iv_full, args.rbias_iv)
-        rtes_iv_full = Rtes(ibias_iv_full, ites_iv_full, Rshunt=args.rshunt)
+        rtes_iv_full = Rtes(ibias_iv_full, ites_iv_full, Rshunt=args.rshunt_uohm * 1e-6)
 
         Rnormal, stop_bias_val = None, None
         positive_rtes_indices = np.where((rtes_iv_full > 50e-6) & np.isfinite(rtes_iv_full))[0]
@@ -460,7 +460,7 @@ def main():
                 else:
                     I_bias_fft_component = raw_fft_shifted[f_idx]
                     I_0_ref_fft_component = zero_bias_freq_currents.get(stim_freq)
-                    Z_shunt_L_circuit = 1j * 2 * np.pi * stim_freq * args.l_nyq + args.rshunt
+                    Z_shunt_L_circuit = 1j * 2 * np.pi * stim_freq * (args.l_nyq_nh * 1e-9) + (args.rshunt_uohm * 1e-6)
                     if I_0_ref_fft_component is None or np.abs(I_0_ref_fft_component) < 1e-15:
                         Z_tes_calculated = np.nan + 1j * np.nan
                     else:

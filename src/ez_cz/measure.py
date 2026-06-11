@@ -190,12 +190,12 @@ def parse_args():
         help="Final AWG amplitude in Vpp (default: %(default)s)."
     )
     parser.add_argument(
-        "--rs", type=float, default=get_default("rs", 250e-6),
-        help="Shunt resistance Rs in Ohms (default: %(default)s)."
+        "--rs-uohm", type=float, default=get_default("rs_uOhm", 250.0),
+        help="Shunt resistance Rs in micro-Ohms (default: %(default)s)."
     )
     parser.add_argument(
-        "--l", type=float, default=get_default("l", 1000e-9),
-        help="Nyquist inductor L in Henries (default: %(default)s)."
+        "--l-nh", type=float, default=get_default("l_nH", 1000.0),
+        help="Nyquist inductor L in nano-Henries (default: %(default)s)."
     )
     parser.add_argument(
         "--trigger-awg", action="store_true", default=get_default("trigger_awg", False),
@@ -318,8 +318,8 @@ def main():
 
         # Circuit model (unbiased response)
         omega_fft_model = 2 * np.pi * fs_sch
-        Z_L = 1j * omega_fft_model * args.l
-        Z_model = args.rs / (args.rs + Z_L) * 9.6e6
+        Z_L = 1j * omega_fft_model * (args.l_nh * 1e-9)
+        Z_model = (args.rs_uohm * 1e-6) / ((args.rs_uohm * 1e-6) + Z_L) * 9.6e6
 
         if idx == 0:
             def real_model(fs, tau_shift):
