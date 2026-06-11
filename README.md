@@ -23,7 +23,19 @@ uv venv
 # Install the package in editable mode
 uv pip install -e .
 ```
-This command automatically installs all dependencies, including external, non-PyPI dependencies like `qsdumux` and `dastardcommander` directly from the official NIST repositories on GitHub.
+This command automatically installs all dependencies.
+
+### Alternative: Running without Installation
+If you prefer not to install the package, you can run the source scripts directly using standard Python (provided you have the dependencies like `numpy`, `scipy`, `matplotlib`, `lmfit`, and `pandas` installed in your environment):
+
+```bash
+# Run measurements directly
+python src/ez_cz/measure.py --channel 13
+
+# Run analysis directly
+python src/ez_cz/analyze.py -c 13
+```
+In this direct mode, the scripts will still automatically check for the `run_settings.json` file in the directory where they are run.
 
 ---
 
