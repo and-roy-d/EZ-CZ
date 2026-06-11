@@ -100,6 +100,30 @@ ez-cz-analyze --channel-id 13 --raw-dir ./data/20250807/Complex_Z/20250807_14131
 
 ---
 
+## Graphical User Interface (GUI)
+
+The package includes a lightweight, real-time GUI built using `tkinter` and `matplotlib`. It allows you to configure measurement settings, trigger sweeps, and visualize results dynamically.
+
+### Running the GUI
+
+If the package is installed:
+```bash
+ez-cz-gui
+```
+
+Alternatively, you can run the GUI script directly without installation:
+```bash
+python src/ez_cz/gui.py
+```
+
+### Features
+* **Interactive Control Board**: Customize channel ID, sample rate, shunt resistance, Nyquist inductor, bias range (dense and medium sweeps), and AWG URL.
+* **Save Default Settings**: Save your current inputs to the local `run_settings.json` file.
+* **Dry Run / Simulation Mode**: Test and verify the GUI offline. It synthesizes signals using realistic TES models when laboratory instruments are not present.
+* **4-Panel Real-time Plotting**: Shows the Real/Imaginary, Nyquist, Magnitude, and Phase response curves updating live at each bias step.
+
+---
+
 ## Customizing inside Python scripts
 You can also import modules directly in Python:
 ```python

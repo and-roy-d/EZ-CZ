@@ -18,6 +18,7 @@ dependencies = [
 [project.scripts]
 ez-cz-measure = "ez_cz.measure:main"
 ez-cz-analyze = "ez_cz.analyze:main"
+ez-cz-gui = "ez_cz.gui:main"
 
 [build-system]
 requires = ["hatchling"]
