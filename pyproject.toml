@@ -1,0 +1,25 @@
+[project]
+name = "ez-cz"
+version = "0.1.0"
+description = "A standalone package for complex impedance measurement and analysis of TES devices."
+readme = "README.md"
+requires-python = ">=3.9"
+authors = [
+    { name = "NIST Quantum Sensors" }
+]
+dependencies = [
+    "numpy",
+    "scipy",
+    "matplotlib",
+    "lmfit",
+    "pandas",
+]
+
+[project.scripts]
+ez-cz-measure = "ez_cz.measure:main"
+ez-cz-analyze = "ez_cz.analyze:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
