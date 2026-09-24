@@ -1,731 +1,1948 @@
-import tkinter as tk
-from tkinter import messagebox
-from tkinter import ttk
-import queue
-import threading
-import json
+#!/usr/bin/env python3
+"""
+gui.py: EZ-CZ Dashboard for Complex Impedance (CZ) Measurement.
+
+Features:
+  - Selectable DC Bias Source via rolldown menu:
+      * "DC source: AWG" (Default): Direct DC offset on Keysight 33600A AWG Ch2 (from cztest4 / cz_test_AWG-DC).
+      * "DC source: SRS900": External SRS SIM900/SIM928 DC voltage box (from cztest3 / cz_test_SRS900-DC).
+  - Derived timing strictly from time_per_flux_ramp (eliminates arbitrary magic numbers).
+  - Background execution via QThread with non-blocking UI.
+  - Automatic Superconducting (0V) Transfer Function Health Check & Abort:
+      * Fits single-pole L/Rs model: |Z(f)| = amp0 / sqrt(1 + (f / f_roll)^2)
+      * Fits phase/cable delay tau_shift
+      * Computes R^2 goodness of fit
+      * Evaluates f_roll physical limits (10 Hz - 25 kHz)
+      * Immediate abort if transfer function is bad or corrupted
+      * Optional user pause after 0V calibration for manual visual inspection
+  - Live 4-panel Matplotlib display:
+      1. Real & Imaginary vs Frequency (semilog-x)
+      2. Nyquist Plot (Imag vs Real)
+      3. Magnitude Response (log-log) + Model Fit
+      4. Phase Response (semilog-x) + Model Fit
+  - Dedicated instant ABORT button that safely zeroes voltages on AWG and SRS900.
+  - Simulation / Dry Run mode for verification and testing without hardware.
+"""
+
+import sys
+import os
 import time
+import json
+import argparse
 from datetime import datetime
 from pathlib import Path
 import numpy as np
 import scipy.fft
-import matplotlib.pyplot as plt
-from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from lmfit import Model, Parameters
 
-# Optional imports for hardware control
+from PyQt5 import QtWidgets, QtCore, QtGui
+from PyQt5.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+    QGridLayout, QGroupBox, QLabel, QLineEdit, QPushButton, QTextEdit,
+    QCheckBox, QMessageBox, QComboBox, QDoubleSpinBox, QSpinBox, QSplitter,
+    QProgressBar, QTabWidget, QTableWidget, QTableWidgetItem, QHeaderView,
+    QFileDialog
+)
+from PyQt5.QtCore import Qt, QThread, pyqtSignal, pyqtSlot
+from PyQt5.QtGui import QFont, QColor, QPalette
+
+import matplotlib
+matplotlib.use("Qt5Agg")
+from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
+from matplotlib.backends.backend_qt5agg import NavigationToolbar2QT as NavigationToolbar
+from matplotlib.figure import Figure
+
+# ---------------------------------------------------------------------------
+# Hardware Imports with Mock Fallbacks for Simulation / Offline Use
+# ---------------------------------------------------------------------------
 try:
     import qsdumux
+    import qsdumux.instruments.keysight33600A_usb as keysight33600A_usb
     import qsdumux.instruments.srs_sim900 as sim900
     import qsdumux.instruments.srs_sim928 as sim928
     HAS_HARDWARE_LIBS = True
 except ImportError:
     HAS_HARDWARE_LIBS = False
+    keysight33600A_usb = None
+    sim900 = None
+    sim928 = None
 
 try:
     from dastardcommander import EasyClientDastard
     HAS_DASTARD_LIB = True
 except ImportError:
     HAS_DASTARD_LIB = False
-
-
-# Helper function to generate logspaced freq multiples
-def generate_freq_mutiples_logspaced(f0=20, start_exp=0, stop_exp=3, num_high_freq_tones=20, fs_global=250e3):
-    max_desired_freq = fs_global / 2
-    max_allowable_multiplier = int(max_desired_freq / f0)
-    multipliers = np.unique(np.int64(np.logspace(start_exp, stop_exp, num_high_freq_tones)))
-    return [m for m in multipliers if 1 <= m <= max_allowable_multiplier]
-
-
-# Helper function to generate superimposed sines
-def cos_superimposed(fmults, f0, f_low, n_periods_of_f_low, output_rate_hz, multiplier):
-    t_duration = n_periods_of_f_low / f_low
-    npts = int(round(t_duration * output_rate_hz))
-    t = np.arange(npts) / output_rate_hz
-    v_superimposed = np.zeros(npts)
-    all_freqs = np.insert(np.array(fmults) * f0, 0, f_low)
-    for f in all_freqs:
-        v_superimposed += np.cos(2 * np.pi * t * f)
-    return all_freqs, v_superimposed * multiplier
-
-
-# ----------------------------------------------------------------------
-# Mock Hardware Classes for Simulation Mode
-# ----------------------------------------------------------------------
-class MockEasyClientDastard:
-    def __init__(self, channel, fs_global, f_low, f0, amp_mult, vpp, rs_uohm, l_nh):
-        self.channel = channel
-        self.fs_global = fs_global
-        self.f_low = f_low
-        self.f0 = f0
-        self.amp_mult = amp_mult
-        self.vpp = vpp
-        self.rs_uohm = rs_uohm
-        self.l_nh = l_nh
-        self.current_bias = 0.0
-        
-        # Calculate stimulus frequencies
-        f_mults = generate_freq_mutiples_logspaced(self.f0, 0, 3, 20, self.fs_global)
-        self.fs_sch = np.insert(np.array(f_mults) * self.f0, 0, self.f_low)
-
-    def set_bias(self, bias):
-        self.current_bias = bias
-
-    def getNewData(self, num_samples):
-        # Generate time array
-        t = np.arange(num_samples) / self.fs_global
-        
-        # Cable/digital delay simulation
-        tau_delay = -2.70625e-2
-        t_delayed = t + tau_delay
-
-        # Rnormal of simulated TES is 12 mOhm
-        Rnormal = 12e-3
-        Rshunt = self.rs_uohm * 1e-6
-        L = self.l_nh * 1e-9
-
-        # Simulated superconducting transition profile
-        if self.current_bias == 0.0:
-            R0 = 0.0
-        else:
-            R0 = Rnormal / (1.0 + np.exp(-(self.current_bias - 1.2) / 0.2))
-
-        Vpp_tone = self.amp_mult * self.vpp
-        data = np.zeros(num_samples)
-        
-        # Sum stimulus tone currents (I = V / Z)
-        for f in self.fs_sch:
-            Z = (R0 + Rshunt) + 1j * 2 * np.pi * f * L
-            data += np.real((Vpp_tone / Z) * np.exp(1j * (2 * np.pi * f * t_delayed)))
-
-        # Add simulated digitizer noise
-        data += np.random.normal(0, 5e-7, num_samples)
-
-        return {
-            f"chan{self.channel}": data,
-            "firstFrameIndex": [0]
-        }
-
-
-class MockSRS_SIM928:
-    def __init__(self):
-        pass
-    def setvolt(self, voltage):
-        print(f"[Simulation] SIM928 set bias voltage to: {voltage:.3f} V")
+    EasyClientDastard = None
 
 
 class MockKeysight33600A:
-    def __init__(self):
+    """Mock Keysight AWG for dry-run simulation mode."""
+    def __init__(self, *args, **kwargs):
+        self.offsets = {1: 0.0, 2: 0.0}
+        self.channel = self
+
+    def setOutputLoad(self, source, load):
         pass
-    def setFunction(self, *args, **kwargs): pass
-    def setArbFile(self, *args, **kwargs): pass
-    def setArbSampleRate(self, *args, **kwargs): pass
-    def setArbFilter(self, *args, **kwargs): pass
-    def setAmplitude(self, *args, **kwargs): pass
-    def setOutputState(self, *args, **kwargs): pass
-    def clearVolatileMem(self, *args, **kwargs): pass
-    def setByteOrder(self, *args, **kwargs): pass
-    def _write_raw(self, *args, **kwargs): pass
-    def readline(self): return b"+0"
-    def _checkSource(self, *args, **kwargs): pass
+
+    def _checkSource(self, source):
+        pass
+
+    def clearVolatileMem(self, source):
+        pass
+
+    def setByteOrder(self, swap_bytes):
+        pass
+
+    def _write_raw(self, data):
+        pass
+
+    def setFunction(self, waveform_function, source):
+        pass
+
+    def setArbFile(self, source, arb_name):
+        pass
+
+    def setArbSampleRate(self, source, rate):
+        pass
+
+    def setArbFilter(self, source, filter_state):
+        pass
+
+    def setAmplitude(self, source, amp):
+        pass
+
+    def setOffset(self, source, offset):
+        self.offsets[source] = offset
+
+    def getOffset(self, source):
+        return self.offsets.get(source, 0.0)
+
+    def setOutputState(self, source, output_state):
+        pass
+
+    def _ask(self, query):
+        return "+0, No error"
+
+    def readline(self):
+        return b"+0\n"
+
+    def close(self):
+        pass
 
 
-# ----------------------------------------------------------------------
-# Tkinter GUI Main Class
-# ----------------------------------------------------------------------
-class EZCZGui:
-    def __init__(self, root):
-        self.root = root
-        self.root.title("EZ-CZ Complex Impedance Live Sweeper")
-        self.root.geometry("1200x800")
-        
-        # Theme configuration (Dark Slate Premium Theme)
-        self.bg_color = "#1e1e1e"
-        self.fg_color = "#e0e0e0"
-        self.accent_color = "#007acc"
-        self.danger_color = "#d9534f"
-        
-        self.root.configure(bg=self.bg_color)
-        
-        # Setup UI styles
-        self.style = ttk.Style()
-        self.style.theme_use("clam")
-        self.style.configure(".", background=self.bg_color, foreground=self.fg_color, fieldbackground="#333333")
-        self.style.configure("TLabel", background=self.bg_color, foreground=self.fg_color, font=("Segoe UI", 10))
-        self.style.configure("TEntry", fieldbackground="#333333", foreground=self.fg_color, font=("Segoe UI", 10))
-        self.style.configure("TCheckbutton", background=self.bg_color, foreground=self.fg_color)
-        
-        # Threading control
-        self.running_thread = None
-        self.stop_requested = threading.Event()
-        self.update_queue = queue.Queue()
-        
-        # Settings file location
-        self.settings_file = Path("run_settings.json")
-        self.settings = self.load_settings()
+class MockSRS_SIM900:
+    """Mock SRS SIM900 mainframe for dry-run simulation mode."""
+    def __init__(self, *args, **kwargs):
+        pass
 
-        # Build GUI Panels
-        self.build_gui()
-        
-        # Load variables from configuration file
-        self.load_variables_into_inputs()
-        
-        # Start periodic GUI queue polling
-        self.root.after(100, self.process_queue)
+    def close(self):
+        pass
 
-    def load_settings(self):
-        defaults = {
-            "fs": 250000.0,
-            "channel": 13,
-            "v_norm": 9.5,
-            "awg_rate": 5000000.0,
-            "f_low": 5.0,
-            "f0": 20.0,
-            "amp_mult": 0.04,
-            "vpp": 0.02,
-            "rs_uOhm": 250.0,
-            "l_nH": 1000.0,
-            "trigger_awg": False,
-            "srs_url": "serial:///dev/ttyUSB1?baudrate=9600",
-            "srs_port": 2,
-            "keysight_url": "vxi11://192.168.0.112:2021",
-            "bias_dense": [0.5, 1.5, 0.01],
-            "bias_medium": [1.5, 5.0, 0.1],
-            "output_dir": ""
-        }
-        if self.settings_file.exists():
-            try:
-                with open(self.settings_file, "r") as f:
-                    data = json.load(f)
-                    return {**defaults, **data.get("measure", {})}
-            except Exception as e:
-                print(f"Failed to load configuration file: {e}")
-        return defaults
 
-    def save_settings_to_file(self):
-        # Fetch current UI inputs
-        measure_settings = self.get_settings_from_inputs()
-        if not measure_settings:
+class MockSRS_SIM928:
+    """Mock SRS SIM928 isolated DC source for dry-run simulation mode."""
+    def __init__(self, mainframe, port):
+        self.port = port
+        self.voltage = 0.0
+
+    def setvolt(self, voltage):
+        self.voltage = voltage
+
+    def getvolt(self):
+        return self.voltage
+
+    def close(self):
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Timing & Mathematical Helpers (Pure time_per_flux_ramp derivation)
+# ---------------------------------------------------------------------------
+TIME_PER_FLUX_RAMP_POINT_S = 256e-9  # FPGA clock tick (1 / 3.90625 MHz)
+DEFAULT_CONFIG_PATH = "/data/experiment.cfg"
+SETTINGS_FILE_PATH = "run_settings.json"
+
+
+def get_time_per_flux_ramp_from_cfg(cfg_path=DEFAULT_CONFIG_PATH):
+    """Auto-reads flux_ramp_points from experiment.cfg and computes time_per_flux_ramp."""
+    import configparser
+    if not os.path.exists(cfg_path):
+        raise FileNotFoundError(f"Config file not found: {cfg_path}")
+
+    parser = configparser.ConfigParser()
+    parser.read(cfg_path)
+
+    for section in ["Global", "global"]:
+        if section in parser and "flux_ramp_points" in parser[section]:
+            raw_val = parser[section]["flux_ramp_points"].split("#")[0].strip()
+            if "*" in raw_val:
+                parts = raw_val.split("*")
+                fr_points = int(parts[0]) * int(parts[1])
+            else:
+                fr_points = int(raw_val)
+
+            if fr_points <= 0:
+                raise ValueError(f"Invalid flux_ramp_points ({fr_points})")
+
+            time_per_flux_ramp = fr_points * TIME_PER_FLUX_RAMP_POINT_S
+            return time_per_flux_ramp, fr_points
+
+    raise KeyError(f"Could not find 'flux_ramp_points' under [Global] in {cfg_path}")
+
+
+def derive_timing_from_flux_ramp(time_per_flux_ramp, target_duration_s=0.2,
+                                 target_f0_hz=20.0, nominal_awg_rate=5e6):
+    """
+    Derives all DAQ and AWG parameters strictly from time_per_flux_ramp.
+    Eliminates all arbitrary magic numbers.
+    """
+    fs_global = 1.0 / time_per_flux_ramp
+    N_samples = int(round(target_duration_s / time_per_flux_ramp))
+    t_duration = N_samples * time_per_flux_ramp
+
+    f_fund = 1.0 / t_duration
+    f_low = f_fund
+
+    k0 = max(1, int(round(target_f0_hz / f_fund)))
+    f0 = k0 * f_fund
+
+    n_awg_points = int(round(t_duration * nominal_awg_rate))
+    awg_sample_rate = n_awg_points / t_duration
+
+    return {
+        "time_per_flux_ramp": time_per_flux_ramp,
+        "fs_global": fs_global,
+        "N_samples": N_samples,
+        "t_duration": t_duration,
+        "f_fund": f_fund,
+        "f_low": f_low,
+        "k0": k0,
+        "f0": f0,
+        "n_awg_points": n_awg_points,
+        "awg_sample_rate": awg_sample_rate,
+    }
+
+
+def generate_stimulus_tones(fs_global, f0, f_low, start_exp=0, stop_exp=3, num_high_freq_tones=30):
+    """Generates log-spaced tone multipliers up to Nyquist limit."""
+    max_desired_freq = fs_global / 2.0
+    max_allowable_multiplier = int(max_desired_freq / f0)
+    multipliers = np.unique(np.int64(np.logspace(start_exp, stop_exp, num_high_freq_tones)))
+    valid_mults = [m for m in multipliers if 1 <= m <= max_allowable_multiplier]
+    all_freqs = np.insert(np.array(valid_mults) * f0, 0, f_low)
+    return valid_mults, all_freqs
+
+
+def synthesize_comb_waveform(all_freqs, t_duration, awg_sample_rate, multiplier):
+    """Synthesizes zero-leakage multi-tone cosine waveform."""
+    npts = int(round(t_duration * awg_sample_rate))
+    t = np.arange(npts) / awg_sample_rate
+    v_superimposed = np.zeros(npts, dtype=np.float64)
+    for f in all_freqs:
+        v_superimposed += np.cos(2 * np.pi * t * f)
+    return v_superimposed * multiplier
+
+
+# ---------------------------------------------------------------------------
+# Background Acquisition & Processing Worker
+# ---------------------------------------------------------------------------
+class CZWorker(QThread):
+    """
+    Executes CZ data collection on a separate background thread.
+    Supports both AWG DC offset and SRS SIM900/SIM928 DC bias sources.
+    Communicates with GUI via Qt signals.
+    """
+    log_signal = pyqtSignal(str, str)             # (level, message)
+    step_started = pyqtSignal(int, int, float)    # (index, total, bias_v)
+    step_completed = pyqtSignal(float, dict)      # (bias_v, plot_dict)
+    sc_calibrated = pyqtSignal(dict)              # (sc_stats)
+    sc_check_failed = pyqtSignal(str, dict)       # (reason, sc_stats)
+    pause_for_inspection = pyqtSignal(dict)       # (sc_stats)
+    progress_signal = pyqtSignal(int, int)        # (current, total)
+    finished_signal = pyqtSignal(bool, str)       # (success, message)
+
+    def __init__(self, params, parent=None):
+        super().__init__(parent)
+        self.params = params
+        self._is_aborted = False
+        self._resume_event = QtCore.QWaitCondition()
+        self._resume_mutex = QtCore.QMutex()
+        self._is_paused = False
+        self.fg = None
+        self.mainframe = None
+        self.vbox = None
+
+    def abort(self):
+        """Signals worker to abort execution immediately."""
+        self._is_aborted = True
+        self.log_signal.emit("WARN", "ABORT requested by user! Halting acquisition...")
+        self.resume()
+
+    def resume(self):
+        """Resumes execution after user inspection pause."""
+        self._resume_mutex.lock()
+        self._is_paused = False
+        self._resume_event.wakeAll()
+        self._resume_mutex.unlock()
+
+    def run(self):
+        self._is_aborted = False
+        p = self.params
+        dc_source = p.get("dc_source", "AWG")
+        run_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        run_date = datetime.now().strftime("%Y%m%d")
+
+        # Determine save directory
+        save_root = Path(p["save_dir"])
+        base_dir = save_root / run_date / "Complex_Z" / run_timestamp
+        try:
+            base_dir.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            base_dir = Path("./data") / run_date / "Complex_Z" / run_timestamp
+            base_dir.mkdir(parents=True, exist_ok=True)
+
+        self.log_signal.emit("INFO", f"Run directory: {base_dir}")
+        self.log_signal.emit("INFO", f"Active DC Bias Source: {dc_source}")
+
+        # 1. Timing calculation
+        try:
+            time_per_flux_ramp = p["time_per_flux_ramp"]
+            timing = derive_timing_from_flux_ramp(
+                time_per_flux_ramp=time_per_flux_ramp,
+                target_duration_s=p["target_duration_s"],
+                target_f0_hz=p["target_f0_hz"],
+                nominal_awg_rate=p["nominal_awg_rate"]
+            )
+            fs_global = timing["fs_global"]
+            N_samples = timing["N_samples"]
+            t_duration = timing["t_duration"]
+            f_low = timing["f_low"]
+            f0 = timing["f0"]
+            awg_sample_rate = timing["awg_sample_rate"]
+            n_awg_points = timing["n_awg_points"]
+
+            self.log_signal.emit("INFO", (
+                f"Timing: dt = {time_per_flux_ramp*1e6:.4f} µs, fs = {fs_global:.1f} Hz, "
+                f"N = {N_samples} flux ramps (T = {t_duration:.6f} s)"
+            ))
+            self.log_signal.emit("INFO", (
+                f"Comb: f_low = {f_low:.4f} Hz, f0 = {f0:.4f} Hz ({timing['k0']}x df), "
+                f"AWG = {n_awg_points} pts @ {awg_sample_rate:.1f} Sa/s"
+            ))
+        except Exception as e:
+            self.finished_signal.emit(False, f"Timing calculation failed: {e}")
             return
-        
-        full_settings_data = {}
-        if self.settings_file.exists():
+
+        # 2. Voltage limit pre-flight check
+        bias_values = p["bias_values"]
+        vpp = p["awg_vpp"]
+        load = p["awg_load"]
+        v_limit = 10.0 if load.upper() in ("INFINITY", "INF") else 5.0
+
+        if dc_source == "AWG":
+            voltage_check_values = bias_values
+            if p.get("normal_first", False):
+                voltage_check_values = np.append(voltage_check_values, p["vnorm"])
+            v_max = np.max(voltage_check_values) + (vpp / 2.0)
+            v_min = np.min(voltage_check_values) - (vpp / 2.0)
+            headroom = v_limit - max(abs(v_max), abs(v_min))
+
+            if v_max > v_limit or v_min < -v_limit:
+                err = f"Voltage limits exceeded! Range [{v_min:+.3f} V, {v_max:+.3f} V] exceeds ±{v_limit:.1f} V."
+                self.log_signal.emit("ERROR", err)
+                self.finished_signal.emit(False, err)
+                return
+            self.log_signal.emit("INFO", f"AWG Voltage verification PASS: Headroom = +{headroom:.3f} V")
+        else:
+            ac_peak = vpp / 2.0
+            if ac_peak > v_limit:
+                err = f"AWG AC stimulus ({vpp:.4f} Vpp) exceeds ±{v_limit:.1f} V limit!"
+                self.log_signal.emit("ERROR", err)
+                self.finished_signal.emit(False, err)
+                return
+            self.log_signal.emit("INFO", f"AWG AC Output verification PASS (Headroom: +{v_limit - ac_peak:.3f} V)")
+            self.log_signal.emit("INFO", f"DC Bias will be driven via SRS SIM928 isolated source (Port {p.get('srs_port', 2)})")
+
+        # 3. Connect to AWG and upload waveform
+        self.log_signal.emit("INFO", f"Connecting to AWG at {p['awg_address']}...")
+        is_dry_run = p.get("dry_run_mode", False) or not HAS_HARDWARE_LIBS
+
+        try:
+            if is_dry_run:
+                self.fg = MockKeysight33600A()
+                self.log_signal.emit("INFO", "Running with Mock Keysight AWG (Dry Run / Simulation mode).")
+            elif p["awg_address"].startswith("vxi11://") or "://" in p["awg_address"]:
+                self.fg = keysight33600A_usb.Keysight33600A_usb(url=p["awg_address"])
+            else:
+                self.fg = keysight33600A_usb.Keysight33600A_usb(device=p["awg_address"])
+        except Exception as e:
+            err = f"Failed to connect to AWG: {e}"
+            self.log_signal.emit("ERROR", err)
+            self.finished_signal.emit(False, err)
+            return
+
+        # 3b. If SRS900 DC source selected, connect to SRS SIM900 mainframe & SIM928
+        if dc_source == "SRS900":
+            srs_url = p.get("srs_url", "serial:///dev/ttyUSB1?baudrate=9600")
+            srs_port = p.get("srs_port", 2)
+            self.log_signal.emit("INFO", f"Connecting to SRS SIM900 mainframe at {srs_url} (Port {srs_port})...")
             try:
-                with open(self.settings_file, "r") as f:
-                    full_settings_data = json.load(f)
+                if is_dry_run:
+                    self.mainframe = MockSRS_SIM900()
+                    self.vbox = MockSRS_SIM928(self.mainframe, srs_port)
+                    self.log_signal.emit("INFO", "Running with Mock SRS SIM928 (Dry Run / Simulation mode).")
+                else:
+                    self.mainframe = sim900.SRS_SIM900(url=srs_url)
+                    self.vbox = sim928.SRS_SIM928(self.mainframe, srs_port)
+                    self.log_signal.emit("INFO", "Connected to SRS SIM900 / SIM928 successfully.")
+            except Exception as e:
+                err = f"Failed to connect to SRS SIM900/928: {e}"
+                self.log_signal.emit("ERROR", err)
+                self._safe_cleanup()
+                self.finished_signal.emit(False, err)
+                return
+
+        # Generate comb waveform
+        f_mults, all_freqs = generate_stimulus_tones(
+            fs_global, f0, f_low, num_high_freq_tones=p["num_high_freq_tones"]
+        )
+        v_waveform = synthesize_comb_waveform(
+            all_freqs, t_duration, awg_sample_rate, p["amp_multiplier"]
+        )
+        self.log_signal.emit("INFO", f"Synthesized {len(all_freqs)} tones ({all_freqs[0]:.2f} Hz to {all_freqs[-1]:.2f} Hz)")
+
+        # Save supplied waveform
+        try:
+            np.savez(
+                base_dir / "supplied_waveform.npz",
+                waveform=v_waveform,
+                frequencies=all_freqs,
+                awg_sample_rate=awg_sample_rate,
+                amplitude_vpp=vpp,
+                multiplier=p["amp_multiplier"],
+                fs_global=fs_global,
+                time_per_flux_ramp=time_per_flux_ramp,
+                dc_source=dc_source,
+                created_at=datetime.now().isoformat()
+            )
+            self.log_signal.emit("INFO", f"Saved supplied waveform to {base_dir / 'supplied_waveform.npz'}")
+        except Exception as e:
+            self.log_signal.emit("WARN", f"Failed to save supplied waveform npz: {e}")
+
+        # Program AWG
+        try:
+            source = p["awg_channel"]
+            self.fg.setOutputLoad(source=source, load=load)
+            self.fg._checkSource(source)
+            self.fg.clearVolatileMem(source)
+            time.sleep(0.1)
+            self.fg.setByteOrder(swap_bytes=True)
+            packed = np.array(v_waveform, dtype=np.float32).tobytes()
+            header = f"SOURce{source}:DATA:ARB cz_sum_sines, #{len(str(len(packed)))}{len(packed)}".encode("ascii")
+            self.fg._write_raw(header + packed + b"\n")
+
+            self.fg.setFunction(waveform_function="ARB", source=source)
+            self.fg.setArbFile(source, "cz_sum_sines")
+            self.fg.setArbSampleRate(source, awg_sample_rate)
+            self.fg.setArbFilter(source, filter_state="STEP")
+            self.fg.setAmplitude(source, vpp)
+
+            # In AWG mode, initial offset is first bias; in SRS mode, AWG offset is 0.0 V
+            initial_offset = bias_values[0] if dc_source == "AWG" else 0.0
+            self.fg.setOffset(source, initial_offset)
+            self.fg.setOutputState(source=source, output_state="ON")
+            time.sleep(0.5)
+
+            if dc_source == "AWG":
+                self.log_signal.emit("INFO", f"AWG Ch{source} active: Vpp={vpp} V, Offset={initial_offset:.3f} V")
+            else:
+                self.log_signal.emit("INFO", f"AWG Ch{source} active (AC stimulus only, Vpp={vpp} V, Offset=0.0 V)")
+        except Exception as e:
+            err = f"Failed to program AWG: {e}"
+            self.log_signal.emit("ERROR", err)
+            self._safe_cleanup()
+            self.finished_signal.emit(False, err)
+            return
+
+        # 4. Connect to DASTARD
+        c = None
+        if not is_dry_run and HAS_DASTARD_LIB:
+            self.log_signal.emit("INFO", "Connecting to DASTARD...")
+            for attempt in range(5):
+                if self._is_aborted:
+                    self._safe_cleanup()
+                    self.finished_signal.emit(False, "Aborted before DASTARD connection.")
+                    return
+                try:
+                    c = EasyClientDastard()
+                    self.log_signal.emit("INFO", "Connected to DASTARD successfully.")
+                    break
+                except Exception as e:
+                    self.log_signal.emit("WARN", f"DASTARD connection attempt {attempt+1}/5 failed ({e})")
+                    time.sleep(0.5)
+
+            if c is None:
+                err = "Failed to connect to DASTARD client."
+                self.log_signal.emit("ERROR", err)
+                self._safe_cleanup()
+                self.finished_signal.emit(False, err)
+                return
+        else:
+            self.log_signal.emit("INFO", "Using simulated detector signal (Dry Run / Simulation mode).")
+
+        # 5. Acquisition Loop
+        tau_shift_0V = None
+        Z_model_pure = None
+        amp0 = None
+        f_roll = None
+        total_steps = len(bias_values)
+        V_stim = p["amp_multiplier"] * vpp
+
+        try:
+            for idx, bias in enumerate(bias_values):
+                if self._is_aborted:
+                    break
+
+                self.step_started.emit(idx + 1, total_steps, bias)
+                self.progress_signal.emit(idx + 1, total_steps)
+                self.log_signal.emit("INFO", f"[{idx+1}/{total_steps}] Setting bias = {bias:.3f} V ({dc_source})...")
+
+                # Apply DC bias based on selected DC source
+                point_settle_time = p.get("settle_time_s", 0.3)
+                if np.isclose(bias, 0.0):
+                    point_settle_time = p.get("sc_settle_time_s", 2.0)
+
+                if dc_source == "AWG":
+                    self.fg.setOffset(source=p["awg_channel"], offset=bias)
+                    time.sleep(point_settle_time)
+                else:
+                    # SRS SIM900/SIM928 code from cztest3
+                    if p.get("srs_pulse_vnorm", True) and not np.isclose(bias, 0.0):
+                        vnorm_val = p.get("vnorm", 9.5)
+                        self.log_signal.emit("INFO", f"Pulsing SRS SIM928 Vnorm = {vnorm_val:.3f} V (cztest3 style)...")
+                        self.vbox.setvolt(vnorm_val)
+                        time.sleep(0.1)
+                    self.vbox.setvolt(bias)
+                    time.sleep(point_settle_time)
+
+                # Fetch data from DASTARD
+                if c is not None:
+                    n_req = N_samples * p.get("n_averages", 4)
+                    ch_key = f"chan{p['channel']}"
+                    n_avg = p.get("n_averages", 4)
+                    n_candidates = 3 if np.isclose(bias, 0.0) else 1
+                    if n_candidates > 1:
+                        self.log_signal.emit("INFO", "Selecting the strongest of 3 fresh SC data blocks.")
+                    candidate_data = []
+                    candidate_scores = []
+                    candidate_results = []
+                    candidate_bin_width = fs_global / N_samples
+                    candidate_indices = np.rint(all_freqs / candidate_bin_width).astype(int)
+                    for _ in range(n_candidates):
+                        data_all = c.getNewData(n_req)
+                        if ch_key not in data_all:
+                            raise KeyError(f"Channel '{ch_key}' not found in DASTARD data.")
+                        data_raw = data_all[ch_key] * 1.0
+                        data_mean = data_raw[:N_samples * n_avg].reshape((n_avg, N_samples)).mean(axis=0)
+                        first_frame_index = data_all["firstFrameIndex"][0] % N_samples
+                        candidate = np.roll(data_mean, first_frame_index)
+                        candidate_fft = scipy.fft.rfft(candidate)
+                        valid_indices = candidate_indices[(candidate_indices > 0) & (candidate_indices < len(candidate_fft))]
+                        candidate_scores.append(float(np.sum(np.abs(candidate_fft[valid_indices]))))
+                        candidate_results.append(data_all)
+                        candidate_data.append(candidate)
+                    selected_index = int(np.argmax(candidate_scores))
+                    data = candidate_data[selected_index]
+                    data_all = candidate_results[selected_index]
+                else:
+                    t = np.arange(N_samples) * time_per_flux_ramp
+                    data = np.zeros(N_samples)
+                    f_r_sim = 1200.0
+                    for f in all_freqs:
+                        mag = 5000.0 / np.sqrt(1 + (f / f_r_sim)**2)
+                        phi = -np.arctan(f / f_r_sim) - 2 * np.pi * f * 15e-6
+                        data += mag * np.cos(2 * np.pi * f * t + phi)
+                    data += np.random.normal(0, 10, N_samples)
+                    data_all = {f"chan{p['channel']}": np.tile(data, p.get("n_averages", 4)), "firstFrameIndex": [0]}
+
+                # Compute FFT
+                fft_data_raw = scipy.fft.rfft(data)
+                fft_freqs = scipy.fft.rfftfreq(N_samples, d=time_per_flux_ramp)
+                f_sch_idx = np.argmin(
+                    np.abs(fft_freqs[:, None] - all_freqs[None, :]),
+                    axis=0,
+                )
+                fs_sch = all_freqs
+                tone_data_raw = fft_data_raw[f_sch_idx]
+                sc_tone_data_raw = tone_data_raw
+
+                # 0 V Calibration & Superconducting Transfer Function Health Check
+                if np.isclose(bias, 0.0):
+                    self.log_signal.emit("INFO", "Evaluating Superconducting (0 V) Transfer Function...")
+
+                    def magnitude_model(fs, amp0_val, f_roll_val):
+                        return amp0_val / np.sqrt(1 + (fs / f_roll_val)**2)
+
+                    model_mag = Model(magnitude_model)
+                    params_mag = Parameters()
+                    params_mag.add("amp0_val", value=np.abs(fft_data_raw[0]), min=0, vary=True)
+                    params_mag.add("f_roll_val", value=1e3, min=1.0, max=1e6, vary=True)
+
+                    y_data = np.abs(sc_tone_data_raw)
+                    res_mag = model_mag.fit(y_data, fs=fs_sch, params=params_mag)
+
+                    amp0 = float(res_mag.params["amp0_val"].value)
+                    f_roll = float(res_mag.params["f_roll_val"].value)
+
+                    # Goodness of fit (R^2)
+                    fit_best = magnitude_model(fs_sch, amp0, f_roll)
+                    ss_res = np.sum((y_data - fit_best)**2)
+                    ss_tot = np.sum((y_data - np.mean(y_data))**2)
+                    r_squared = float(1.0 - (ss_res / ss_tot)) if ss_tot > 0 else 0.0
+
+                    Z_model_pure = amp0 / (1.0 + 1j * fs_sch / f_roll)
+
+                    def real_model(fs, tau_shift):
+                        return np.real((fft_data_raw * np.exp(-2j * np.pi * fft_freqs * tau_shift))[f_sch_idx])
+
+                    model_real = Model(real_model)
+                    tau_guess = -np.argmax(data) / fs_global
+                    params_real = Parameters()
+                    params_real.add("tau_shift", value=tau_guess, vary=True)
+                    res_real = model_real.fit(np.real(Z_model_pure), fs=all_freqs, params=params_real)
+                    tau_shift_0V = float(res_real.params["tau_shift"].value)
+
+                    sc_stats = {
+                        "amp0": amp0,
+                        "f_roll": f_roll,
+                        "r_squared": r_squared,
+                        "tau_shift": tau_shift_0V,
+                        "y_data": y_data,
+                        "best_fit": fit_best,
+                        "all_freqs": all_freqs,
+                    }
+                    self.sc_calibrated.emit(sc_stats)
+                    self.log_signal.emit("INFO", (
+                        f"0 V Fit Results: R² = {r_squared:.4f}, f_roll = {f_roll:.1f} Hz, "
+                        f"amp0 = {amp0:.1f}, τ_shift = {tau_shift_0V*1e6:.2f} µs"
+                    ))
+
+                    # Evaluate failure criteria
+                    abort_reasons = []
+                    min_r2 = p.get("min_sc_r2", 0.85)
+                    min_froll = p.get("min_froll_hz", 10.0)
+                    max_froll = p.get("max_froll_hz", 25000.0)
+
+                    if r_squared < min_r2:
+                        abort_reasons.append(f"Low fit quality: R² = {r_squared:.4f} < {min_r2:.4f}")
+                    if f_roll < min_froll or f_roll > max_froll:
+                        abort_reasons.append(f"Unphysical f_roll: {f_roll:.1f} Hz outside [{min_froll}, {max_froll}] Hz")
+                    if amp0 < 1.0:
+                        abort_reasons.append(f"Extremely weak response: amp0 = {amp0:.2e} (possible unlock/open circuit)")
+
+                    if abort_reasons:
+                        failure_msg = " | ".join(abort_reasons)
+                        self.log_signal.emit("ERROR", f"Superconducting Transfer Function Check FAILED: {failure_msg}")
+                        self.sc_check_failed.emit(failure_msg, sc_stats)
+
+                        if p.get("auto_abort_on_bad_sc", True):
+                            self._safe_cleanup()
+                            self.finished_signal.emit(False, f"ABORTED: Superconducting transfer function bad ({failure_msg})")
+                            return
+
+                    # Optional user pause for visual inspection
+                    if p.get("pause_after_0v", False):
+                        self.log_signal.emit("WARN", "PAUSED: Waiting for user visual confirmation of 0 V SC transfer function...")
+                        self.pause_for_inspection.emit(sc_stats)
+                        self._resume_mutex.lock()
+                        self._is_paused = True
+                        while self._is_paused and not self._is_aborted:
+                            self._resume_event.wait(self._resume_mutex)
+                        self._resume_mutex.unlock()
+
+                        if self._is_aborted:
+                            self._safe_cleanup()
+                            self.finished_signal.emit(False, "Aborted by user during 0 V calibration pause.")
+                            return
+                        self.log_signal.emit("INFO", "User approved 0 V calibration. Resuming sweep...")
+
+                    # Optional normalize TES before sweeping higher voltages
+                    if p.get("normal_first", False):
+                        vnorm_val = p.get("vnorm", 9.5)
+                        self.log_signal.emit("INFO", f"Driving TES normal at Vnorm = {vnorm_val:.3f} V for 1.0 s...")
+                        if dc_source == "AWG":
+                            self.fg.setOffset(source=p["awg_channel"], offset=vnorm_val)
+                        else:
+                            self.vbox.setvolt(vnorm_val)
+                        time.sleep(1.0)
+                        post_settle = p.get("post_normal_settle_s", 5.0)
+                        if post_settle > 0:
+                            self.log_signal.emit("INFO", f"Waiting {post_settle:.1f} s post-normal recovery before sweeping...")
+                            time.sleep(post_settle)
+
+                applied_tau_shift = tau_shift_0V if tau_shift_0V is not None else 0.0
+                fft_unroll = tone_data_raw * np.exp(-2j * np.pi * fs_sch * applied_tau_shift)
+
+                plot_data = {
+                    "bias": bias,
+                    "tau_shift": applied_tau_shift,
+                    "fs_sch": fs_sch,
+                    "fft_unroll": fft_unroll,
+                    "Z_model_pure": Z_model_pure,
+                    "amp0": amp0,
+                    "f_roll": f_roll,
+                    "dc_source": dc_source,
+                }
+                self.step_completed.emit(bias, plot_data)
+
+                # Save step data
+                bias_str = f"{bias:.2f}".replace(".", "v")
+                bias_dir = base_dir / f"bias_{bias_str}"
+                bias_dir.mkdir(parents=True, exist_ok=True)
+
+                np.savez(
+                    bias_dir / f"vbias_{bias_str}_data.npz",
+                    bias=bias,
+                    v_stim=V_stim,
+                    fft_unroll=fft_unroll,
+                    fs_sch=all_freqs,
+                    tau_shift=applied_tau_shift,
+                    raw_data=data,
+                    fs_global=fs_global,
+                    time_per_flux_ramp=time_per_flux_ramp,
+                    dc_source=dc_source
+                )
+                self._save_bias_plot(
+                    bias_dir=bias_dir,
+                    bias=bias,
+                    fs_sch=fs_sch,
+                    fft_unroll=fft_unroll,
+                    Z_model_pure=Z_model_pure,
+                    tau_shift=applied_tau_shift,
+                    dc_source=dc_source,
+                )
+
+                if p.get("single_0v_test_only", False):
+                    self.log_signal.emit("INFO", "Single 0 V SC test completed.")
+                    break
+
+        except Exception as e:
+            self.log_signal.emit("ERROR", f"Acquisition error: {e}")
+            self._safe_cleanup()
+            self.finished_signal.emit(False, str(e))
+            return
+
+        # Final cleanup
+        self._safe_cleanup()
+        if self._is_aborted:
+            self.finished_signal.emit(False, "Run was aborted by user. All DC sources safely reset to 0.0 V.")
+        else:
+            self.finished_signal.emit(True, f"Run completed successfully! All data saved to {base_dir}")
+
+    def _safe_cleanup(self):
+        """Safely ramps down the AWG DC offset and/or SRS SIM928 voltage to 0.0 V."""
+        if self.fg is not None:
+            try:
+                self.log_signal.emit("INFO", "Safely resetting AWG Channel offset to 0.0 V and disabling output...")
+                self.fg.setOffset(source=self.params["awg_channel"], offset=0.0)
+                self.fg.setOutputState(source=self.params["awg_channel"], output_state="OFF")
+            except Exception as e:
+                self.log_signal.emit("WARN", f"AWG cleanup exception: {e}")
+            try:
+                self.fg.channel.close()
             except Exception:
                 pass
-        
-        full_settings_data["measure"] = measure_settings
-        
-        try:
-            with open(self.settings_file, "w") as f:
-                json.dump(full_settings_data, f, indent=2)
-            messagebox.showinfo("Config Saved", f"Successfully saved defaults to {self.settings_file.name}")
-        except Exception as e:
-            messagebox.showerror("Error", f"Failed to save settings: {e}")
+            self.fg = None
 
-    def build_gui(self):
-        # Master grid setup
-        self.root.columnconfigure(0, weight=0, minsize=380)
-        self.root.columnconfigure(1, weight=1)
-        self.root.rowconfigure(0, weight=1)
+        if self.vbox is not None:
+            try:
+                self.log_signal.emit("INFO", "Safely resetting SRS SIM928 voltage to 0.0 V...")
+                self.vbox.setvolt(0.0)
+            except Exception as e:
+                self.log_signal.emit("WARN", f"SRS SIM928 cleanup exception: {e}")
+            self.vbox = None
 
-        # ----------------------------------------------------------------------
-        # Left Panel (Inputs and Controls)
-        # ----------------------------------------------------------------------
-        left_frame = tk.Frame(self.root, bg=self.bg_color, padx=15, pady=15, highlightthickness=1, highlightbackground="#333333")
-        left_frame.grid(row=0, column=0, sticky="nsew")
-        left_frame.columnconfigure(1, weight=1)
+        if self.mainframe is not None:
+            try:
+                self.mainframe.close()
+            except Exception:
+                pass
+            self.mainframe = None
 
-        # Header Label
-        header = tk.Label(left_frame, text="EZ-CZ CONTROL BOARD", font=("Segoe UI", 14, "bold"), bg=self.bg_color, fg="#ff9900")
-        header.grid(row=0, column=0, columnspan=2, pady=(0, 15), sticky="w")
+    def _save_bias_plot(self, bias_dir, bias, fs_sch, fft_unroll, Z_model_pure, tau_shift, dc_source):
+        fig = Figure(figsize=(12, 9), dpi=100)
+        axes = fig.subplots(2, 2).flatten()
+        fig.set_facecolor("white")
+        for axis in axes:
+            axis.grid(True, which="both", linestyle="--", alpha=0.4)
 
-        # Variables Dict for UI Inputs
-        self.entries = {}
-        self.trigger_awg_var = tk.BooleanVar()
-        self.simulation_var = tk.BooleanVar(value=not (HAS_HARDWARE_LIBS and HAS_DASTARD_LIB))
+        axes[0].semilogx(fs_sch, np.real(fft_unroll), ".-", label="Real (Data)")
+        axes[0].semilogx(fs_sch, np.imag(fft_unroll), ".-", label="Imag (Data)")
+        if Z_model_pure is not None:
+            axes[0].semilogx(fs_sch, np.real(Z_model_pure), "--", label="Real (Model)")
+            axes[0].semilogx(fs_sch, np.imag(Z_model_pure), "--", label="Imag (Model)")
+        axes[0].set_title("Real and Imaginary Parts")
+        axes[0].set_xlabel("Frequency (Hz)")
+        axes[0].legend(fontsize=8)
 
-        # Inputs mapping config
-        inputs_config = [
-            ("channel", "Dastard Channel ID:", "13"),
-            ("fs", "Digi Sample Rate (Hz):", "250000.0"),
-            ("rs_uOhm", "Rs (uOhm):", "250.0"),
-            ("l_nH", "L (nH):", "1000.0"),
-            ("v_norm", "Normalization Volt (V):", "9.5"),
-            ("vpp", "Tone Amplitude Vpp:", "0.02"),
-            ("amp_mult", "Tone Amp Multiplier:", "0.04"),
-            ("awg_rate", "AWG Sample Rate (Hz):", "5000000.0"),
-            ("f_low", "Low Freq Tone (Hz):", "5.0"),
-            ("f0", "Base Tone Freq F0 (Hz):", "20.0"),
-            ("srs_url", "SRS URL / Port:", "serial:///dev/ttyUSB1?baudrate=9600"),
-            ("keysight_url", "Keysight AWG URL:", "vxi11://192.168.0.112:2021"),
+        axes[1].plot(np.real(fft_unroll), np.imag(fft_unroll), ".-", label="Data")
+        if Z_model_pure is not None:
+            axes[1].plot(np.real(Z_model_pure), np.imag(Z_model_pure), "--", label="Model")
+        axes[1].set_title("Nyquist Plot")
+        axes[1].set_xlabel("Real(Z)")
+        axes[1].set_ylabel("Imag(Z)")
+        axes[1].legend(fontsize=8)
+        axes[1].axis("equal")
+
+        axes[2].loglog(fs_sch, np.abs(fft_unroll), ".-", label="Data")
+        if Z_model_pure is not None:
+            axes[2].loglog(fs_sch, np.abs(Z_model_pure), "--", label="Model")
+        axes[2].set_title("Magnitude Response")
+        axes[2].set_xlabel("Frequency (Hz)")
+        axes[2].legend(fontsize=8)
+
+        axes[3].semilogx(fs_sch, np.angle(fft_unroll) / np.pi, ".-", label="Data")
+        if Z_model_pure is not None:
+            axes[3].semilogx(fs_sch, np.angle(Z_model_pure) / np.pi, "--", label="Model")
+        axes[3].set_title("Phase Response")
+        axes[3].set_xlabel("Frequency (Hz)")
+        axes[3].set_ylabel("Phase (π rad)")
+        axes[3].legend(fontsize=8)
+
+        fig.suptitle(f"EZ-CZ Dashboard | Bias = {bias:.3f} V ({dc_source}) | Delay = {tau_shift * 1e6:.2f} µs")
+        fig.tight_layout(rect=[0, 0, 1, 0.96])
+        fig.savefig(bias_dir / f"vbias_{bias:.2f}_impedance_plot.png".replace(".", "v", 1))
+
+
+# ---------------------------------------------------------------------------
+# Embedded 4-Panel Matplotlib Canvas Widget
+# ---------------------------------------------------------------------------
+class CZPlotCanvas(FigureCanvas):
+    """Matplotlib canvas containing 4 diagnostic subplots for CZ testing."""
+    def __init__(self, parent=None, width=10, height=8, dpi=100):
+        self.dark_mode = False
+        self.fig = Figure(figsize=(width, height), dpi=dpi)
+        self.fig.set_facecolor("#ffffff")
+        self.axs = self.fig.subplots(2, 2)
+        self.fig.tight_layout(pad=3.0)
+        super().__init__(self.fig)
+        self.setParent(parent)
+        self.init_plots()
+
+    def init_plots(self):
+        titles = [
+            "Real & Imaginary Parts",
+            "Nyquist Plot (Complex Z)",
+            "Magnitude Response |Z(f)|",
+            "Phase Response ∠Z(f) / π"
         ]
+        background_color = "#15181e" if self.dark_mode else "#ffffff"
+        text_color = "#e0e4ed" if self.dark_mode else "#202124"
+        grid_color = "#333842" if self.dark_mode else "#c7cbd1"
 
-        row = 1
-        for key, label_text, default_val in inputs_config:
-            lbl = ttk.Label(left_frame, text=label_text)
-            lbl.grid(row=row, column=0, sticky="w", pady=4)
-            
-            ent = ttk.Entry(left_frame)
-            ent.grid(row=row, column=1, sticky="ew", padx=(10, 0), pady=4)
-            self.entries[key] = ent
-            row += 1
-
-        # SRS Port (Slot) Entry (small next to URL)
-        # We replace URL entry layout to hold both url and port side-by-side
-        self.entries["srs_url"].grid_forget()
-        srs_subframe = tk.Frame(left_frame, bg=self.bg_color)
-        srs_subframe.grid(row=11, column=1, sticky="ew", padx=(10, 0), pady=4)
-        srs_subframe.columnconfigure(0, weight=3)
-        srs_subframe.columnconfigure(1, weight=1)
-
-        ent_url = ttk.Entry(srs_subframe)
-        ent_url.pack(side="left", fill="x", expand=True)
-        self.entries["srs_url"] = ent_url
-
-        ent_port = ttk.Entry(srs_subframe, width=5)
-        ent_port.pack(side="right", padx=(5, 0))
-        self.entries["srs_port"] = ent_port
-
-        # Bias Sweeps Inputs
-        lbl_dense = ttk.Label(left_frame, text="Dense Bias [Start, Stop, Step]:")
-        lbl_dense.grid(row=row, column=0, columnspan=2, sticky="w", pady=(10, 2))
-        row += 1
-
-        dense_frame = tk.Frame(left_frame, bg=self.bg_color)
-        dense_frame.grid(row=row, column=0, columnspan=2, sticky="ew", pady=2)
-        dense_frame.columnconfigure((0, 1, 2), weight=1)
-        self.entries["bias_dense_start"] = ttk.Entry(dense_frame)
-        self.entries["bias_dense_start"].grid(row=0, column=0, padx=2)
-        self.entries["bias_dense_stop"] = ttk.Entry(dense_frame)
-        self.entries["bias_dense_stop"].grid(row=0, column=1, padx=2)
-        self.entries["bias_dense_step"] = ttk.Entry(dense_frame)
-        self.entries["bias_dense_step"].grid(row=0, column=2, padx=2)
-        row += 1
-
-        lbl_med = ttk.Label(left_frame, text="Medium Bias [Start, Stop, Step]:")
-        lbl_med.grid(row=row, column=0, columnspan=2, sticky="w", pady=(8, 2))
-        row += 1
-
-        med_frame = tk.Frame(left_frame, bg=self.bg_color)
-        med_frame.grid(row=row, column=0, columnspan=2, sticky="ew", pady=2)
-        med_frame.columnconfigure((0, 1, 2), weight=1)
-        self.entries["bias_med_start"] = ttk.Entry(med_frame)
-        self.entries["bias_med_start"].grid(row=0, column=0, padx=2)
-        self.entries["bias_med_stop"] = ttk.Entry(med_frame)
-        self.entries["bias_med_stop"].grid(row=0, column=1, padx=2)
-        self.entries["bias_med_step"] = ttk.Entry(med_frame)
-        self.entries["bias_med_step"].grid(row=0, column=2, padx=2)
-        row += 1
-
-        # Checkboxes Frame
-        chk_frame = tk.Frame(left_frame, bg=self.bg_color)
-        chk_frame.grid(row=row, column=0, columnspan=2, sticky="w", pady=10)
-        row += 1
-
-        chk_awg = ttk.Checkbutton(chk_frame, text="Trigger Keysight AWG", variable=self.trigger_awg_var)
-        chk_awg.pack(anchor="w", pady=2)
-
-        chk_sim = ttk.Checkbutton(chk_frame, text="Simulation (Dry Run Mode)", variable=self.simulation_var)
-        chk_sim.pack(anchor="w", pady=2)
-        if not (HAS_HARDWARE_LIBS and HAS_DASTARD_LIB):
-            chk_sim.configure(state="disabled")
-
-        # Save Defaults Config Button
-        btn_save = tk.Button(left_frame, text="Save Settings as Default", command=self.save_settings_to_file,
-                             bg="#333333", fg=self.fg_color, relief="flat", activebackground="#444444", activeforeground=self.fg_color)
-        btn_save.grid(row=row, column=0, columnspan=2, sticky="ew", pady=5)
-        row += 1
-
-        # Separation Bar
-        sep = ttk.Separator(left_frame, orient="horizontal")
-        sep.grid(row=row, column=0, columnspan=2, sticky="ew", pady=15)
-        row += 1
-
-        # Sweep Status Labels
-        status_header = ttk.Label(left_frame, text="Status Panel:", font=("Segoe UI", 11, "bold"))
-        status_header.grid(row=row, column=0, sticky="w")
-        row += 1
-
-        self.status_lbl = tk.Label(left_frame, text="Idle", font=("Segoe UI", 11, "bold"), fg="cyan", bg=self.bg_color)
-        self.status_lbl.grid(row=row, column=0, columnspan=2, sticky="w", pady=2)
-        row += 1
-
-        self.progress_lbl = ttk.Label(left_frame, text="Click GO to start bias sweeps.")
-        self.progress_lbl.grid(row=row, column=0, columnspan=2, sticky="w", pady=2)
-        row += 1
-
-        # Run Controls Buttons
-        ctrl_frame = tk.Frame(left_frame, bg=self.bg_color)
-        ctrl_frame.grid(row=row, column=0, columnspan=2, sticky="ew", pady=15)
-        ctrl_frame.columnconfigure((0, 1), weight=1)
-
-        self.btn_go = tk.Button(ctrl_frame, text="GO", command=self.start_sweep,
-                                bg="#28a745", fg="white", font=("Segoe UI", 12, "bold"), relief="flat", activebackground="#218838")
-        self.btn_go.grid(row=0, column=0, padx=5, sticky="ew")
-
-        self.btn_stop = tk.Button(ctrl_frame, text="STOP", command=self.stop_sweep, state="disabled",
-                                  bg=self.danger_color, fg="white", font=("Segoe UI", 12, "bold"), relief="flat", activebackground="#c9302c")
-        self.btn_stop.grid(row=0, column=1, padx=5, sticky="ew")
-
-        # ----------------------------------------------------------------------
-        # Right Panel (Real-time Matplotlib Plot Canvas)
-        # ----------------------------------------------------------------------
-        right_frame = tk.Frame(self.root, bg="#111111", padx=10, pady=10)
-        right_frame.grid(row=0, column=1, sticky="nsew")
-        right_frame.columnconfigure(0, weight=1)
-        right_frame.rowconfigure(0, weight=1)
-
-        # Style Matplotlib to match Dark Theme
-        plt.style.use('dark_background')
-        self.fig, self.axs = plt.subplots(2, 2, figsize=(10, 8))
-        self.fig.patch.set_facecolor('#111111')
-        for ax in self.axs.flat:
-            ax.set_facecolor('#1e1e1e')
-            ax.grid(True, which="both", color="#333333", linestyle=":")
-        self.fig.suptitle("EZ-CZ Live Sweeper Plot", color="#ff9900", fontsize=14, weight="bold")
-        self.fig.tight_layout(rect=[0, 0, 1, 0.95])
-
-        # Embed figure in Tkinter window
-        self.canvas = FigureCanvasTkAgg(self.fig, master=right_frame)
-        self.canvas.get_tk_widget().pack(fill="both", expand=True)
-
-    def load_variables_into_inputs(self):
-        # Load scalar settings
-        for key, ent in self.entries.items():
-            if key in ["srs_port", "bias_dense_start", "bias_dense_stop", "bias_dense_step", 
-                       "bias_med_start", "bias_med_stop", "bias_med_step"]:
-                continue
-            ent.insert(0, str(self.settings.get(key, "")))
-
-        self.entries["srs_port"].insert(0, str(self.settings.get("srs_port", 2)))
-
-        # Load bias dense
-        bd = self.settings.get("bias_dense", [0.5, 1.5, 0.01])
-        self.entries["bias_dense_start"].insert(0, str(bd[0]))
-        self.entries["bias_dense_stop"].insert(0, str(bd[1]))
-        self.entries["bias_dense_step"].insert(0, str(bd[2]))
-
-        # Load bias med
-        bm = self.settings.get("bias_medium", [1.5, 5.0, 0.1])
-        self.entries["bias_med_start"].insert(0, str(bm[0]))
-        self.entries["bias_med_stop"].insert(0, str(bm[1]))
-        self.entries["bias_med_step"].insert(0, str(bm[2]))
-
-        # Load checkboxes
-        self.trigger_awg_var.set(self.settings.get("trigger_awg", False))
-
-    def get_settings_from_inputs(self):
-        try:
-            dense_vals = [
-                float(self.entries["bias_dense_start"].get()),
-                float(self.entries["bias_dense_stop"].get()),
-                float(self.entries["bias_dense_step"].get())
-            ]
-            med_vals = [
-                float(self.entries["bias_med_start"].get()),
-                float(self.entries["bias_med_stop"].get()),
-                float(self.entries["bias_med_step"].get())
-            ]
-            
-            return {
-                "channel": int(self.entries["channel"].get()),
-                "fs": float(self.entries["fs"].get()),
-                "rs_uOhm": float(self.entries["rs_uOhm"].get()),
-                "l_nH": float(self.entries["l_nH"].get()),
-                "v_norm": float(self.entries["v_norm"].get()),
-                "vpp": float(self.entries["vpp"].get()),
-                "amp_mult": float(self.entries["amp_mult"].get()),
-                "awg_rate": float(self.entries["awg_rate"].get()),
-                "f_low": float(self.entries["f_low"].get()),
-                "f0": float(self.entries["f0"].get()),
-                "srs_url": self.entries["srs_url"].get(),
-                "srs_port": int(self.entries["srs_port"].get()),
-                "keysight_url": self.entries["keysight_url"].get(),
-                "bias_dense": dense_vals,
-                "bias_medium": med_vals,
-                "trigger_awg": self.trigger_awg_var.get(),
-                "is_sim": self.simulation_var.get(),
-                "output_dir": ""
-            }
-        except ValueError as e:
-            messagebox.showerror("Validation Error", f"Please enter valid numeric parameters.\nDetail: {e}")
-            return None
-
-    def start_sweep(self):
-        config = self.get_settings_from_inputs()
-        if not config:
-            return
-        
-        # UI Toggles
-        self.btn_go.configure(state="disabled")
-        self.btn_stop.configure(state="normal")
-        self.status_lbl.configure(text="Running", fg="#28a745")
-        
-        self.stop_requested.clear()
-        
-        # Start background sweep thread
-        self.running_thread = threading.Thread(target=self.run_sweep_loop, args=(config,))
-        self.running_thread.daemon = True
-        self.running_thread.start()
-
-    def stop_sweep(self):
-        self.stop_requested.set()
-        self.status_lbl.configure(text="Stopping...", fg="#ffc107")
-        self.progress_lbl.configure(text="Terminating sweep after current step...")
-        self.btn_stop.configure(state="disabled")
-
-    # ----------------------------------------------------------------------
-    # Core Measurement Sweep Thread Loop
-    # ----------------------------------------------------------------------
-    def run_sweep_loop(self, config):
-        try:
-            is_sim = config.get("is_sim", False)
-            
-            # Setup sweep bias values
-            dense = np.arange(config["bias_dense"][0], config["bias_dense"][1], config["bias_dense"][2])
-            medium = np.arange(config["bias_medium"][0], config["bias_medium"][1], config["bias_medium"][2])
-            bias_values = np.concatenate([[0.0], dense, medium])
-            
-            # Initialize hardware instruments
-            vbox = None
-            dastard_client = None
-
-            if is_sim:
-                self.update_queue.put(("log", "[Simulation Mode] Connecting mock instruments..."))
-                vbox = MockSRS_SIM928()
-                dastard_client = MockEasyClientDastard(
-                    channel=config["channel"],
-                    fs_global=config["fs"],
-                    f_low=config["f_low"],
-                    f0=config["f0"],
-                    amp_mult=config["amp_mult"],
-                    vpp=config["vpp"],
-                    rs_uohm=config["rs_uOhm"],
-                    l_nh=config["l_nH"]
-                )
-            else:
-                self.update_queue.put(("log", "Connecting to hardware instruments..."))
-                try:
-                    mainframe = sim900.SRS_SIM900(url=config["srs_url"])
-                    vbox = sim928.SRS_SIM928(mainframe, config["srs_port"])
-                except Exception as e:
-                    self.update_queue.put(("error", f"Failed to connect to SRS: {e}"))
-                    return
-
-                try:
-                    dastard_client = EasyClientDastard()
-                except Exception as e:
-                    self.update_queue.put(("error", f"Failed to connect to Dastard: {e}"))
-                    return
-            
-            n_periods_low_for_duration = 1
-            N_samples = int(config["fs"] * n_periods_low_for_duration / config["f_low"])
-            V_stim = config["amp_mult"] * config["vpp"]
-            
-            tau_shift_0V = None
-            fs_sch = None
-            Z_model_pure = None
-            fft_freqs = None
-            f_sch_idx = None
-            
-            total_steps = len(bias_values)
-            
-            # Outer Sweep Loop (Infinite run loop requested: "keeps making bias sweeps")
-            sweep_count = 1
-            while not self.stop_requested.is_set():
-                self.update_queue.put(("log", f"Starting Bias Sweep #{sweep_count} ({total_steps} points)..."))
-                
-                for idx, bias in enumerate(bias_values):
-                    if self.stop_requested.is_set():
-                        break
-                    
-                    self.update_queue.put(("log", f"Sweep #{sweep_count} | Step {idx+1}/{total_steps} | Bias = {bias:.3f} V"))
-                    
-                    # Apply bias
-                    if is_sim:
-                        vbox.setvolt(bias)
-                        dastard_client.set_bias(bias)
-                    else:
-                        if vbox:
-                            vbox.setvolt(config["v_norm"])
-                            time.sleep(0.1)
-                            vbox.setvolt(bias)
-                            time.sleep(0.5)
-                    
-                    # Set waveform on AWG for the 0V step
-                    if idx == 0:
-                        f_mults_list = generate_freq_mutiples_logspaced(
-                            f0=config["f0"], start_exp=0, stop_exp=3, num_high_freq_tones=20, fs_global=config["fs"]
-                        )
-                        fs_sch, v_sch = cos_superimposed(
-                            f_mults_list, config["f0"], config["f_low"], n_periods_low_for_duration, config["awg_rate"], config["amp_mult"]
-                        )
-                        
-                        if config["trigger_awg"] and not is_sim:
-                            # Direct execution keysight call
-                            try:
-                                fg = qsdumux.instruments.Keysight33600A_usb(url=config["keysight_url"])
-                                # Setup arb block
-                                fg._checkSource(2)
-                                fg.clearVolatileMem(2)
-                                time.sleep(0.1)
-                                fg.setByteOrder(swap_bytes=True)
-                                packed_bytes = np.array(v_sch, dtype=np.float32).tobytes()
-                                header = f'SOURce2:DATA:ARB newone, #{len(str(len(packed_bytes)))}{len(packed_bytes)}'.encode('ascii')
-                                fg._write_raw(header + packed_bytes + b"\n")
-                                
-                                fg.setFunction(waveform_function='ARB', source=2)
-                                fg.setArbFile(2, "newone")
-                                fg.setArbSampleRate(2, config["awg_rate"])
-                                fg.setArbFilter(2, filter_state='STEP')
-                                fg.setAmplitude(2, config["vpp"])
-                                fg.setOutputState(source=2, output_state='ON')
-                                time.sleep(2)
-                                for _ in range(100):
-                                    fg._write_raw(b"SYST:ERR?")
-                                    if fg.readline().startswith(b"+0"):
-                                        break
-                            except Exception as e:
-                                self.update_queue.put(("log", f"Warning: Keysight error: {e}"))
-                    
-                    # Fetch Dastard current data
-                    data_all = dastard_client.getNewData(N_samples * 4)
-                    data_raw = data_all[f"chan{config['channel']}"] * 1.0
-                    data_mean = data_raw[:N_samples * 4].reshape((4, N_samples)).mean(axis=0)
-                    firstFrameIndexMod = data_all["firstFrameIndex"][0] % N_samples
-                    data = np.roll(data_mean, firstFrameIndexMod)
-                    
-                    # FFT
-                    fft_data_raw = scipy.fft.rfft(data)
-                    fft_freqs = scipy.fft.rfftfreq(N_samples, d=1/config["fs"])
-                    f_sch_idx = np.searchsorted(fft_freqs, fs_sch)
-                    
-                    # Fit 0V pole to get time shift
-                    if idx == 0:
-                        def magnitude_model(fs, amp0, f_roll):
-                            return amp0 / np.sqrt(1 + (fs / f_roll)**2)
-
-                        model_mag = Model(magnitude_model)
-                        params_mag = Parameters()
-                        params_mag.add('amp0', value=np.abs(fft_data_raw[0]), vary=True)
-                        params_mag.add('f_roll', value=1e3, vary=True)
-                        result_mag = model_mag.fit(np.abs(fft_data_raw[f_sch_idx]), fs=fs_sch, params=params_mag)
-                        amp0 = result_mag.params["amp0"].value
-                        f_roll = result_mag.params["f_roll"].value
-
-                        Z_model_pure = amp0 / (1 + 1j * fs_sch / f_roll)
-
-                        def real_model(fs, tau_shift):
-                            return np.real((fft_data_raw * np.exp(-2j * np.pi * fft_freqs * tau_shift))[f_sch_idx])
-
-                        model_real = Model(real_model)
-                        tau_guess = -np.argmax(data) / config["fs"]
-                        params = Parameters()
-                        params.add('tau_shift', value=tau_guess, vary=True)
-                        result_real = model_real.fit(np.real(Z_model_pure), fs=fs_sch, params=params)
-                        tau_shift_0V = result_real.params['tau_shift'].value
-                    
-                    # Unroll data phase
-                    fft_unroll = (fft_data_raw * np.exp(-2j * np.pi * fft_freqs * tau_shift_0V))[f_sch_idx]
-                    
-                    # Post data update back to Tkinter UI thread
-                    plot_data = {
-                        "bias": bias,
-                        "tau_shift": tau_shift_0V,
-                        "fs_sch": fs_sch,
-                        "fft_unroll": fft_unroll,
-                        "Z_model_pure": Z_model_pure
-                    }
-                    self.update_queue.put(("plot", plot_data))
-                    
-                    # Sleep slightly between points to keep background loop friendly
-                    time.sleep(0.1)
-                
-                sweep_count += 1
-                
-            self.update_queue.put(("finished", None))
-        except Exception as e:
-            self.update_queue.put(("error", f"An error occurred in background sweep:\n{e}"))
-
-    # ----------------------------------------------------------------------
-    # UI Thread Communication and Matplotlib Plot Redrawing
-    # ----------------------------------------------------------------------
-    def process_queue(self):
-        try:
-            while True:
-                msg_type, payload = self.update_queue.get_nowait()
-                if msg_type == "log":
-                    self.progress_lbl.configure(text=payload)
-                elif msg_type == "error":
-                    messagebox.showerror("Sweep Error", payload)
-                    self.reset_ui()
-                elif msg_type == "finished":
-                    self.reset_ui()
-                elif msg_type == "plot":
-                    self.redraw_plots(payload)
-        except queue.Empty:
-            pass
-        # Keep polling queue
-        self.root.after(100, self.process_queue)
-
-    def redraw_plots(self, data):
-        # Extract data payload
-        bias = data["bias"]
-        tau = data["tau_shift"]
-        fs_sch = data["fs_sch"]
-        fft_unroll = data["fft_unroll"]
-        Z_model_pure = data["Z_model_pure"]
-        
-        # Clear plots
-        for ax in self.axs.flat:
+        for ax, title in zip(self.axs.flatten(), titles):
             ax.clear()
-            ax.grid(True, which="both", color="#333333", linestyle=":")
-            
-        self.fig.suptitle(f"Bias = {bias:.3f} V, τ_shift = {tau:.6e} s", color="#ff9900", fontsize=14, weight="bold")
-        
-        # Plot 0: Real/Imag parts
-        self.axs[0, 0].semilogx(fs_sch, np.real(fft_unroll), ".-", label="Real Data", color="#1f77b4")
-        self.axs[0, 0].semilogx(fs_sch, np.imag(fft_unroll), ".-", label="Imag Data", color="#ff7f0e")
-        self.axs[0, 0].semilogx(fs_sch, np.real(Z_model_pure), "--", label="Real Model", color="#2ca02c")
-        self.axs[0, 0].semilogx(fs_sch, np.imag(Z_model_pure), "--", label="Imag Model", color="#d62728")
-        self.axs[0, 0].set_title("Real & Imaginary Parts")
-        self.axs[0, 0].legend(fontsize='x-small')
-        
-        # Plot 1: Nyquist
-        self.axs[0, 1].plot(np.real(fft_unroll), np.imag(fft_unroll), ".-", label="Data", color="#1f77b4")
-        self.axs[0, 1].plot(np.real(Z_model_pure), np.imag(Z_model_pure), "--", label="Model", color="#2ca02c")
-        self.axs[0, 1].set_title("Nyquist Plot")
-        self.axs[0, 1].axis("equal")
-        self.axs[0, 1].legend(fontsize='x-small')
-        
-        # Plot 2: Magnitude Response
-        self.axs[1, 0].loglog(fs_sch, np.abs(fft_unroll), ".-", label="Data", color="#1f77b4")
-        self.axs[1, 0].loglog(fs_sch, np.abs(Z_model_pure), "--", label="Model", color="#2ca02c")
-        self.axs[1, 0].set_title("Magnitude Response")
-        self.axs[1, 0].legend(fontsize='x-small')
-        
-        # Plot 3: Phase Response
-        self.axs[1, 1].semilogx(fs_sch, np.angle(fft_unroll)/np.pi, ".-", label="Data", color="#1f77b4")
-        self.axs[1, 1].semilogx(fs_sch, np.angle(Z_model_pure)/np.pi, "--", label="Model", color="#2ca02c")
-        self.axs[1, 1].set_title("Phase Response (π rad)")
-        self.axs[1, 1].legend(fontsize='x-small')
-        
-        self.fig.tight_layout(rect=[0, 0, 1, 0.95])
-        self.canvas.draw()
+            ax.set_facecolor(background_color)
+            ax.set_title(title, color=text_color, fontsize=11, fontweight="bold", pad=8)
+            ax.tick_params(colors=text_color, which="both", labelsize=8)
+            for spine in ax.spines.values():
+                spine.set_color("#444b58" if self.dark_mode else "#9aa0a6")
+            ax.grid(True, which="both", color=grid_color, linestyle="--", alpha=0.5)
 
-    def reset_ui(self):
-        self.btn_go.configure(state="normal")
-        self.btn_stop.configure(state="disabled")
-        self.status_lbl.configure(text="Idle", fg="cyan")
-        self.progress_lbl.configure(text="Sweep completed.")
+        self.axs[0, 0].set_xlabel("Frequency (Hz)", color=text_color, fontsize=9)
+        self.axs[0, 1].set_xlabel("Real(Z)", color=text_color, fontsize=9)
+        self.axs[0, 1].set_ylabel("Imag(Z)", color=text_color, fontsize=9)
+        self.axs[1, 0].set_xlabel("Frequency (Hz)", color=text_color, fontsize=9)
+        self.axs[1, 1].set_xlabel("Frequency (Hz)", color=text_color, fontsize=9)
+        self.draw()
 
+    def set_theme(self, dark_mode):
+        self.dark_mode = dark_mode
+        self.fig.set_facecolor("#1e222b" if dark_mode else "#ffffff")
+        self.init_plots()
+
+    def update_plots(self, plot_data, is_sc_eval=False):
+        """Updates all 4 subplots with latest data point."""
+        bias = plot_data["bias"]
+        tau_shift = plot_data["tau_shift"]
+        fs_sch = plot_data["fs_sch"]
+        fft_unroll = plot_data["fft_unroll"]
+        Z_model_pure = plot_data.get("Z_model_pure", None)
+        dc_source = plot_data.get("dc_source", "AWG")
+
+        text_color = "#e0e4ed" if self.dark_mode else "#202124"
+        legend_face = "#1e222b" if self.dark_mode else "#ffffff"
+        legend_edge = "#444b58" if self.dark_mode else "#9aa0a6"
+        self.init_plots()
+
+        # 1. Real and Imaginary parts
+        ax1 = self.axs[0, 0]
+        c_real = "#00e5ff" if self.dark_mode else "#0072b2"
+        c_imag = "#ff4081" if self.dark_mode else "#d55e00"
+        ax1.semilogx(fs_sch, np.real(fft_unroll), ".-", color=c_real, label="Real (Data)", lw=1.5)
+        ax1.semilogx(fs_sch, np.imag(fft_unroll), ".-", color=c_imag, label="Imag (Data)", lw=1.5)
+        if Z_model_pure is not None:
+            ax1.semilogx(fs_sch, np.real(Z_model_pure), "--", color=c_real, label="Real (Model)", alpha=0.5)
+            ax1.semilogx(fs_sch, np.imag(Z_model_pure), "--", color=c_imag, label="Imag (Model)", alpha=0.5)
+        ax1.legend(loc="best", fontsize=7, facecolor=legend_face, edgecolor=legend_edge, labelcolor=text_color)
+
+        # 2. Nyquist Plot
+        ax2 = self.axs[0, 1]
+        c_nyq = "#69f0ae" if self.dark_mode else "#009e73"
+        ax2.plot(np.real(fft_unroll), np.imag(fft_unroll), ".-", color=c_nyq, label="Data", lw=1.5)
+        if Z_model_pure is not None:
+            ax2.plot(np.real(Z_model_pure), np.imag(Z_model_pure), "--", color=c_nyq, label="Model", alpha=0.5)
+        ax2.legend(loc="best", fontsize=7, facecolor=legend_face, edgecolor=legend_edge, labelcolor=text_color)
+        ax2.axis("equal")
+
+        # 3. Magnitude Response
+        ax3 = self.axs[1, 0]
+        c_mag = "#ffd740" if self.dark_mode else "#cc79a7"
+        ax3.loglog(fs_sch, np.abs(fft_unroll), ".-", color=c_mag, label="Data", lw=1.5)
+        if Z_model_pure is not None:
+            ax3.loglog(fs_sch, np.abs(Z_model_pure), "--", color=c_mag, label="Fit Model", lw=1.2, alpha=0.5)
+        ax3.legend(loc="best", fontsize=7, facecolor=legend_face, edgecolor=legend_edge, labelcolor=text_color)
+
+        # 4. Phase Response
+        ax4 = self.axs[1, 1]
+        c_phase = "#b388ff" if self.dark_mode else "#56b4e9"
+        ax4.semilogx(fs_sch, np.angle(fft_unroll) / np.pi, ".-", color=c_phase, label="Data", lw=1.5)
+        if Z_model_pure is not None:
+            ax4.semilogx(fs_sch, np.angle(Z_model_pure) / np.pi, "--", color=c_phase, label="Fit Model", lw=1.2, alpha=0.5)
+        ax4.set_ylabel("Phase (π rad)", color=text_color, fontsize=9)
+        ax4.legend(loc="best", fontsize=7, facecolor=legend_face, edgecolor=legend_edge, labelcolor=text_color)
+
+        tag = " [0 V Superconducting Baseline]" if is_sc_eval or bias == 0 else ""
+        self.fig.suptitle(
+            f"V_bias = {bias:.3f} V ({dc_source}) | τ_shift = {tau_shift*1e6:.2f} µs{tag}",
+            color=text_color, fontsize=12, fontweight="bold", y=0.98
+        )
+        self.fig.tight_layout(rect=[0, 0, 1, 0.96])
+        self.draw()
+
+
+# ---------------------------------------------------------------------------
+# Main GUI Window
+# ---------------------------------------------------------------------------
+class CZMainWindow(QMainWindow):
+    """Main Application Window for EZ-CZ Testing."""
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("EZ-CZ Dashboard - Complex Impedance")
+        self.resize(1600, 850)
+        self.worker = None
+
+        self.dark_stylesheet = """
+            QMainWindow, QWidget {
+                background-color: #12141a;
+                color: #e0e4ed;
+                font-family: 'Segoe UI', Arial, sans-serif;
+                font-size: 10pt;
+            }
+            QGroupBox {
+                border: 1px solid #2a313d;
+                border-radius: 6px;
+                margin-top: 22px;
+                padding-top: 16px;
+                font-weight: bold;
+                color: #82b1ff;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                subcontrol-position: top left;
+                padding: 0 8px;
+            }
+            QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox {
+                background-color: #1b2028;
+                border: 1px solid #363d4a;
+                border-radius: 4px;
+                padding: 4px 8px;
+                color: #ffffff;
+                selection-background-color: #2979ff;
+            }
+            QLineEdit:focus, QSpinBox:focus, QDoubleSpinBox:focus, QComboBox:focus {
+                border: 1px solid #2979ff;
+            }
+            QPushButton {
+                background-color: #263238;
+                border: 1px solid #37474f;
+                border-radius: 4px;
+                padding: 8px 14px;
+                font-weight: bold;
+                color: #eceff1;
+            }
+            QPushButton:hover {
+                background-color: #37474f;
+                border-color: #546e7a;
+            }
+            QPushButton:pressed {
+                background-color: #1e272c;
+            }
+            QPushButton:disabled {
+                background-color: #171a21;
+                color: #546e7a;
+                border-color: #263238;
+            }
+            QProgressBar {
+                border: 1px solid #2a313d;
+                border-radius: 4px;
+                text-align: center;
+                background-color: #181d24;
+                color: #ffffff;
+                font-weight: bold;
+            }
+            QProgressBar::chunk {
+                background-color: #00c853;
+                border-radius: 3px;
+            }
+            QTextEdit {
+                background-color: #0d1017;
+                border: 1px solid #262c38;
+                border-radius: 4px;
+                font-family: 'Consolas', 'Courier New', monospace;
+                font-size: 9pt;
+                color: #cfd8dc;
+            }
+            QTabWidget::pane {
+                border: 1px solid #2a313d;
+                border-radius: 4px;
+                background-color: #151922;
+            }
+            QTabBar::tab {
+                background-color: #1e2430;
+                color: #90a4ae;
+                padding: 8px 16px;
+                border-top-left-radius: 4px;
+                border-top-right-radius: 4px;
+                font-weight: bold;
+            }
+            QTabBar::tab:selected {
+                background-color: #151922;
+                color: #82b1ff;
+                border-bottom: 2px solid #2979ff;
+            }
+        """
+
+        self.init_ui()
+        self.load_settings_from_json()
+        self.on_timing_source_changed()
+        self.on_dc_source_changed()
+        self.update_bias_preview()
+        self.apply_theme()
+
+    def init_ui(self):
+        main_widget = QWidget()
+        self.setCentralWidget(main_widget)
+        main_layout = QHBoxLayout(main_widget)
+        main_layout.setContentsMargins(10, 10, 10, 10)
+        main_layout.setSpacing(10)
+
+        splitter = QSplitter(Qt.Horizontal)
+        main_layout.addWidget(splitter)
+
+        # Left Pane: Config Tabs & Controls
+        left_widget = QWidget()
+        left_layout = QVBoxLayout(left_widget)
+        left_layout.setContentsMargins(0, 0, 0, 0)
+        left_layout.setSpacing(8)
+
+        # Tab Widget for Parameter Sections
+        tabs = QTabWidget()
+        tabs.addTab(self._create_bias_tab(), "Bias & DC Source")
+        tabs.addTab(self._create_awg_tab(), "AWG Stimulus")
+        tabs.addTab(self._create_timing_tab(), "Timing / Flux Ramp")
+        tabs.addTab(self._create_sc_health_tab(), "SC Health Check")
+        left_layout.addWidget(tabs, stretch=0)
+
+        # Safety & Status Group
+        status_box = QGroupBox("Acquisition Status")
+        status_layout = QVBoxLayout(status_box)
+        status_layout.setSpacing(6)
+
+        badge_layout = QHBoxLayout()
+        self.lbl_status = QLabel("STATE: IDLE")
+        self.lbl_status.setStyleSheet("font-weight: bold; color: #b0bec5; font-size: 11pt;")
+        self.lbl_current_bias = QLabel("Bias: -- V")
+        self.lbl_current_bias.setStyleSheet("font-weight: bold; color: #82b1ff; font-size: 11pt;")
+        badge_layout.addWidget(self.lbl_status)
+        badge_layout.addStretch()
+        badge_layout.addWidget(self.lbl_current_bias)
+        status_layout.addLayout(badge_layout)
+
+        # Health Indicator Badge
+        self.lbl_sc_health = QLabel("SC 0V Health: Not Tested")
+        self.lbl_sc_health.setStyleSheet("padding: 4px; border-radius: 4px; background-color: #263238; color: #eceff1; font-weight: bold;")
+        status_layout.addWidget(self.lbl_sc_health)
+
+        # Progress bar
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        status_layout.addWidget(self.progress_bar)
+
+        left_layout.addWidget(status_box)
+
+        # Action Buttons
+        btn_box = QGroupBox("Execution Controls")
+        btn_layout = QGridLayout(btn_box)
+        btn_layout.setSpacing(8)
+
+        self.btn_check_limits = QPushButton("Verify Voltage Limits")
+        self.btn_check_limits.setStyleSheet("background-color: #1976d2; color: #ffffff;")
+        self.btn_check_limits.clicked.connect(self.on_verify_limits_clicked)
+
+        self.btn_test_0v = QPushButton("Test 0V SC Baseline Only")
+        self.btn_test_0v.setStyleSheet("background-color: #00897b; color: #ffffff;")
+        self.btn_test_0v.clicked.connect(self.on_test_0v_clicked)
+
+        self.btn_start = QPushButton("START FULL SWEEP")
+        self.btn_start.setStyleSheet("background-color: #2e7d32; color: #ffffff; font-size: 11pt; padding: 10px;")
+        self.btn_start.clicked.connect(self.on_start_clicked)
+
+        self.btn_abort = QPushButton("ABORT (SAFE ZERO)")
+        self.btn_abort.setStyleSheet("background-color: #c62828; color: #ffffff; font-size: 11pt; font-weight: bold; padding: 10px;")
+        self.btn_abort.setEnabled(False)
+        self.btn_abort.clicked.connect(self.on_abort_clicked)
+
+        self.btn_resume = QPushButton("Resume / Proceed")
+        self.btn_resume.setStyleSheet("background-color: #f57f17; color: #ffffff;")
+        self.btn_resume.setEnabled(False)
+        self.btn_resume.clicked.connect(self.on_resume_clicked)
+
+        for button in (
+            self.btn_check_limits,
+            self.btn_test_0v,
+            self.btn_start,
+            self.btn_abort,
+            self.btn_resume,
+        ):
+            button.setFixedSize(250, 44)
+
+        btn_layout.addWidget(self.btn_check_limits, 0, 0)
+        btn_layout.addWidget(self.btn_test_0v, 0, 1)
+        btn_layout.addWidget(self.btn_start, 1, 0)
+        btn_layout.addWidget(self.btn_abort, 1, 1)
+        btn_layout.addWidget(self.btn_resume, 2, 0)
+        left_layout.addWidget(btn_box)
+
+        # Save settings button
+        self.btn_save_config = QPushButton("Save Settings as Default (run_settings.json)")
+        self.btn_save_config.setStyleSheet("background-color: #37474f; color: #cfd8dc; font-size: 9pt;")
+        self.btn_save_config.clicked.connect(self.save_settings_to_json)
+        left_layout.addWidget(self.btn_save_config)
+
+        # Console Log
+        log_box = QGroupBox("Activity Console Log")
+        log_layout = QVBoxLayout(log_box)
+        self.txt_log = QTextEdit()
+        self.txt_log.setReadOnly(True)
+        log_layout.addWidget(self.txt_log)
+        left_layout.addWidget(log_box, stretch=1)
+
+        splitter.addWidget(left_widget)
+
+        # Right Pane: 4-Panel Live Canvas & Toolbar
+        right_widget = QWidget()
+        right_layout = QVBoxLayout(right_widget)
+        right_layout.setContentsMargins(0, 0, 0, 0)
+        right_layout.setSpacing(6)
+
+        self.canvas = CZPlotCanvas(self, width=9, height=8)
+        self.toolbar = NavigationToolbar(self.canvas, self)
+        self.toolbar.setStyleSheet("background-color: #e4e8ed; border: 1px solid #c7cbd1; border-radius: 4px;")
+
+        right_layout.addWidget(self.toolbar)
+        right_layout.addWidget(self.canvas, stretch=1)
+
+        splitter.addWidget(right_widget)
+        splitter.setStretchFactor(0, 1)
+        splitter.setStretchFactor(1, 1)
+
+    def _create_bias_tab(self):
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        layout.setSpacing(8)
+
+        source_box = QGroupBox("DC Bias Source & Channel Selection")
+        source_layout = QGridLayout(source_box)
+        source_layout.setSpacing(8)
+
+        # Rolldown Menu for DC Source
+        source_layout.addWidget(QLabel("DC Bias Source:"), 0, 0)
+        self.combo_dc_source = QComboBox()
+        self.combo_dc_source.addItems(["DC source: AWG", "DC source: SRS900"])
+        self.combo_dc_source.setCurrentIndex(0)
+        self.combo_dc_source.currentIndexChanged.connect(self.on_dc_source_changed)
+        source_layout.addWidget(self.combo_dc_source, 0, 1)
+
+        source_layout.addWidget(QLabel("Target Channel (ch_global):"), 0, 2)
+        self.spin_channel = QSpinBox()
+        self.spin_channel.setRange(0, 2048)
+        self.spin_channel.setValue(13)
+        source_layout.addWidget(self.spin_channel, 0, 3)
+
+        self.lbl_dc_source_note = QLabel("AWG Option B1: DC offset is generated directly on AWG Channel 2 (from cztest4 / cz_test_AWG-DC).")
+        self.lbl_dc_source_note.setStyleSheet("color: #00897b; font-size: 8.5pt; font-style: italic;")
+        source_layout.addWidget(self.lbl_dc_source_note, 1, 0, 1, 4)
+
+        # SRS900 Configuration Sub-Group
+        self.grp_srs = QGroupBox("SRS SIM900 / SIM928 Configuration (cztest3 style)")
+        srs_grid = QGridLayout(self.grp_srs)
+        srs_grid.setSpacing(6)
+
+        srs_grid.addWidget(QLabel("Mainframe URL:"), 0, 0)
+        self.edit_srs_url = QLineEdit("serial:///dev/ttyUSB1?baudrate=9600")
+        srs_grid.addWidget(self.edit_srs_url, 0, 1)
+
+        srs_grid.addWidget(QLabel("SIM928 Port/Slot:"), 0, 2)
+        self.spin_srs_port = QSpinBox()
+        self.spin_srs_port.setRange(1, 8)
+        self.spin_srs_port.setValue(2)
+        srs_grid.addWidget(self.spin_srs_port, 0, 3)
+
+        self.chk_srs_pulse_vnorm = QCheckBox("Pulse Vnorm (0.1 s) before each bias point (cztest3 apply_bias)")
+        self.chk_srs_pulse_vnorm.setChecked(True)
+        srs_grid.addWidget(self.chk_srs_pulse_vnorm, 1, 0, 1, 4)
+
+        source_layout.addWidget(self.grp_srs, 2, 0, 1, 4)
+        layout.addWidget(source_box)
+
+        # Schedule Box
+        sched_box = QGroupBox("Bias Voltage Schedule (V)")
+        grid = QGridLayout(sched_box)
+        grid.setSpacing(6)
+
+        grid.addWidget(QLabel("Baseline Point:"), 0, 0)
+        self.spin_base_bias = QDoubleSpinBox()
+        self.spin_base_bias.setRange(0.0, 0.0)
+        self.spin_base_bias.setValue(0.0)
+        self.spin_base_bias.setDecimals(3)
+        self.spin_base_bias.setEnabled(False)
+        grid.addWidget(self.spin_base_bias, 0, 1)
+        grid.addWidget(QLabel("(Fixed 0.0 V for SC calibration)"), 0, 2)
+
+        self.chk_normal_first = QCheckBox("SC check, then normalize TES for 1 s before sweep")
+        self.chk_normal_first.setChecked(False)
+        self.chk_normal_first.toggled.connect(self.update_bias_preview)
+        grid.addWidget(self.chk_normal_first, 0, 3, 1, 3)
+
+        grid.addWidget(QLabel("Vnorm:"), 3, 0)
+        self.spin_vnorm = QDoubleSpinBox()
+        self.spin_vnorm.setRange(0.0, 10.0)
+        self.spin_vnorm.setValue(9.5)
+        self.spin_vnorm.setDecimals(3)
+        self.spin_vnorm.setSingleStep(0.5)
+        self.spin_vnorm.valueChanged.connect(self.update_bias_preview)
+        grid.addWidget(self.spin_vnorm, 3, 1)
+        grid.addWidget(QLabel("(Used as pre-sweep or conditioning offset)"), 3, 2, 1, 4)
+
+        grid.addWidget(QLabel("Post-normal recovery (s):"), 4, 0)
+        self.spin_post_normal_settle = QDoubleSpinBox()
+        self.spin_post_normal_settle.setRange(0.0, 60.0)
+        self.spin_post_normal_settle.setValue(5.0)
+        self.spin_post_normal_settle.setDecimals(1)
+        self.spin_post_normal_settle.setSingleStep(1.0)
+        grid.addWidget(self.spin_post_normal_settle, 4, 1)
+        grid.addWidget(QLabel("(Wait before first sweep point)"), 4, 2, 1, 4)
+
+        # Dense region
+        grid.addWidget(QLabel("Dense Region:"), 1, 0)
+        self.spin_dense_start = QDoubleSpinBox()
+        self.spin_dense_start.setRange(0.0, 10.0)
+        self.spin_dense_start.setValue(0.5)
+        self.spin_dense_start.setSingleStep(0.1)
+        self.spin_dense_start.valueChanged.connect(self.update_bias_preview)
+        grid.addWidget(self.spin_dense_start, 1, 1)
+
+        grid.addWidget(QLabel("to"), 1, 2)
+        self.spin_dense_stop = QDoubleSpinBox()
+        self.spin_dense_stop.setRange(0.0, 10.0)
+        self.spin_dense_stop.setValue(1.5)
+        self.spin_dense_stop.setSingleStep(0.1)
+        self.spin_dense_stop.valueChanged.connect(self.update_bias_preview)
+        grid.addWidget(self.spin_dense_stop, 1, 3)
+
+        grid.addWidget(QLabel("step:"), 1, 4)
+        self.spin_dense_step = QDoubleSpinBox()
+        self.spin_dense_step.setRange(0.001, 1.0)
+        self.spin_dense_step.setValue(0.01)
+        self.spin_dense_step.setDecimals(3)
+        self.spin_dense_step.setSingleStep(0.005)
+        self.spin_dense_step.valueChanged.connect(self.update_bias_preview)
+        grid.addWidget(self.spin_dense_step, 1, 5)
+
+        # Medium region
+        grid.addWidget(QLabel("Medium Region:"), 2, 0)
+        self.spin_med_start = QDoubleSpinBox()
+        self.spin_med_start.setRange(0.0, 10.0)
+        self.spin_med_start.setValue(1.5)
+        self.spin_med_start.setSingleStep(0.1)
+        self.spin_med_start.valueChanged.connect(self.update_bias_preview)
+        grid.addWidget(self.spin_med_start, 2, 1)
+
+        grid.addWidget(QLabel("to"), 2, 2)
+        self.spin_med_stop = QDoubleSpinBox()
+        self.spin_med_stop.setRange(0.0, 10.0)
+        self.spin_med_stop.setValue(5.0)
+        self.spin_med_stop.setSingleStep(0.5)
+        self.spin_med_stop.valueChanged.connect(self.update_bias_preview)
+        grid.addWidget(self.spin_med_stop, 2, 3)
+
+        grid.addWidget(QLabel("step:"), 2, 4)
+        self.spin_med_step = QDoubleSpinBox()
+        self.spin_med_step.setRange(0.01, 2.0)
+        self.spin_med_step.setValue(0.1)
+        self.spin_med_step.setDecimals(2)
+        self.spin_med_step.setSingleStep(0.05)
+        self.spin_med_step.valueChanged.connect(self.update_bias_preview)
+        grid.addWidget(self.spin_med_step, 2, 5)
+
+        layout.addWidget(sched_box)
+
+        # Bias Points Summary Label
+        self.lbl_bias_summary = QLabel("Total Points: -- | Max: -- V")
+        self.lbl_bias_summary.setStyleSheet("color: #00897b; font-weight: bold;")
+        layout.addWidget(self.lbl_bias_summary)
+
+        # Bias points table preview
+        self.tbl_bias = QTableWidget(0, 2)
+        self.tbl_bias.setHorizontalHeaderLabels(["Index", "Bias Voltage (V)"])
+        self.tbl_bias.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.tbl_bias.setMaximumHeight(150)
+        layout.addWidget(self.tbl_bias)
+
+        layout.addStretch()
+        return tab
+
+    def _create_awg_tab(self):
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        grid = QGridLayout()
+        grid.setSpacing(8)
+
+        grid.addWidget(QLabel("AWG Address / URL:"), 0, 0)
+        self.edit_awg_addr = QLineEdit("USB::2391::22279::INSTR")
+        grid.addWidget(self.edit_awg_addr, 0, 1)
+
+        grid.addWidget(QLabel("Output Channel:"), 1, 0)
+        self.spin_awg_ch = QSpinBox()
+        self.spin_awg_ch.setRange(1, 2)
+        self.spin_awg_ch.setValue(2)
+        grid.addWidget(self.spin_awg_ch, 1, 1)
+
+        grid.addWidget(QLabel("Termination Load:"), 2, 0)
+        self.combo_load = QComboBox()
+        self.combo_load.addItems(["INFinity", "50"])
+        grid.addWidget(self.combo_load, 2, 1)
+
+        grid.addWidget(QLabel("AC Amplitude Vpp (V):"), 3, 0)
+        self.spin_awg_vpp = QDoubleSpinBox()
+        self.spin_awg_vpp.setRange(0.001, 1.0)
+        self.spin_awg_vpp.setValue(0.02)
+        self.spin_awg_vpp.setDecimals(4)
+        self.spin_awg_vpp.setSingleStep(0.005)
+        grid.addWidget(self.spin_awg_vpp, 3, 1)
+
+        grid.addWidget(QLabel("Multiplier per Sine:"), 4, 0)
+        self.spin_sine_mult = QDoubleSpinBox()
+        self.spin_sine_mult.setRange(0.001, 0.5)
+        self.spin_sine_mult.setValue(0.04)
+        self.spin_sine_mult.setDecimals(4)
+        grid.addWidget(self.spin_sine_mult, 4, 1)
+
+        grid.addWidget(QLabel("Nominal AWG Rate (MSa/s):"), 5, 0)
+        self.spin_awg_rate = QDoubleSpinBox()
+        self.spin_awg_rate.setRange(0.1, 50.0)
+        self.spin_awg_rate.setValue(5.0)
+        grid.addWidget(self.spin_awg_rate, 5, 1)
+
+        grid.addWidget(QLabel("Settle Time (s):"), 6, 0)
+        self.spin_settle = QDoubleSpinBox()
+        self.spin_settle.setRange(0.05, 5.0)
+        self.spin_settle.setValue(0.3)
+        grid.addWidget(self.spin_settle, 6, 1)
+
+        layout.addLayout(grid)
+        layout.addStretch()
+        return tab
+
+    def _create_timing_tab(self):
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        grid = QGridLayout()
+        grid.setSpacing(8)
+
+        self.chk_auto_cfg = QCheckBox("Auto-read time_per_flux_ramp from experiment.cfg")
+        self.chk_auto_cfg.setChecked(True)
+        self.chk_auto_cfg.toggled.connect(self.on_timing_source_changed)
+        grid.addWidget(self.chk_auto_cfg, 0, 0, 1, 2)
+
+        grid.addWidget(QLabel("Config File Path:"), 1, 0)
+        cfg_h = QHBoxLayout()
+        self.edit_cfg_path = QLineEdit(DEFAULT_CONFIG_PATH)
+        cfg_h.addWidget(self.edit_cfg_path)
+        self.btn_browse_cfg = QPushButton("Browse")
+        self.btn_browse_cfg.clicked.connect(self.on_browse_cfg)
+        cfg_h.addWidget(self.btn_browse_cfg)
+        grid.addLayout(cfg_h, 1, 1)
+
+        grid.addWidget(QLabel("Manual time_per_flux_ramp (µs):"), 2, 0)
+        self.spin_manual_tfr = QDoubleSpinBox()
+        self.spin_manual_tfr.setRange(0.5, 100.0)
+        self.spin_manual_tfr.setValue(8.192)
+        self.spin_manual_tfr.setDecimals(4)
+        self.spin_manual_tfr.setEnabled(False)
+        grid.addWidget(self.spin_manual_tfr, 2, 1)
+
+        grid.addWidget(QLabel("Target Duration (s):"), 3, 0)
+        self.spin_target_dur = QDoubleSpinBox()
+        self.spin_target_dur.setRange(0.05, 5.0)
+        self.spin_target_dur.setValue(0.2)
+        self.spin_target_dur.setDecimals(3)
+        grid.addWidget(self.spin_target_dur, 3, 1)
+
+        grid.addWidget(QLabel("Target Base Comb f0 (Hz):"), 4, 0)
+        self.spin_target_f0 = QDoubleSpinBox()
+        self.spin_target_f0.setRange(1.0, 500.0)
+        self.spin_target_f0.setValue(20.0)
+        grid.addWidget(self.spin_target_f0, 4, 1)
+
+        grid.addWidget(QLabel("Num High-Freq Tones:"), 5, 0)
+        self.spin_num_tones = QSpinBox()
+        self.spin_num_tones.setRange(5, 50)
+        self.spin_num_tones.setValue(30)
+        grid.addWidget(self.spin_num_tones, 5, 1)
+
+        grid.addWidget(QLabel("Averages per Bias Point:"), 6, 0)
+        self.spin_averages = QSpinBox()
+        self.spin_averages.setRange(1, 32)
+        self.spin_averages.setValue(4)
+        grid.addWidget(self.spin_averages, 6, 1)
+
+        grid.addWidget(QLabel("Data Save Root Dir:"), 7, 0)
+        self.edit_save_dir = QLineEdit("/data")
+        grid.addWidget(self.edit_save_dir, 7, 1)
+
+        layout.addLayout(grid)
+        layout.addStretch()
+        return tab
+
+    def _create_sc_health_tab(self):
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        grid = QGridLayout()
+        grid.setSpacing(8)
+
+        self.chk_auto_abort = QCheckBox("Automatically ABORT sweep if 0V transfer function looks bad")
+        self.chk_auto_abort.setChecked(True)
+        self.chk_auto_abort.setStyleSheet("font-weight: bold; color: #d32f2f;")
+        grid.addWidget(self.chk_auto_abort, 0, 0, 1, 2)
+
+        self.chk_pause_0v = QCheckBox("Pause after 0V calibration for user visual inspection")
+        self.chk_pause_0v.setChecked(False)
+        self.chk_pause_0v.setStyleSheet("color: #f57f17;")
+        grid.addWidget(self.chk_pause_0v, 1, 0, 1, 2)
+
+        grid.addWidget(QLabel("SC acquisition settle time (s):"), 2, 0)
+        self.spin_sc_settle = QDoubleSpinBox()
+        self.spin_sc_settle.setRange(0.0, 30.0)
+        self.spin_sc_settle.setValue(2.0)
+        self.spin_sc_settle.setDecimals(1)
+        self.spin_sc_settle.setSingleStep(0.5)
+        grid.addWidget(self.spin_sc_settle, 2, 1)
+
+        grid.addWidget(QLabel("Minimum Acceptable R² Fit Quality:"), 3, 0)
+        self.spin_min_r2 = QDoubleSpinBox()
+        self.spin_min_r2.setRange(0.1, 0.999)
+        self.spin_min_r2.setValue(0.85)
+        self.spin_min_r2.setDecimals(3)
+        self.spin_min_r2.setSingleStep(0.05)
+        grid.addWidget(self.spin_min_r2, 3, 1)
+
+        grid.addWidget(QLabel("Allowed f_roll Range (Hz):"), 4, 0)
+        f_h = QHBoxLayout()
+        self.spin_min_froll = QDoubleSpinBox()
+        self.spin_min_froll.setRange(1.0, 1000.0)
+        self.spin_min_froll.setValue(10.0)
+        f_h.addWidget(self.spin_min_froll)
+        f_h.addWidget(QLabel("to"))
+        self.spin_max_froll = QDoubleSpinBox()
+        self.spin_max_froll.setRange(100.0, 100000.0)
+        self.spin_max_froll.setValue(25000.0)
+        f_h.addWidget(self.spin_max_froll)
+        grid.addLayout(f_h, 4, 1)
+
+        self.chk_dry_run = QCheckBox("Simulation / Dry Run Mode (No physical instruments required)")
+        self.chk_dry_run.setChecked(not (HAS_HARDWARE_LIBS and HAS_DASTARD_LIB))
+        grid.addWidget(self.chk_dry_run, 5, 0, 1, 2)
+
+        self.chk_dark_mode = QCheckBox("Dark mode")
+        self.chk_dark_mode.setChecked(False)
+        self.chk_dark_mode.toggled.connect(self.apply_theme)
+        grid.addWidget(self.chk_dark_mode, 6, 0, 1, 2)
+
+        layout.addLayout(grid)
+        layout.addStretch()
+        return tab
+
+    # -----------------------------------------------------------------------
+    # Event Handlers & Helpers
+    # -----------------------------------------------------------------------
+    def on_dc_source_changed(self):
+        is_srs = (self.combo_dc_source.currentIndex() == 1)
+        self.grp_srs.setVisible(is_srs)
+        if is_srs:
+            self.lbl_dc_source_note.setText("SRS900 Mode: DC bias is generated via SRS SIM928 isolated source (from cztest3 / cz_test_SRS900-DC).")
+            self.lbl_dc_source_note.setStyleSheet("color: #1976d2; font-size: 8.5pt; font-style: italic;")
+        else:
+            self.lbl_dc_source_note.setText("AWG Option B1: DC offset is generated directly on AWG Channel 2 (from cztest4 / cz_test_AWG-DC).")
+            self.lbl_dc_source_note.setStyleSheet("color: #00897b; font-size: 8.5pt; font-style: italic;")
+
+    def on_timing_source_changed(self):
+        auto = self.chk_auto_cfg.isChecked()
+        self.edit_cfg_path.setEnabled(auto)
+        self.btn_browse_cfg.setEnabled(auto)
+        self.spin_manual_tfr.setEnabled(not auto)
+
+    def apply_theme(self):
+        dark_mode = self.chk_dark_mode.isChecked()
+        if dark_mode:
+            self.setStyleSheet(self.dark_stylesheet)
+            self.toolbar.setStyleSheet("background-color: #1e2430; border: 1px solid #2a313d; border-radius: 4px;")
+        else:
+            self.setStyleSheet("""
+                QMainWindow, QWidget {
+                    background-color: #f4f6f8;
+                    color: #202124;
+                }
+                QGroupBox {
+                    border: 1px solid #c7cbd1;
+                    border-radius: 6px;
+                    margin-top: 22px;
+                    padding-top: 16px;
+                    color: #245ea8;
+                }
+                QGroupBox::title {
+                    subcontrol-origin: margin;
+                    subcontrol-position: top left;
+                    padding: 0 8px;
+                }
+                QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox {
+                    background-color: #ffffff;
+                    border: 1px solid #aeb4bc;
+                    color: #202124;
+                    selection-background-color: #90caf9;
+                }
+                QPushButton {
+                    background-color: #e4e8ed;
+                    border: 1px solid #aeb4bc;
+                    color: #202124;
+                }
+                QTextEdit {
+                    background-color: #ffffff;
+                    border: 1px solid #c7cbd1;
+                    color: #202124;
+                }
+                QTabWidget::pane {
+                    border: 1px solid #c7cbd1;
+                    background-color: #ffffff;
+                }
+                QTabBar::tab {
+                    background-color: #e4e8ed;
+                    color: #4f5965;
+                }
+                QTabBar::tab:selected {
+                    background-color: #ffffff;
+                    color: #245ea8;
+                }
+            """)
+            self.toolbar.setStyleSheet("background-color: #e4e8ed; border: 1px solid #c7cbd1; border-radius: 4px;")
+        self.canvas.set_theme(dark_mode)
+
+    def on_browse_cfg(self):
+        filename, _ = QFileDialog.getOpenFileName(self, "Select experiment.cfg", "/data", "Config Files (*.cfg *.ini);;All Files (*)")
+        if filename:
+            self.edit_cfg_path.setText(filename)
+
+    def update_bias_preview(self):
+        try:
+            dense = np.arange(self.spin_dense_start.value(), self.spin_dense_stop.value(), self.spin_dense_step.value())
+            medium = np.arange(self.spin_med_start.value(), self.spin_med_stop.value() + 1e-9, self.spin_med_step.value())
+            if self.chk_normal_first.isChecked():
+                bias_vals = np.concatenate([[0.0], dense, medium])
+            else:
+                bias_vals = np.concatenate([[0.0], dense, medium])
+                bias_vals = np.sort(bias_vals)
+            bias_vals = np.round(bias_vals, 4)
+            _, first_indices = np.unique(bias_vals, return_index=True)
+            bias_vals = bias_vals[np.sort(first_indices)]
+
+            self.lbl_bias_summary.setText(f"Total Points: {len(bias_vals)} | Max: {np.max(bias_vals):.3f} V")
+            self.tbl_bias.setRowCount(len(bias_vals))
+            for i, b in enumerate(bias_vals):
+                item_idx = QTableWidgetItem(str(i + 1))
+                item_idx.setTextAlignment(Qt.AlignCenter)
+                item_v = QTableWidgetItem(f"{b:.3f}")
+                item_v.setTextAlignment(Qt.AlignCenter)
+                self.tbl_bias.setItem(i, 0, item_idx)
+                self.tbl_bias.setItem(i, 1, item_v)
+        except Exception as e:
+            self.lbl_bias_summary.setText(f"Error computing bias: {e}")
+
+    def get_configured_bias_values(self):
+        dense = np.arange(self.spin_dense_start.value(), self.spin_dense_stop.value(), self.spin_dense_step.value())
+        medium = np.arange(self.spin_med_start.value(), self.spin_med_stop.value() + 1e-9, self.spin_med_step.value())
+        if self.chk_normal_first.isChecked():
+            bias_vals = np.concatenate([[0.0], dense, medium])
+        else:
+            bias_vals = np.concatenate([[0.0], dense, medium])
+            bias_vals = np.sort(bias_vals)
+        bias_vals = np.round(bias_vals, 4)
+        _, first_indices = np.unique(bias_vals, return_index=True)
+        return bias_vals[np.sort(first_indices)]
+
+    def get_time_per_flux_ramp(self):
+        if self.chk_auto_cfg.isChecked():
+            cfg_file = self.edit_cfg_path.text().strip()
+            if os.path.exists(cfg_file):
+                tfr, _ = get_time_per_flux_ramp_from_cfg(cfg_file)
+                return tfr
+            else:
+                self.log("WARN", f"Config file '{cfg_file}' not found. Falling back to manual time_per_flux_ramp ({self.spin_manual_tfr.value():.4f} µs).")
+                return self.spin_manual_tfr.value() * 1e-6
+        else:
+            return self.spin_manual_tfr.value() * 1e-6
+
+    def assemble_parameters(self, single_0v_only=False):
+        tfr = self.get_time_per_flux_ramp()
+        bias_vals = np.array([0.0]) if single_0v_only else self.get_configured_bias_values()
+        dc_source = "AWG" if self.combo_dc_source.currentIndex() == 0 else "SRS900"
+
+        return {
+            "dc_source": dc_source,
+            "srs_url": self.edit_srs_url.text().strip(),
+            "srs_port": self.spin_srs_port.value(),
+            "srs_pulse_vnorm": self.chk_srs_pulse_vnorm.isChecked(),
+            "time_per_flux_ramp": tfr,
+            "target_duration_s": self.spin_target_dur.value(),
+            "target_f0_hz": self.spin_target_f0.value(),
+            "nominal_awg_rate": self.spin_awg_rate.value() * 1e6,
+            "num_high_freq_tones": self.spin_num_tones.value(),
+            "n_averages": self.spin_averages.value(),
+            "channel": self.spin_channel.value(),
+            "bias_values": bias_vals,
+            "normal_first": self.chk_normal_first.isChecked() and not single_0v_only,
+            "vnorm": self.spin_vnorm.value(),
+            "post_normal_settle_s": self.spin_post_normal_settle.value(),
+            "awg_address": self.edit_awg_addr.text().strip(),
+            "awg_channel": self.spin_awg_ch.value(),
+            "awg_load": self.combo_load.currentText(),
+            "awg_vpp": self.spin_awg_vpp.value(),
+            "amp_multiplier": self.spin_sine_mult.value(),
+            "settle_time_s": self.spin_settle.value(),
+            "save_dir": self.edit_save_dir.text().strip(),
+            "auto_abort_on_bad_sc": self.chk_auto_abort.isChecked(),
+            "pause_after_0v": self.chk_pause_0v.isChecked() and not single_0v_only,
+            "sc_settle_time_s": self.spin_sc_settle.value(),
+            "min_sc_r2": self.spin_min_r2.value(),
+            "min_froll_hz": self.spin_min_froll.value(),
+            "max_froll_hz": self.spin_max_froll.value(),
+            "single_0v_test_only": single_0v_only,
+            "dry_run_mode": self.chk_dry_run.isChecked(),
+        }
+
+    def load_settings_from_json(self):
+        """Loads default values from run_settings.json if present."""
+        path = Path(SETTINGS_FILE_PATH)
+        if not path.exists():
+            return
+        try:
+            with open(path, "r") as f:
+                data = json.load(f)
+            m = data.get("measure", {})
+            if "dc_source" in m:
+                idx = 0 if m["dc_source"].upper() == "AWG" else 1
+                self.combo_dc_source.setCurrentIndex(idx)
+            if "channel" in m:
+                self.spin_channel.setValue(int(m["channel"]))
+            if "v_norm" in m:
+                self.spin_vnorm.setValue(float(m["v_norm"]))
+            if "vpp" in m:
+                self.spin_awg_vpp.setValue(float(m["vpp"]))
+            if "amp_mult" in m:
+                self.spin_sine_mult.setValue(float(m["amp_mult"]))
+            if "awg_rate" in m:
+                self.spin_awg_rate.setValue(float(m["awg_rate"]) / 1e6)
+            if "f0" in m:
+                self.spin_target_f0.setValue(float(m["f0"]))
+            if "srs_url" in m:
+                self.edit_srs_url.setText(str(m["srs_url"]))
+            if "srs_port" in m:
+                self.spin_srs_port.setValue(int(m["srs_port"]))
+            if "keysight_url" in m:
+                self.edit_awg_addr.setText(str(m["keysight_url"]))
+            if "bias_dense" in m and len(m["bias_dense"]) == 3:
+                self.spin_dense_start.setValue(float(m["bias_dense"][0]))
+                self.spin_dense_stop.setValue(float(m["bias_dense"][1]))
+                self.spin_dense_step.setValue(float(m["bias_dense"][2]))
+            if "bias_medium" in m and len(m["bias_medium"]) == 3:
+                self.spin_med_start.setValue(float(m["bias_medium"][0]))
+                self.spin_med_stop.setValue(float(m["bias_medium"][1]))
+                self.spin_med_step.setValue(float(m["bias_medium"][2]))
+            if "output_dir" in m and m["output_dir"]:
+                self.edit_save_dir.setText(str(m["output_dir"]))
+            self.log("INFO", f"Loaded parameters from {SETTINGS_FILE_PATH}")
+        except Exception as e:
+            self.log("WARN", f"Could not load {SETTINGS_FILE_PATH}: {e}")
+
+    def save_settings_to_json(self):
+        """Saves current GUI configuration back to run_settings.json."""
+        path = Path(SETTINGS_FILE_PATH)
+        existing = {}
+        if path.exists():
+            try:
+                with open(path, "r") as f:
+                    existing = json.load(f)
+            except Exception:
+                pass
+
+        measure_cfg = existing.get("measure", {})
+        measure_cfg["dc_source"] = "awg" if self.combo_dc_source.currentIndex() == 0 else "srs900"
+        measure_cfg["channel"] = self.spin_channel.value()
+        measure_cfg["v_norm"] = self.spin_vnorm.value()
+        measure_cfg["vpp"] = self.spin_awg_vpp.value()
+        measure_cfg["amp_mult"] = self.spin_sine_mult.value()
+        measure_cfg["awg_rate"] = self.spin_awg_rate.value() * 1e6
+        measure_cfg["f0"] = self.spin_target_f0.value()
+        measure_cfg["srs_url"] = self.edit_srs_url.text().strip()
+        measure_cfg["srs_port"] = self.spin_srs_port.value()
+        measure_cfg["keysight_url"] = self.edit_awg_addr.text().strip()
+        measure_cfg["bias_dense"] = [
+            self.spin_dense_start.value(),
+            self.spin_dense_stop.value(),
+            self.spin_dense_step.value()
+        ]
+        measure_cfg["bias_medium"] = [
+            self.spin_med_start.value(),
+            self.spin_med_stop.value(),
+            self.spin_med_step.value()
+        ]
+        measure_cfg["output_dir"] = self.edit_save_dir.text().strip()
+        existing["measure"] = measure_cfg
+
+        try:
+            with open(path, "w") as f:
+                json.dump(existing, f, indent=2)
+            self.log("INFO", f"Configuration successfully saved to {SETTINGS_FILE_PATH}")
+            QMessageBox.information(self, "Settings Saved", f"Successfully saved defaults to {SETTINGS_FILE_PATH}")
+        except Exception as e:
+            self.log("ERROR", f"Failed to save settings: {e}")
+            QMessageBox.critical(self, "Save Error", str(e))
+
+    # -----------------------------------------------------------------------
+    # Action Button Handlers
+    # -----------------------------------------------------------------------
+    def on_verify_limits_clicked(self):
+        try:
+            dc_source = "AWG" if self.combo_dc_source.currentIndex() == 0 else "SRS900"
+            bias_vals = self.get_configured_bias_values()
+            vpp = self.spin_awg_vpp.value()
+            load = self.combo_load.currentText()
+            v_limit = 10.0 if load.upper() in ("INFINITY", "INF") else 5.0
+
+            self.log("INFO", "=" * 55)
+            self.log("INFO", f"Voltage Verification Check ({dc_source}):")
+
+            if dc_source == "AWG":
+                voltage_check_values = bias_vals
+                if self.chk_normal_first.isChecked():
+                    voltage_check_values = np.append(voltage_check_values, self.spin_vnorm.value())
+                v_max = np.max(voltage_check_values) + (vpp / 2.0)
+                v_min = np.min(voltage_check_values) - (vpp / 2.0)
+                headroom = v_limit - max(abs(v_max), abs(v_min))
+
+                self.log("INFO", f"  AWG Load: {load} | Max allowable: ±{v_limit:.2f} V")
+                self.log("INFO", f"  Peak max: {v_max:+.4f} V | Peak min: {v_min:+.4f} V")
+
+                if v_max > v_limit or v_min < -v_limit:
+                    msg = f"LIMIT EXCEEDED! Range [{v_min:+.3f} V, {v_max:+.3f} V] exceeds ±{v_limit:.1f} V."
+                    self.log("ERROR", msg)
+                    QMessageBox.critical(self, "Limit Error", msg)
+                else:
+                    msg = f"AWG Voltage verification PASSED! Headroom: +{headroom:.3f} V"
+                    self.log("INFO", msg)
+                    QMessageBox.information(self, "Limit Verification", msg)
+            else:
+                ac_peak = vpp / 2.0
+                headroom = v_limit - ac_peak
+                self.log("INFO", f"  AWG AC Stimulus: {vpp:.4f} Vpp (Peak ±{ac_peak:.4f} V)")
+                self.log("INFO", f"  SRS SIM928 DC Bias Range: [{np.min(bias_vals):.3f} V, {np.max(bias_vals):.3f} V] (Rated to ±20.0 V)")
+                msg = f"SRS900 & AWG Verification PASSED! AWG Headroom: +{headroom:.3f} V"
+                self.log("INFO", msg)
+                QMessageBox.information(self, "Limit Verification", msg)
+
+            self.log("INFO", "=" * 55)
+        except Exception as e:
+            QMessageBox.critical(self, "Error", str(e))
+
+    def on_test_0v_clicked(self):
+        self.start_worker(single_0v_only=True)
+
+    def on_start_clicked(self):
+        self.start_worker(single_0v_only=False)
+
+    def start_worker(self, single_0v_only=False):
+        try:
+            params = self.assemble_parameters(single_0v_only=single_0v_only)
+        except Exception as e:
+            QMessageBox.critical(self, "Parameter Error", f"Invalid parameters: {e}")
+            return
+
+        self.btn_start.setEnabled(False)
+        self.btn_test_0v.setEnabled(False)
+        self.btn_check_limits.setEnabled(False)
+        self.btn_abort.setEnabled(True)
+        self.btn_resume.setEnabled(False)
+
+        state_tag = "0V TEST ONLY" if single_0v_only else f"RUNNING ({params['dc_source']})"
+        self.lbl_status.setText(f"STATE: {state_tag}")
+        self.lbl_status.setStyleSheet("font-weight: bold; color: #00e676; font-size: 11pt;")
+        self.progress_bar.setValue(0)
+
+        self.worker = CZWorker(params)
+        self.worker.log_signal.connect(self.log)
+        self.worker.step_started.connect(self.on_worker_step_started)
+        self.worker.step_completed.connect(self.on_worker_step_completed)
+        self.worker.sc_calibrated.connect(self.on_sc_calibrated)
+        self.worker.sc_check_failed.connect(self.on_sc_check_failed)
+        self.worker.pause_for_inspection.connect(self.on_pause_for_inspection)
+        self.worker.progress_signal.connect(self.on_progress)
+        self.worker.finished_signal.connect(self.on_worker_finished)
+        self.worker.start()
+
+    def on_abort_clicked(self):
+        if self.worker is not None and self.worker.isRunning():
+            self.lbl_status.setText("STATE: ABORTING...")
+            self.lbl_status.setStyleSheet("font-weight: bold; color: #ff1744; font-size: 11pt;")
+            self.worker.abort()
+
+    def on_resume_clicked(self):
+        if self.worker is not None and self.worker.isRunning():
+            self.btn_resume.setEnabled(False)
+            self.lbl_status.setText("STATE: RUNNING")
+            self.lbl_status.setStyleSheet("font-weight: bold; color: #00e676; font-size: 11pt;")
+            self.worker.resume()
+
+    # -----------------------------------------------------------------------
+    # Worker Signals Handling
+    # -----------------------------------------------------------------------
+    @pyqtSlot(int, int, float)
+    def on_worker_step_started(self, idx, total, bias_v):
+        self.lbl_current_bias.setText(f"Bias: {bias_v:.3f} V [{idx}/{total}]")
+
+    @pyqtSlot(float, dict)
+    def on_worker_step_completed(self, bias_v, plot_data):
+        self.canvas.update_plots(plot_data, is_sc_eval=(bias_v == 0.0))
+
+    @pyqtSlot(dict)
+    def on_sc_calibrated(self, sc_stats):
+        r2 = sc_stats["r_squared"]
+        f_roll = sc_stats["f_roll"]
+        self.lbl_sc_health.setText(f"SC 0V Health: PASS (R² = {r2:.4f}, f_roll = {f_roll:.1f} Hz)")
+        self.lbl_sc_health.setStyleSheet("padding: 4px; border-radius: 4px; background-color: #1b5e20; color: #b9f6ca; font-weight: bold;")
+
+    @pyqtSlot(str, dict)
+    def on_sc_check_failed(self, reason, sc_stats):
+        self.lbl_sc_health.setText(f"SC 0V Health: BAD ({reason})")
+        self.lbl_sc_health.setStyleSheet("padding: 4px; border-radius: 4px; background-color: #b71c1c; color: #ffcdd2; font-weight: bold;")
+
+    @pyqtSlot(dict)
+    def on_pause_for_inspection(self, sc_stats):
+        self.lbl_status.setText("STATE: PAUSED FOR 0V REVIEW")
+        self.lbl_status.setStyleSheet("font-weight: bold; color: #ffd600; font-size: 11pt;")
+        self.btn_resume.setEnabled(True)
+        QMessageBox.information(
+            self,
+            "0 V Calibration Inspection",
+            f"0 V Superconducting Transfer Function fit complete:\n"
+            f"  - R² Fit Quality: {sc_stats['r_squared']:.4f}\n"
+            f"  - f_roll: {sc_stats['f_roll']:.1f} Hz\n"
+            f"  - tau_shift: {sc_stats['tau_shift']*1e6:.2f} µs\n\n"
+            f"Please inspect the 4 diagnostic subplots.\n"
+            f"Click 'Resume / Proceed' to sweep higher voltages, or 'ABORT' to halt."
+        )
+
+    @pyqtSlot(int, int)
+    def on_progress(self, current, total):
+        pct = int(round((current / total) * 100))
+        self.progress_bar.setValue(pct)
+
+    @pyqtSlot(bool, str)
+    def on_worker_finished(self, success, message):
+        self.btn_start.setEnabled(True)
+        self.btn_test_0v.setEnabled(True)
+        self.btn_check_limits.setEnabled(True)
+        self.btn_abort.setEnabled(False)
+        self.btn_resume.setEnabled(False)
+
+        if success:
+            self.lbl_status.setText("STATE: COMPLETED")
+            self.lbl_status.setStyleSheet("font-weight: bold; color: #00e676; font-size: 11pt;")
+            self.log("INFO", message)
+            QMessageBox.information(self, "Acquisition Complete", message)
+        else:
+            self.lbl_status.setText("STATE: ABORTED / ERROR")
+            self.lbl_status.setStyleSheet("font-weight: bold; color: #ff1744; font-size: 11pt;")
+            self.log("ERROR", message)
+            QMessageBox.warning(self, "Acquisition Stopped", message)
+
+    @pyqtSlot(str, str)
+    def log(self, level, msg):
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        color_map = {
+            "INFO": "#00897b" if not self.chk_dark_mode.isChecked() else "#80cbc4",
+            "WARN": "#f57f17" if not self.chk_dark_mode.isChecked() else "#ffd54f",
+            "ERROR": "#d32f2f" if not self.chk_dark_mode.isChecked() else "#ef5350"
+        }
+        color = color_map.get(level.upper(), "#333333" if not self.chk_dark_mode.isChecked() else "#e0e4ed")
+        html = f"<span style='color:#78909c;'>[{timestamp}]</span> <b style='color:{color};'>[{level.upper()}]</b> {msg}"
+        self.txt_log.append(html)
+        sb = self.txt_log.verticalScrollBar()
+        sb.setValue(sb.maximum())
+
+    def closeEvent(self, event):
+        """Safe shutdown on window close."""
+        if self.worker is not None and self.worker.isRunning():
+            reply = QMessageBox.question(
+                self, "Confirm Exit",
+                "An acquisition run is currently active! Abort and safely zero all voltages before exit?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes
+            )
+            if reply == QMessageBox.Yes:
+                self.worker.abort()
+                self.worker.wait(3000)
+                event.accept()
+            else:
+                event.ignore()
+        else:
+            event.accept()
+
+
+# ===========================================================================
+# Application Entrypoint
+# ===========================================================================
 def main():
-    root = tk.Tk()
-    app = EZCZGui(root)
-    root.mainloop()
+    parser = argparse.ArgumentParser(description="EZ-CZ Dashboard GUI")
+    parser.add_argument("--config", default=DEFAULT_CONFIG_PATH, help="Path to experiment.cfg")
+    args, unknown = parser.parse_known_args()
+
+    app = QApplication(sys.argv)
+    window = CZMainWindow()
+    if os.path.exists(args.config):
+        window.edit_cfg_path.setText(args.config)
+    window.show()
+    sys.exit(app.exec_())
+
 
 if __name__ == "__main__":
     main()

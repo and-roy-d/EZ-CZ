@@ -1,5 +1,6 @@
 {
   "measure": {
+    "dc_source": "awg",
     "fs": 250000.0,
     "channel": 13,
     "v_norm": 9.5,
