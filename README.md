@@ -1,6 +1,6 @@
 # EZ-CZ: Complex Impedance ($Z_{TES}$) Measurement & Analysis
 
-**EZ-CZ** is a Python suite for measuring, visualizing, and analyzing the complex impedance of Transition Edge Sensor (TES) microcalorimeters and bolometers. It automates multi-frequency sine-comb excitation, synchronous DASTARD acquisition, superconducting 0 V transfer function health checks, and two-fluid hanging-body thermal model fitting.
+**EZ-CZ** is a Python suite for measuring, visualizing, and analyzing the complex impedance of Transition Edge Sensor (TES) microcalorimeters and bolometers. It automates multi-frequency sine-comb excitation, synchronous DASTARD acquisition, superconducting 0 V transfer function checks, and thermal model fitting.
 
 ---
 
