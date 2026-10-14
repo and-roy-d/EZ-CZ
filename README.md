@@ -1,163 +1,189 @@
-# EZ-CZ (Complex Impedance Measure & Analyze)
+# EZ-CZ: Complex Impedance ($Z_{TES}$) Measurement & Analysis
 
-`ez-cz` is a standalone Python package for measuring and analyzing the complex impedance ($Z_{TES}$) of Transition Edge Sensor (TES) devices. It interfaces with SRS SIM900/928 voltage boxes, Keysight function generators, and the DASTARD data acquisition client, and fits the measured impedance curves to thermal model equations.
+**EZ-CZ** is a Python suite for measuring, visualizing, and analyzing the complex impedance of Transition Edge Sensor (TES) microcalorimeters and bolometers. It automates multi-frequency sine-comb excitation, synchronous DASTARD acquisition, superconducting 0 V transfer function health checks, and two-fluid hanging-body thermal model fitting.
 
-## Installation
+---
 
-### 1. Prerequisites
-You must have the `uv` Python package manager installed. If you do not have it, install it via:
-```bash
-# On Windows (PowerShell)
-powershell -c "irm https://astral.sh/uv/install.ps1 | iex"
-
-# On macOS/Linux
-curl -LsSf https://astral.sh/uv/install.sh | sh
-```
-
-### 2. Create the environment and install
-Clone this repository (or navigate to its folder) and run:
-```bash
-# Initialize/Create virtual environment
-uv venv
-
-# Install the package in editable mode
-uv pip install -e .
-```
-This command automatically installs all dependencies.
-
-### Alternative: Running without Installation
-If you prefer not to install the package, you can run the source scripts directly using standard Python (provided you have the dependencies like `numpy`, `scipy`, `matplotlib`, `lmfit`, and `pandas` installed in your environment):
+## Quickstart (30 Seconds)
 
 ```bash
-# Run measurements directly
-python src/ez_cz/measure.py --channel 13
+# 1. Launch the interactive real-time GUI
+ez-cz-gui
 
-# Run analysis directly
-python src/ez_cz/analyze.py -c 13
+# 2. Run a measurement sweep from the terminal (default: AWG Ch2 DC bias)
+ez-cz-measure --channel 13
+
+# 3. Test offline on your laptop (simulation / dry-run mode, no hardware needed)
+ez-cz-measure --channel 13 --dry-run
+
+# 4. Analyze an existing dataset and fit thermal parameters
+ez-cz-analyze --channel-id 13 --raw-dir ./data/20250807/Complex_Z/run_01 --iv-file 20250807_iv.npz
 ```
-In this direct mode, the scripts will still automatically check for the `run_settings.json` file in the directory where they are run.
+
+> **Running without installation?**  
+> You can also run the scripts directly:
+> ```bash
+> python src/ez_cz/gui.py
+> python src/ez_cz/measure.py --channel 13 --dry-run
+> python src/ez_cz/analyze.py --channel-id 13
+> ```
+
+---
+
+## How It Works: Two DC Bias Modes
+
+EZ-CZ supports two methods for setting the TES DC bias voltage. You can toggle between them using the GUI dropdown menu or the `--dc-source` CLI flag:
+
+| Mode | AC Stimulus Comb | DC Bias Source | Lab Hardware Required |
+|:---|:---|:---|:---|
+| **`awg`** <br>*(Default)* | Keysight 33600A Ch2 | **Keysight 33600A Ch2** (Hardware DC offset) | **1 BNC cable directly from AWG Ch2.** No external DC voltage box or hardware summing amplifier needed. |
+| **`srs900`** | Keysight 33600A Ch2 | **SRS SIM928** (via SIM900 mainframe) | Keysight AWG + SRS SIM900/928 mainframe + hardware summing amplifier. |
+
+### Flux-Ramp Synchronized Timing
+To eliminate spectral leakage without windowing, EZ-CZ harmonizes all excitation frequencies with DASTARD's flux-ramp demodulation rate:
+1. It reads `flux_ramp_points` from `/data/experiment.cfg` (e.g. $32 \times 64 = 2048$ ticks $\rightarrow 524.288\text{ }\mu\text{s}$).
+2. The fundamental period $T_{\text{meas}} \approx 0.2\text{ s}$ is rounded to an exact integer multiple of flux-ramp cycles.
+3. Every tone in the multi-sine comb is placed on an exact Fourier frequency bin $f_k = k \cdot f_{\text{fund}}$, guaranteeing orthogonal, leakage-free FFT extraction.
+
+---
+
+## Graphical User Interface (`ez-cz-gui`)
+
+The PyQt5 Dashboard provides complete experiment control with real-time feedback:
+
+```
++-----------------------------------------------------------------------------------------+
+| EZ-CZ Dashboard                                                       [ Light / Dark ]  |
++---------------------------------------+-------------------------------------------------+
+| Experiment Settings                   | Live 4-Panel Visualization                      |
+|  - Channel: [ 13 ]                    |  1. Re(Z) & Im(Z) vs. Frequency (semilog-x)     |
+|  - DC Source: [ DC source: AWG v ]   |  2. Nyquist Plot: Im(Z) vs. Re(Z)               |
+|  - AWG Vpp: [ 20 mV ]                 |  3. Magnitude |Z(f)| with L/Rs Fit (log-log)   |
+|  - Bias Points: 0V, Dense, Medium     |  4. Phase vs. Frequency with Tau Delay Fit      |
+|                                       +-------------------------------------------------+
+| Controls                              | Diagnostic Log                                  |
+|  [ START SWEEP ]   [ TEST 0V SC ]     |  [14:02:10] SC Health: PASS (R² = 0.9998)      |
+|  [ CHECK LIMITS ]  [ ABORT (SAFE) ]   |  [14:02:11] Voltage headroom: +4.99 V (PASS)    |
++---------------------------------------+-------------------------------------------------+
+```
+
+### Key Safety & Diagnostic Features
+- **0 V Superconducting Health Check**: Before sweeping bias, the system measures $Z(f)$ at $0\text{ V}$ and fits the single-pole $L/R_s$ transfer function. If the response is unphysical ($R^2 < 0.90$, abnormal roll-off, or corrupted delay), the run aborts immediately to protect data integrity.
+- **Voltage Headroom Verification**: Verifies that combined AC + DC voltage stays within the AWG's allowable range ($\pm 10\text{ V}$ into High-$Z$, or $\pm 5\text{ V}$ into $50\,\Omega$).
+- **Instant Safe ABORT**: Clicking **ABORT** or pressing `Ctrl+C` immediately ramps down and zeroes the DC voltage on both the AWG and SRS SIM928.
+- **Offline Dry Run**: Automatically switches to simulated hardware if `qsdumux` or DASTARD libraries are not detected.
+
+---
+
+## Command-Line Usage
+
+### 1. Measurement Runner (`ez-cz-measure`)
+
+```bash
+ez-cz-measure [OPTIONS]
+```
+
+#### Common Options:
+| Flag | Description | Default |
+|:---|:---|:---|
+| `--dc-source {awg,srs900}` | Choose DC bias source: direct AWG offset or SRS SIM928 | `awg` |
+| `--channel`, `-c` | DASTARD detector channel number | `13` |
+| `--vpp` | AC multi-sine stimulus amplitude in $V_{\text{pp}}$ | `0.02` (20 mV) |
+| `--v-norm` | TES normal-state bias pulse voltage in Volts | `9.5` |
+| `--normal-first` | Pulse TES to normal state for 1 s after 0V calibration | `False` |
+| `--bias-dense` | `START STOP STEP` for dense transition bias sweep | `0.5 1.5 0.01` |
+| `--bias-medium` | `START STOP STEP` for medium transition bias sweep | `1.5 5.0 0.1` |
+| `--dry-run` | Run in simulation mode without hardware | `False` |
+| `--config`, `-cfg` | Path to JSON settings file | `run_settings.json` |
+
+---
+
+### 2. Analysis & Thermal Model Fitting (`ez-cz-analyze`)
+
+```bash
+ez-cz-analyze [OPTIONS]
+```
+
+Processes measured $Z(f)$ across all bias points and fits the two-fluid hanging-body thermal model:
+
+$$Z_{\text{hanging}}(\omega) = R_0 (1 + \beta) + \frac{R_0 \mathcal{L}}{(1 - \mathcal{L})} \frac{(2 + \beta)}{1 + i \omega \tau_I - \frac{g_1 / (g_1 + g_b)(1 - \mathcal{L})}{1 + i \omega \tau_1}}$$
+
+#### Common Options:
+| Flag | Description | Default |
+|:---|:---|:---|
+| `--raw-dir`, `-d` | Path to folder containing measured `bias_*` subfolders | *(from config)* |
+| `--iv-file`, `-i` | Corresponding IV curve `.npz` file for $R_0$ and $I_{\text{TES}}$ extraction | *(from config)* |
+| `--channel-id`, `-c` | Detector channel ID to analyze | `13` |
+| `--tc` | Device critical temperature $T_c$ in Kelvin | `0.12` |
+| `--tbath` | Cryostat bath temperature $T_{\text{bath}}$ in Kelvin | `0.02` |
+| `--rshunt-uohm` | Shunt resistance $R_s$ in micro-Ohms | `250.0` ($\mu\Omega$) |
+| `--l-nyq-nh` | Nyquist circuit inductance $L$ in nano-Henries | `74.8` (nH) |
+| `--output-base-dir`, `-o`| Directory where fit plots and summary CSVs are saved | `/data/.../Results/` |
 
 ---
 
 ## Configuration File (`run_settings.json`)
 
-Both CLI commands can load their default parameters from a single JSON settings file. By default, they will search for a file named `run_settings.json` in the directory where they are executed.
+Both CLI tools and the GUI can load and save settings from `run_settings.json`. Command-line arguments always override values in this file:
 
-To use a custom settings file, pass the `--config` (or `-cfg`) flag:
-```bash
-ez-cz-measure --config custom_settings.json
-ez-cz-analyze -cfg custom_settings.json
+```json
+{
+  "measure": {
+    "dc_source": "awg",
+    "channel": 13,
+    "v_norm": 9.5,
+    "vpp": 0.02,
+    "bias_dense": [0.5, 1.5, 0.01],
+    "bias_medium": [1.5, 5.0, 0.1],
+    "keysight_url": "vxi11://192.168.0.112:2021",
+    "srs_url": "serial:///dev/ttyUSB1?baudrate=9600"
+  },
+  "analyze": {
+    "channel_id": 13,
+    "tc": 0.12,
+    "tbath": 0.02,
+    "rshunt_uOhm": 250.0,
+    "l_nyq_nH": 74.8,
+    "save_plots": true
+  }
+}
 ```
-
-*Note: Command-line arguments always override values specified in the configuration file.*
 
 ---
 
-## Command Line Interface (CLI)
+## Project Structure
 
-The package registers three command-line scripts: `ez-cz-measure`, `ez-cz-analyze`, and `ez-cz-gui`.
-
-### 1. Measurements: `ez-cz-measure`
-To run measurement sweeps, configure the waveform generator, and collect DASTARD traces:
-```bash
-# Default: Using Keysight AWG Ch2 DC offset (cztest4 / cz_test_AWG-DC style)
-ez-cz-measure --channel 13 --dc-source awg
-
-# Alternative: Using SRS SIM900/SIM928 DC voltage box (cztest3 / cz_test_SRS900-DC style)
-ez-cz-measure --channel 13 --dc-source srs900 --srs-url "serial:///dev/ttyUSB1?baudrate=9600"
 ```
-
-#### Key Arguments:
-* `--dc-source`: DC bias voltage source: `awg` (default) or `srs900`.
-* `--channel` / `-c`: Dastard channel ID to read data from (default: `13`).
-* `--config-cfg`: Path to `experiment.cfg` to auto-read `time_per_flux_ramp` (default: `/data/experiment.cfg`).
-* `--time-per-flux-ramp`: Manual time duration per flux ramp in seconds (e.g. `8.192e-6`).
-* `--v-norm`: Bias normalization voltage in Volts (default: `9.5`).
-* `--normal-first`: Drive TES normal for 1.0 s after 0V calibration before sweep.
-* `--awg-rate`: AWG sample rate in Hz (default: `5000000.0`).
-* `--target-duration`: Nominal measurement duration window in seconds (default: `0.2`).
-* `--f0`: Base frequency comb spacing in Hz (default: `20.0`).
-* `--amp-mult`: Amplitude multiplier per sine tone (default: `0.04`).
-* `--vpp`: Final AWG AC amplitude in Vpp (default: `0.02`).
-* `--awg-channel`: AWG output channel number (default: `2`).
-* `--awg-load`: AWG termination load: `INFinity` (default, ±10 V range) or `50` (±5 V range).
-* `--keysight-url`: Keysight AWG connection address or URL (default: `USB::2391::22279::INSTR`).
-* `--srs-url`: SRS SIM900 mainframe serial connection string (default: `"serial:///dev/ttyUSB1?baudrate=9600"`).
-* `--srs-port`: SRS SIM928 card slot port (default: `2`).
-* `--bias-dense`: Start, stop, and step size for dense bias sweeps (default: `0.5 1.5 0.01`).
-* `--bias-medium`: Start, stop, and step size for medium bias sweeps (default: `1.5 5.0 0.1`).
-* `--output-dir`: Custom path to save raw `.npz` records and sweeps.
-* `--dry-run` / `--simulation`: Run in simulation mode without physical hardware.
+EZ-CZ/
+├── run_settings.json         # Default hardware, sweep, and analysis parameters
+├── pyproject.toml            # Package configuration and dependencies
+├── README.md                 # This documentation
+└── src/
+    └── ez_cz/                # Consolidated Python package
+        ├── __init__.py       # Package metadata and helper exports
+        ├── gui.py            # Unified PyQt5 real-time measurement dashboard
+        ├── measure.py        # Automated measurement CLI and hardware control
+        └── analyze.py        # Thermal model fitting and parameter extraction
+```
 
 ---
 
-### 2. Analysis: `ez-cz-analyze`
-To process measurement sweeps, compute the complex impedance $Z_{TES}$, and fit the hanging body thermal model:
+## Installation & Requirements
+
+### Recommended Setup (using `uv`)
+
 ```bash
-ez-cz-analyze --channel-id 13 --raw-dir ./data/20250807/Complex_Z/20250807_141314 --iv-file 20250807_150622_iv.npz
+# Clone the repository
+git clone https://github.com/and-roy-d/EZ-CZ.git
+cd EZ-CZ
+
+# Create virtual environment and install in editable mode
+uv sync
 ```
 
-#### Key Arguments:
-* `--raw-dir` / `-d`: Directory containing raw `.npz` sweeps (e.g. `bias_0v00`).
-* `--iv-file` / `-i`: Reference IV curve `.npz` filename.
-* `--channel-id` / `-c`: Dastard channel ID to analyze (default: `13`).
-* `--zero-bias-time-shift` / `-t`: Superconducting time shift in seconds (default: `-2.70625e-2`).
-* `--tc`: Device critical temperature $T_c$ in Kelvin (default: `120e-3`).
-* `--g-data-file`: CSV file path containing precomputed G data.
-* `--dummy-g-tes-b`: Fallback $g_{tes,b}$ in W/K if G CSV is not found (default: `200e-9`).
-* `--pixel-map`: Space-separated list of `channel_id:pixel_number` mappings (default: `13:13`).
-* `--rshunt-uohm`: Shunt resistance $R_{shunt}$ in micro-Ohms (default: `250.0`).
-* `--l-nyq-nh`: Nyquist inductor $L_{nyq}$ in nano-Henries (default: `74.8`).
-* `--output-base-dir` / `-o`: Directory to save plots and CSV parameter tables.
-* `--no-save-plots`: Do not save plot files on disk (only displays them on screen).
+### Lab Hardware Libraries
+On data-acquisition measurement PCs, install the NIST instrument libraries:
+- `qsdumux`: Keysight 33600A and SRS SIM900/928 driver wrappers.
+- `dastardcommander`: Client interface for streaming DASTARD records.
 
----
-
-## Graphical User Interface (GUI)
-
-The package includes a modern, high-performance Qt5 dashboard (`ez-cz-gui`).
-
-### Running the GUI
-
-If the package is installed:
-```bash
-ez-cz-gui
-```
-
-Alternatively, run the GUI script directly without installation:
-```bash
-python src/ez_cz/gui.py
-# or
-python src/cztest/cz_gui.py
-```
-
-### Key Features
-* **Selectable DC Bias Source**:
-  - Rolldown menu (`DC source: AWG` or `DC source: SRS900`).
-  - **`DC source: AWG` (Default)**: Generates the DC bias offset directly via Channel 2 of the Keysight 33600A AWG (eliminates the external voltage box).
-  - **`DC source: SRS900`**: Uses the SRS SIM900/SIM928 DC voltage box (incorporating `cz_test_SRS900-DC` logic).
-* **Flux-Ramp Synchronized Timing**: Auto-reads `flux_ramp_points` from `experiment.cfg` and harmonically locks all tones to eliminate spectral leakage.
-* **Superconducting (0V) Health Check & Abort**: Fits the single-pole $L/R_s$ transfer function and phase delay $\tau_{shift}$ at 0 V. Automatically aborts or pauses for review if the fit is unphysical.
-* **Live 4-Panel Matplotlib Display**: Real/Imaginary, Nyquist, Magnitude, and Phase responses update in real time at each bias point.
-* **Safe Instant ABORT**: Safely zeroes the DC voltage on the AWG and/or SRS SIM928 immediately.
-* **Light and Dark Modes**: Clean toggle between light and dark UI themes.
-
----
-
-## Test & Reference Scripts (`src/cztest/`)
-
-Standalone test scripts for experimental validation and bench testing:
-* `src/cztest/cz_test_AWG-DC.py` (formerly `cz_test4.py`): AWG-direct DC offset measurement script.
-* `src/cztest/cz_test_SRS900-DC.py` (formerly `cz_test3.py`): SRS SIM900/SIM928 DC bias measurement script.
-* `src/cztest/cz_gui.py`: Standalone GUI entrypoint pointing to `ez_cz.gui`.
-* `src/cztest/analyze_complexZ3.py`: Reference complex impedance analysis script.
-
----
-
-## Customizing inside Python scripts
-You can also import modules directly in Python:
-```python
-from ez_cz.measure import derive_timing_from_flux_ramp, generate_stimulus_tones
-from ez_cz.analyze import calculate_z_hanging_model_complex
-from ez_cz.gui import CZMainWindow
-```
+*(When these drivers are absent, EZ-CZ runs automatically in mock simulation mode for offline analysis and UI testing.)*

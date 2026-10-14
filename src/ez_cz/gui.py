@@ -4,8 +4,8 @@ gui.py: EZ-CZ Dashboard for Complex Impedance (CZ) Measurement.
 
 Features:
   - Selectable DC Bias Source via rolldown menu:
-      * "DC source: AWG" (Default): Direct DC offset on Keysight 33600A AWG Ch2 (from cztest4 / cz_test_AWG-DC).
-      * "DC source: SRS900": External SRS SIM900/SIM928 DC voltage box (from cztest3 / cz_test_SRS900-DC).
+      * "DC source: AWG" (Default): Direct DC offset on Keysight 33600A AWG Ch2.
+      * "DC source: SRS900": External SRS SIM900/SIM928 DC voltage box.
   - Derived timing strictly from time_per_flux_ramp (eliminates arbitrary magic numbers).
   - Background execution via QThread with non-blocking UI.
   - Automatic Superconducting (0V) Transfer Function Health Check & Abort:
@@ -516,10 +516,10 @@ class CZWorker(QThread):
                     self.fg.setOffset(source=p["awg_channel"], offset=bias)
                     time.sleep(point_settle_time)
                 else:
-                    # SRS SIM900/SIM928 code from cztest3
+                    # SRS SIM900/SIM928 bias application
                     if p.get("srs_pulse_vnorm", True) and not np.isclose(bias, 0.0):
                         vnorm_val = p.get("vnorm", 9.5)
-                        self.log_signal.emit("INFO", f"Pulsing SRS SIM928 Vnorm = {vnorm_val:.3f} V (cztest3 style)...")
+                        self.log_signal.emit("INFO", f"Pulsing SRS SIM928 Vnorm = {vnorm_val:.3f} V...")
                         self.vbox.setvolt(vnorm_val)
                         time.sleep(0.1)
                     self.vbox.setvolt(bias)
@@ -1181,12 +1181,12 @@ class CZMainWindow(QMainWindow):
         self.spin_channel.setValue(13)
         source_layout.addWidget(self.spin_channel, 0, 3)
 
-        self.lbl_dc_source_note = QLabel("AWG Option B1: DC offset is generated directly on AWG Channel 2 (from cztest4 / cz_test_AWG-DC).")
+        self.lbl_dc_source_note = QLabel("AWG Direct Mode: DC offset is generated directly on AWG Channel 2 (no external DC box required).")
         self.lbl_dc_source_note.setStyleSheet("color: #00897b; font-size: 8.5pt; font-style: italic;")
         source_layout.addWidget(self.lbl_dc_source_note, 1, 0, 1, 4)
 
         # SRS900 Configuration Sub-Group
-        self.grp_srs = QGroupBox("SRS SIM900 / SIM928 Configuration (cztest3 style)")
+        self.grp_srs = QGroupBox("SRS SIM900 / SIM928 Configuration")
         srs_grid = QGridLayout(self.grp_srs)
         srs_grid.setSpacing(6)
 
@@ -1200,7 +1200,7 @@ class CZMainWindow(QMainWindow):
         self.spin_srs_port.setValue(2)
         srs_grid.addWidget(self.spin_srs_port, 0, 3)
 
-        self.chk_srs_pulse_vnorm = QCheckBox("Pulse Vnorm (0.1 s) before each bias point (cztest3 apply_bias)")
+        self.chk_srs_pulse_vnorm = QCheckBox("Pulse Vnorm (0.1 s) before each bias point")
         self.chk_srs_pulse_vnorm.setChecked(True)
         srs_grid.addWidget(self.chk_srs_pulse_vnorm, 1, 0, 1, 4)
 
@@ -1492,10 +1492,10 @@ class CZMainWindow(QMainWindow):
         is_srs = (self.combo_dc_source.currentIndex() == 1)
         self.grp_srs.setVisible(is_srs)
         if is_srs:
-            self.lbl_dc_source_note.setText("SRS900 Mode: DC bias is generated via SRS SIM928 isolated source (from cztest3 / cz_test_SRS900-DC).")
+            self.lbl_dc_source_note.setText("SRS900 Mode: DC bias is generated via SRS SIM928 isolated source.")
             self.lbl_dc_source_note.setStyleSheet("color: #1976d2; font-size: 8.5pt; font-style: italic;")
         else:
-            self.lbl_dc_source_note.setText("AWG Option B1: DC offset is generated directly on AWG Channel 2 (from cztest4 / cz_test_AWG-DC).")
+            self.lbl_dc_source_note.setText("AWG Direct Mode: DC offset is generated directly on AWG Channel 2 (no external DC box required).")
             self.lbl_dc_source_note.setStyleSheet("color: #00897b; font-size: 8.5pt; font-style: italic;")
 
     def on_timing_source_changed(self):

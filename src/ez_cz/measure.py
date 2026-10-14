@@ -4,8 +4,8 @@ measure.py: Complex Impedance (CZ) Measurement Runner for TES Devices.
 
 Features:
   - Dual DC Bias Source Support:
-      * "awg" (Default): Direct DC offset on Keysight 33600A AWG Ch2 (cztest4 / cz_test_AWG-DC style).
-      * "srs900": External SRS SIM900/SIM928 DC voltage source (cztest3 / cz_test_SRS900-DC style).
+      * "awg" (Default): Direct DC offset on Keysight 33600A AWG Ch2.
+      * "srs900": External SRS SIM900/SIM928 DC voltage source.
   - Derived timing strictly from time_per_flux_ramp (eliminates arbitrary magic numbers).
   - Superconducting (0V) Transfer Function Health Check & delay calibration.
   - Safe ramp-down and zeroing on exit or interruption.
@@ -487,7 +487,7 @@ def main():
                 fg.setOffset(source=args.awg_channel, offset=bias)
                 time.sleep(0.3 if not np.isclose(bias, 0.0) else 1.0)
             else:
-                # cztest3 SRS SIM928 style
+                # SRS SIM900/SIM928 DC bias with optional Vnorm pre-pulse
                 if not np.isclose(bias, 0.0):
                     vbox.setvolt(args.v_norm)
                     time.sleep(0.1)

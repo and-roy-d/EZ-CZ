@@ -1,3 +1,15 @@
+#!/usr/bin/env python3
+"""
+analyze.py: Complex Impedance (CZ) Data Analysis & Thermal Model Fitting.
+
+Processes measured complex impedance sweeps across TES bias points:
+  - Computes unrolled frequency response and calibrated impedance Z(f).
+  - Fits single-pole superconducting (0V) transfer function.
+  - Fits hanging-body two-fluid thermal models (C_tes, C_1, G_tes, G_1, alpha, beta).
+  - Generates Nyquist, Cole-Cole, Alpha vs Beta, and parameter evolution plots.
+  - Exports fitted thermal parameters to summary CSV and figure sets.
+"""
+
 import os
 import glob
 import numpy as np
