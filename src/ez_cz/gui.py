@@ -29,11 +29,15 @@ import os
 import time
 import json
 import argparse
+import logging
+import subprocess
 from datetime import datetime
 from pathlib import Path
 import numpy as np
 import scipy.fft
 from lmfit import Model, Parameters
+
+logger = logging.getLogger(__name__)
 
 from PyQt5 import QtWidgets, QtCore, QtGui
 from PyQt5.QtWidgets import (
@@ -48,9 +52,11 @@ from PyQt5.QtGui import QFont, QColor, QPalette
 
 import matplotlib
 matplotlib.use("Qt5Agg")
+matplotlib.rcParams['axes.formatter.use_mathtext'] = False
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.backends.backend_qt5agg import NavigationToolbar2QT as NavigationToolbar
 from matplotlib.figure import Figure
+import matplotlib.image as mpimg
 
 # ---------------------------------------------------------------------------
 # Hardware Imports with Mock Fallbacks for Simulation / Offline Use
@@ -158,12 +164,88 @@ class MockSRS_SIM928:
 # ---------------------------------------------------------------------------
 # Timing & Mathematical Helpers (Pure time_per_flux_ramp derivation)
 # ---------------------------------------------------------------------------
-TIME_PER_FLUX_RAMP_POINT_S = 256e-9  # FPGA clock tick (1 / 3.90625 MHz)
+TIME_PER_FLUX_RAMP_POINT_S = 256e-9  # FPGA clock tick (1 / 3.90625 MHz nominal fallback)
 DEFAULT_CONFIG_PATH = "/data/experiment.cfg"
 SETTINGS_FILE_PATH = "run_settings.json"
 
 
-def get_time_per_flux_ramp_from_cfg(cfg_path=DEFAULT_CONFIG_PATH):
+def query_time_per_flux_ramp_point(cfg_path=DEFAULT_CONFIG_PATH, default_dt=TIME_PER_FLUX_RAMP_POINT_S):
+    """
+    Dynamically queries the fine DDC sample rate directly from the FPGA firmware
+    via qsdumux / ctrl interface specified in cfg_path.
+
+    The FPGA firmware IP-core (e.g. QSG-NIST:qsg-nist:chpfbfft) defines:
+      - ADC sample rate (from TSNUM, TSDENOM, SAMPLESPERCLK)
+      - PFB window length (WINDOWLEN)
+      - Number of sets (NSETS)
+    The fine DDC rate is:
+      rate = samplerate / windowlen * nsets
+    And the time per flux ramp point is:
+      dt = 1.0 / rate (nominally 256 ns = 1 / 3.90625 MHz)
+
+    If the hardware is offline, unconfigured, or qsdumux is unavailable,
+    it gracefully falls back to default_dt.
+    """
+    ctrl_addr = None
+    data_addr = None
+    fset = "fset0"
+
+    if os.path.exists(cfg_path):
+        import configparser
+        parser = configparser.ConfigParser()
+        try:
+            parser.read(cfg_path)
+            for sec in ["Global", "global"]:
+                if sec in parser:
+                    if "ctrl" in parser[sec]:
+                        ctrl_addr = parser[sec]["ctrl"].split("#")[0].strip()
+                    if "data" in parser[sec]:
+                        data_addr = parser[sec]["data"].split("#")[0].strip()
+                    if "fset_path" in parser[sec]:
+                        raw_fset = parser[sec]["fset_path"].split("#")[0].strip()
+                        clean = raw_fset.strip("[]").replace('"', "").replace("'", "").split(",")[0].strip()
+                        if clean:
+                            fset = clean
+                    break
+        except Exception as e:
+            logger.debug(f"Could not parse ctrl settings from {cfg_path}: {e}")
+
+    if ctrl_addr:
+        try:
+            import argparse
+            import qsdumux.user.abaco_setup as abaco_setup
+
+            cfg = argparse.Namespace()
+            cfg.verbose = 0
+            cfg.ctrl = ctrl_addr
+            cfg.data = data_addr or ctrl_addr
+            cfg.rate = False
+            cfg.open_data = False
+            cfg.quiet = True
+            cfg.show_access = False
+
+            ctrlif, dataif, eids, circb = abaco_setup.load_abaco_general(cfg)
+            try:
+                fullset, frontend, wfplayer, backends = abaco_setup.load_abaco_fullset(cfg, fset, ctrlif, eids)
+                if frontend is not None:
+                    rate = float(frontend.samplerate) / float(frontend.get_windowlen()) * float(frontend.get_nsets())
+                    if rate > 0:
+                        dt = 1.0 / rate
+                        vlnv = getattr(getattr(frontend, "entityid", None), "vlnv", "unknown")
+                        logger.info(f"Retrieved FPGA clock from firmware ({vlnv}): dt={dt*1e9:.3f} ns (f_ddc={rate/1e6:.6f} MHz)")
+                        return dt
+            finally:
+                if hasattr(ctrlif, "close"):
+                    ctrlif.close()
+                if hasattr(dataif, "close"):
+                    dataif.close()
+        except Exception as e:
+            logger.info(f"Could not query FPGA firmware clock ({e}); falling back to nominal {default_dt*1e9:.1f} ns")
+
+    return default_dt
+
+
+def get_time_per_flux_ramp_from_cfg(cfg_path=DEFAULT_CONFIG_PATH, query_firmware=True):
     """Auto-reads flux_ramp_points from experiment.cfg and computes time_per_flux_ramp."""
     import configparser
     if not os.path.exists(cfg_path):
@@ -184,7 +266,8 @@ def get_time_per_flux_ramp_from_cfg(cfg_path=DEFAULT_CONFIG_PATH):
             if fr_points <= 0:
                 raise ValueError(f"Invalid flux_ramp_points ({fr_points})")
 
-            time_per_flux_ramp = fr_points * TIME_PER_FLUX_RAMP_POINT_S
+            dt_point = query_time_per_flux_ramp_point(cfg_path=cfg_path, default_dt=TIME_PER_FLUX_RAMP_POINT_S) if query_firmware else TIME_PER_FLUX_RAMP_POINT_S
+            time_per_flux_ramp = fr_points * dt_point
             return time_per_flux_ramp, fr_points
 
     raise KeyError(f"Could not find 'flux_ramp_points' under [Global] in {cfg_path}")
@@ -194,17 +277,18 @@ def derive_timing_from_flux_ramp(time_per_flux_ramp, target_duration_s=0.2,
                                  target_f0_hz=20.0, nominal_awg_rate=5e6):
     """
     Derives all DAQ and AWG parameters strictly from time_per_flux_ramp.
-    Eliminates all arbitrary magic numbers.
+    Harmonizes acquisition duration to an exact integer number of cycles of target_f0_hz
+    so every comb tone lands identically on an FFT bin with zero spectral leakage.
     """
     fs_global = 1.0 / time_per_flux_ramp
-    N_samples = int(round(target_duration_s / time_per_flux_ramp))
+    k_periods = max(1, int(round(target_duration_s * target_f0_hz)))
+    t_nominal = k_periods / target_f0_hz
+    N_samples = int(round(t_nominal / time_per_flux_ramp))
     t_duration = N_samples * time_per_flux_ramp
 
     f_fund = 1.0 / t_duration
-    f_low = f_fund
-
-    k0 = max(1, int(round(target_f0_hz / f_fund)))
-    f0 = k0 * f_fund
+    f0 = k_periods * f_fund
+    f_low = f0
 
     n_awg_points = int(round(t_duration * nominal_awg_rate))
     awg_sample_rate = n_awg_points / t_duration
@@ -216,31 +300,94 @@ def derive_timing_from_flux_ramp(time_per_flux_ramp, target_duration_s=0.2,
         "t_duration": t_duration,
         "f_fund": f_fund,
         "f_low": f_low,
-        "k0": k0,
+        "k0": k_periods,
         "f0": f0,
         "n_awg_points": n_awg_points,
         "awg_sample_rate": awg_sample_rate,
     }
 
 
-def generate_stimulus_tones(fs_global, f0, f_low, start_exp=0, stop_exp=3, num_high_freq_tones=30):
-    """Generates log-spaced tone multipliers up to Nyquist limit."""
-    max_desired_freq = fs_global / 2.0
-    max_allowable_multiplier = int(max_desired_freq / f0)
-    multipliers = np.unique(np.int64(np.logspace(start_exp, stop_exp, num_high_freq_tones)))
-    valid_mults = [m for m in multipliers if 1 <= m <= max_allowable_multiplier]
-    all_freqs = np.insert(np.array(valid_mults) * f0, 0, f_low)
+def generate_stimulus_tones(fs_global, f0, f_low, start_exp=0, stop_exp=None, num_high_freq_tones=100,
+                            high_f_cutoff=None, skip_line_harmonics=True, line_freq=60.0, line_freq_tol=2.0):
+    """
+    Generates log-spaced tone multipliers up to the high-frequency cutoff.
+    Strictly enforces Nyquist limit: internally rejects any tone >= Nyquist (fs_global / 2).
+    Optionally skips power line frequency harmonics (default: 60 Hz multiples).
+    Deduplicates frequencies so the fundamental is never doubled.
+    """
+    nyquist = fs_global / 2.0
+    # Strictly enforce f < Nyquist: never accept anything equal to or greater than Nyquist
+    max_nyquist_safe = nyquist - (f0 * 0.5)
+
+    if high_f_cutoff is not None and high_f_cutoff > 0:
+        effective_max_f = min(float(high_f_cutoff), max_nyquist_safe)
+    elif stop_exp is not None:
+        effective_max_f = min(f0 * (10 ** stop_exp), max_nyquist_safe)
+    else:
+        effective_max_f = min(50000.0, max_nyquist_safe)
+
+    effective_max_f = min(effective_max_f, max_nyquist_safe)
+    max_allowable_multiplier = int(np.floor(effective_max_f / f0))
+    if max_allowable_multiplier < 1:
+        max_allowable_multiplier = 1
+
+    oversample = 2.5 if skip_line_harmonics else 1.6
+    raw_mults = np.geomspace(1, max_allowable_multiplier, int(num_high_freq_tones * oversample))
+    multipliers = np.unique(np.int64(np.round(raw_mults)))
+    valid_mults = [int(m) for m in multipliers if (1 <= m <= max_allowable_multiplier) and (m * f0 < nyquist)]
+
+    if skip_line_harmonics and line_freq > 0:
+        filtered_mults = []
+        for m in valid_mults:
+            f = m * f0
+            dist_to_harmonic = abs(f - round(f / line_freq) * line_freq)
+            if dist_to_harmonic >= line_freq_tol:
+                filtered_mults.append(m)
+        valid_mults = filtered_mults
+
+    if len(valid_mults) > num_high_freq_tones:
+        indices = np.round(np.linspace(0, len(valid_mults) - 1, num_high_freq_tones)).astype(int)
+        valid_mults = [valid_mults[i] for i in indices]
+
+    raw_freqs = np.insert(np.array(valid_mults) * f0, 0, f_low)
+    # Final strict safety clamp: strictly less than Nyquist
+    raw_freqs = raw_freqs[raw_freqs < nyquist]
+    _, unique_idx = np.unique(np.round(raw_freqs, 6), return_index=True)
+    all_freqs = raw_freqs[np.sort(unique_idx)]
     return valid_mults, all_freqs
 
 
-def synthesize_comb_waveform(all_freqs, t_duration, awg_sample_rate, multiplier):
-    """Synthesizes zero-leakage multi-tone cosine waveform."""
+def synthesize_comb_waveform(all_freqs, t_duration, awg_sample_rate, multiplier, use_schroeder=True):
+    """
+    Synthesizes multi-tone cosine waveform with Schroeder crest-factor minimization.
+
+    When use_schroeder is True, phases are set to:
+        phi_k = -pi * k * (k - 1) / N
+    This drastically reduces the peak-to-average power ratio (PAPR / crest factor)
+    by ~sqrt(N), allowing 20 to 100+ tones without clipping the AWG volatile memory.
+    """
     npts = int(round(t_duration * awg_sample_rate))
     t = np.arange(npts) / awg_sample_rate
     v_superimposed = np.zeros(npts, dtype=np.float64)
-    for f in all_freqs:
-        v_superimposed += np.cos(2 * np.pi * t * f)
-    return v_superimposed * multiplier
+    N = len(all_freqs)
+
+    if use_schroeder and N > 1:
+        k = np.arange(N)
+        phases = -np.pi * k * (k - 1) / N
+    else:
+        phases = np.zeros(N)
+
+    for f, phi in zip(all_freqs, phases):
+        v_superimposed += np.cos(2 * np.pi * t * f + phi)
+
+    v_out = v_superimposed * multiplier
+    peak = float(np.max(np.abs(v_out)))
+    scale_factor = 1.0
+    if peak > 1.0:
+        scale_factor = peak
+        v_out = v_out / peak
+
+    return v_out, phases, scale_factor
 
 
 # ---------------------------------------------------------------------------
@@ -284,6 +431,15 @@ class CZWorker(QThread):
         self._is_paused = False
         self._resume_event.wakeAll()
         self._resume_mutex.unlock()
+
+    def sleep_interruptible(self, seconds):
+        """Sleeps in small slices, returning False immediately if aborted."""
+        end_time = time.time() + seconds
+        while time.time() < end_time:
+            if self._is_aborted:
+                return False
+            time.sleep(min(0.04, max(0.005, end_time - time.time())))
+        return not self._is_aborted
 
     def run(self):
         self._is_aborted = False
@@ -404,12 +560,21 @@ class CZWorker(QThread):
 
         # Generate comb waveform
         f_mults, all_freqs = generate_stimulus_tones(
-            fs_global, f0, f_low, num_high_freq_tones=p["num_high_freq_tones"]
+            fs_global, f0, f_low,
+            num_high_freq_tones=p.get("num_high_freq_tones", 100),
+            high_f_cutoff=p.get("high_f_cutoff", 50000.0),
+            skip_line_harmonics=p.get("skip_line_harmonics", True),
+            line_freq=p.get("line_freq", 60.0)
         )
-        v_waveform = synthesize_comb_waveform(
-            all_freqs, t_duration, awg_sample_rate, p["amp_multiplier"]
+        use_schroeder = p.get("use_schroeder_phase", True)
+        v_waveform, phases, scale_factor = synthesize_comb_waveform(
+            all_freqs, t_duration, awg_sample_rate, p["amp_multiplier"], use_schroeder=use_schroeder
         )
-        self.log_signal.emit("INFO", f"Synthesized {len(all_freqs)} tones ({all_freqs[0]:.2f} Hz to {all_freqs[-1]:.2f} Hz)")
+        peak_v = np.max(np.abs(v_waveform))
+        self.log_signal.emit("INFO", (
+            f"Synthesized {len(all_freqs)} tones ({all_freqs[0]:.1f} Hz to {all_freqs[-1]:.1f} Hz). "
+            f"Schroeder phase: {use_schroeder}, Peak: {peak_v:.3f} (scale factor: {scale_factor:.3f})"
+        ))
 
         # Save supplied waveform
         try:
@@ -417,6 +582,9 @@ class CZWorker(QThread):
                 base_dir / "supplied_waveform.npz",
                 waveform=v_waveform,
                 frequencies=all_freqs,
+                phases=phases,
+                scale_factor=scale_factor,
+                use_schroeder=use_schroeder,
                 awg_sample_rate=awg_sample_rate,
                 amplitude_vpp=vpp,
                 multiplier=p["amp_multiplier"],
@@ -451,7 +619,7 @@ class CZWorker(QThread):
             initial_offset = bias_values[0] if dc_source == "AWG" else 0.0
             self.fg.setOffset(source, initial_offset)
             self.fg.setOutputState(source=source, output_state="ON")
-            time.sleep(0.5)
+            self.sleep_interruptible(0.5)
 
             if dc_source == "AWG":
                 self.log_signal.emit("INFO", f"AWG Ch{source} active: Vpp={vpp} V, Offset={initial_offset:.3f} V")
@@ -479,7 +647,10 @@ class CZWorker(QThread):
                     break
                 except Exception as e:
                     self.log_signal.emit("WARN", f"DASTARD connection attempt {attempt+1}/5 failed ({e})")
-                    time.sleep(0.5)
+                    if not self.sleep_interruptible(0.5):
+                        self._safe_cleanup()
+                        self.finished_signal.emit(False, "Aborted during DASTARD connection.")
+                        return
 
             if c is None:
                 err = "Failed to connect to DASTARD client."
@@ -496,7 +667,8 @@ class CZWorker(QThread):
         amp0 = None
         f_roll = None
         total_steps = len(bias_values)
-        V_stim = p["amp_multiplier"] * vpp
+        effective_mult = p["amp_multiplier"] / scale_factor
+        V_stim = effective_mult * vpp
 
         try:
             for idx, bias in enumerate(bias_values):
@@ -513,17 +685,24 @@ class CZWorker(QThread):
                     point_settle_time = p.get("sc_settle_time_s", 2.0)
 
                 if dc_source == "AWG":
-                    self.fg.setOffset(source=p["awg_channel"], offset=bias)
-                    time.sleep(point_settle_time)
+                    if not self._ramp_offset(bias):
+                        break
+                    if not self.sleep_interruptible(point_settle_time):
+                        break
                 else:
                     # SRS SIM900/SIM928 bias application
                     if p.get("srs_pulse_vnorm", True) and not np.isclose(bias, 0.0):
                         vnorm_val = p.get("vnorm", 9.5)
                         self.log_signal.emit("INFO", f"Pulsing SRS SIM928 Vnorm = {vnorm_val:.3f} V...")
                         self.vbox.setvolt(vnorm_val)
-                        time.sleep(0.1)
+                        if not self.sleep_interruptible(0.1):
+                            break
                     self.vbox.setvolt(bias)
-                    time.sleep(point_settle_time)
+                    if not self.sleep_interruptible(point_settle_time):
+                        break
+
+                if self._is_aborted:
+                    break
 
                 # Fetch data from DASTARD
                 if c is not None:
@@ -539,6 +718,8 @@ class CZWorker(QThread):
                     candidate_bin_width = fs_global / N_samples
                     candidate_indices = np.rint(all_freqs / candidate_bin_width).astype(int)
                     for _ in range(n_candidates):
+                        if self._is_aborted:
+                            break
                         data_all = c.getNewData(n_req)
                         if ch_key not in data_all:
                             raise KeyError(f"Channel '{ch_key}' not found in DASTARD data.")
@@ -551,19 +732,37 @@ class CZWorker(QThread):
                         candidate_scores.append(float(np.sum(np.abs(candidate_fft[valid_indices]))))
                         candidate_results.append(data_all)
                         candidate_data.append(candidate)
+                    if self._is_aborted:
+                        break
                     selected_index = int(np.argmax(candidate_scores))
                     data = candidate_data[selected_index]
                     data_all = candidate_results[selected_index]
+
+                    # Detect DASTARD SQUID demodulation unlock / flux jump
+                    data_check = data_all[ch_key] * 1.0
+                    raw_std = float(np.std(data_check))
+                    raw_mean = float(np.mean(data_check))
+                    raw_min = float(np.min(data_check))
+                    raw_max = float(np.max(data_check))
+                    if raw_std > 3000.0 or (raw_min < 5000 and raw_max > 55000):
+                        self.log_signal.emit(
+                            "WARN",
+                            f"DASTARD SQUID unlock / flux jump detected at {bias:.3f} V "
+                            f"(std={raw_std:.0f}, mean={raw_mean:.0f}). Response will appear as noise!"
+                        )
                 else:
                     t = np.arange(N_samples) * time_per_flux_ramp
                     data = np.zeros(N_samples)
                     f_r_sim = 1200.0
-                    for f in all_freqs:
+                    for f, phi_stim in zip(all_freqs, phases):
                         mag = 5000.0 / np.sqrt(1 + (f / f_r_sim)**2)
-                        phi = -np.arctan(f / f_r_sim) - 2 * np.pi * f * 15e-6
-                        data += mag * np.cos(2 * np.pi * f * t + phi)
+                        phi_sys = -np.arctan(f / f_r_sim) - 2 * np.pi * f * 15e-6
+                        data += mag * np.cos(2 * np.pi * f * t + phi_stim + phi_sys)
                     data += np.random.normal(0, 10, N_samples)
                     data_all = {f"chan{p['channel']}": np.tile(data, p.get("n_averages", 4)), "firstFrameIndex": [0]}
+
+                if self._is_aborted:
+                    break
 
                 # Compute FFT
                 fft_data_raw = scipy.fft.rfft(data)
@@ -573,7 +772,7 @@ class CZWorker(QThread):
                     axis=0,
                 )
                 fs_sch = all_freqs
-                tone_data_raw = fft_data_raw[f_sch_idx]
+                tone_data_raw = fft_data_raw[f_sch_idx] * np.exp(-1j * phases)
                 sc_tone_data_raw = tone_data_raw
 
                 # 0 V Calibration & Superconducting Transfer Function Health Check
@@ -600,17 +799,37 @@ class CZWorker(QThread):
                     ss_tot = np.sum((y_data - np.mean(y_data))**2)
                     r_squared = float(1.0 - (ss_res / ss_tot)) if ss_tot > 0 else 0.0
 
+                    flip_bias = p.get("flip_bias", False)
+                    model_sign = -1.0 if flip_bias else 1.0
+                    Z_model_fit = model_sign * amp0 / (1.0 + 1j * fs_sch / f_roll)
                     Z_model_pure = amp0 / (1.0 + 1j * fs_sch / f_roll)
 
+                    # Coherent matched filter for coarse delay estimation across any number of tones & phases
+                    H_eq = sc_tone_data_raw / Z_model_fit
+                    comb_eq = np.zeros(len(fft_data_raw), dtype=complex)
+                    comb_eq[f_sch_idx] = H_eq / np.maximum(np.abs(H_eq), 1e-12)
+                    time_impulse = np.fft.irfft(comb_eq)
+
+                    peak_sample = int(np.argmax(time_impulse))
+                    if peak_sample > N_samples // 2:
+                        tau_coarse = (peak_sample - N_samples) * time_per_flux_ramp
+                    else:
+                        tau_coarse = peak_sample * time_per_flux_ramp
+
+                    tau_guess = -tau_coarse
+
                     def real_model(fs, tau_shift):
-                        return np.real((fft_data_raw * np.exp(-2j * np.pi * fft_freqs * tau_shift))[f_sch_idx])
+                        return np.real(sc_tone_data_raw * np.exp(-2j * np.pi * fs_sch * tau_shift))
 
                     model_real = Model(real_model)
-                    tau_guess = -np.argmax(data) / fs_global
                     params_real = Parameters()
-                    params_real.add("tau_shift", value=tau_guess, vary=True)
-                    res_real = model_real.fit(np.real(Z_model_pure), fs=all_freqs, params=params_real)
-                    tau_shift_0V = float(res_real.params["tau_shift"].value)
+                    params_real.add("tau_shift", value=tau_guess, min=tau_guess - 25e-6, max=tau_guess + 25e-6, vary=True)
+                    try:
+                        res_real = model_real.fit(np.real(Z_model_fit), fs=fs_sch, params=params_real)
+                        tau_shift_0V = float(res_real.params["tau_shift"].value)
+                    except Exception as e:
+                        self.log_signal.emit("WARN", f"Fine tau fitting note ({e}); using coherent matched filter estimate.")
+                        tau_shift_0V = tau_guess
 
                     sc_stats = {
                         "amp0": amp0,
@@ -620,11 +839,12 @@ class CZWorker(QThread):
                         "y_data": y_data,
                         "best_fit": fit_best,
                         "all_freqs": all_freqs,
+                        "flip_bias": flip_bias,
                     }
                     self.sc_calibrated.emit(sc_stats)
                     self.log_signal.emit("INFO", (
                         f"0 V Fit Results: R² = {r_squared:.4f}, f_roll = {f_roll:.1f} Hz, "
-                        f"amp0 = {amp0:.1f}, τ_shift = {tau_shift_0V*1e6:.2f} µs"
+                        f"amp0 = {amp0:.1f}, τ_shift = {tau_shift_0V*1e6:.2f} µs (flip_bias={flip_bias})"
                     ))
 
                     # Evaluate failure criteria
@@ -671,29 +891,28 @@ class CZWorker(QThread):
                         vnorm_val = p.get("vnorm", 9.5)
                         self.log_signal.emit("INFO", f"Driving TES normal at Vnorm = {vnorm_val:.3f} V for 1.0 s...")
                         if dc_source == "AWG":
-                            self.fg.setOffset(source=p["awg_channel"], offset=vnorm_val)
+                            self._ramp_offset(vnorm_val)
                         else:
                             self.vbox.setvolt(vnorm_val)
-                        time.sleep(1.0)
+                        if not self.sleep_interruptible(1.0):
+                            break
                         post_settle = p.get("post_normal_settle_s", 5.0)
                         if post_settle > 0:
                             self.log_signal.emit("INFO", f"Waiting {post_settle:.1f} s post-normal recovery before sweeping...")
-                            time.sleep(post_settle)
+                            first_bias = bias_values[1] if len(bias_values) > 1 else 0.0
+                            if dc_source == "AWG":
+                                self._ramp_offset(first_bias)
+                            else:
+                                self.vbox.setvolt(first_bias)
+                            if not self.sleep_interruptible(post_settle):
+                                break
 
                 applied_tau_shift = tau_shift_0V if tau_shift_0V is not None else 0.0
-                fft_unroll = tone_data_raw * np.exp(-2j * np.pi * fs_sch * applied_tau_shift)
-
-                plot_data = {
-                    "bias": bias,
-                    "tau_shift": applied_tau_shift,
-                    "fs_sch": fs_sch,
-                    "fft_unroll": fft_unroll,
-                    "Z_model_pure": Z_model_pure,
-                    "amp0": amp0,
-                    "f_roll": f_roll,
-                    "dc_source": dc_source,
-                }
-                self.step_completed.emit(bias, plot_data)
+                raw_unroll = tone_data_raw * np.exp(-2j * np.pi * fs_sch * applied_tau_shift)
+                flip_bias = p.get("flip_bias", False)
+                model_sign = -1.0 if flip_bias else 1.0
+                # Invert unrolled response if flip_bias is True so Re(Z) is positive at DC
+                fft_unroll = model_sign * raw_unroll
 
                 # Save step data
                 bias_str = f"{bias:.2f}".replace(".", "v")
@@ -710,17 +929,23 @@ class CZWorker(QThread):
                     raw_data=data,
                     fs_global=fs_global,
                     time_per_flux_ramp=time_per_flux_ramp,
-                    dc_source=dc_source
-                )
-                self._save_bias_plot(
-                    bias_dir=bias_dir,
-                    bias=bias,
-                    fs_sch=fs_sch,
-                    fft_unroll=fft_unroll,
-                    Z_model_pure=Z_model_pure,
-                    tau_shift=applied_tau_shift,
                     dc_source=dc_source,
+                    flip_bias=flip_bias
                 )
+
+                plot_data = {
+                    "bias": bias,
+                    "bias_dir": str(bias_dir),
+                    "tau_shift": applied_tau_shift,
+                    "fs_sch": fs_sch,
+                    "fft_unroll": fft_unroll,
+                    "Z_model_pure": Z_model_pure,
+                    "amp0": amp0,
+                    "f_roll": f_roll,
+                    "dc_source": dc_source,
+                    "flip_bias": flip_bias,
+                }
+                self.step_completed.emit(bias, plot_data)
 
                 if p.get("single_0v_test_only", False):
                     self.log_signal.emit("INFO", "Single 0 V SC test completed.")
@@ -738,6 +963,25 @@ class CZWorker(QThread):
             self.finished_signal.emit(False, "Run was aborted by user. All DC sources safely reset to 0.0 V.")
         else:
             self.finished_signal.emit(True, f"Run completed successfully! All data saved to {base_dir}")
+
+    def _ramp_offset(self, target_offset, max_step=0.01, step_delay=0.005):
+        """Ramps AWG offset smoothly in small increments to prevent SQUID unlock / flux jumps."""
+        if self.fg is None:
+            return False
+        source = self.params["awg_channel"]
+        current_offset = float(self.fg.getOffset(source))
+        diff = target_offset - current_offset
+        if abs(diff) <= max_step:
+            self.fg.setOffset(source, target_offset)
+            return True
+        n_steps = int(np.ceil(abs(diff) / max_step))
+        ramp_vals = np.linspace(current_offset, target_offset, n_steps + 1)[1:]
+        for v in ramp_vals:
+            if self._is_aborted:
+                return False
+            self.fg.setOffset(source, float(v))
+            time.sleep(step_delay)
+        return True
 
     def _safe_cleanup(self):
         """Safely ramps down the AWG DC offset and/or SRS SIM928 voltage to 0.0 V."""
@@ -917,8 +1161,142 @@ class CZPlotCanvas(FigureCanvas):
             f"V_bias = {bias:.3f} V ({dc_source}) | τ_shift = {tau_shift*1e6:.2f} µs{tag}",
             color=text_color, fontsize=12, fontweight="bold", y=0.98
         )
-        self.fig.tight_layout(rect=[0, 0, 1, 0.96])
+        try:
+            self.fig.tight_layout(rect=[0, 0, 1, 0.96])
+        except Exception:
+            pass
+        try:
+            self.draw()
+        except Exception:
+            pass
+
+
+# ---------------------------------------------------------------------------
+# Analysis Background Worker & Plot Canvas
+# ---------------------------------------------------------------------------
+ANALYZE_PLOT_TYPES = [
+    ("01: Full IV Curve & Processed Bias Points", "01_IVcurve.png"),
+    ("02: Rtes vs Vbias Curve", "02_Rtes_vs_Vbias.png"),
+    ("03: Shifted Raw Current Traces", "03_ShiftedTraces.png"),
+    ("04: Measured Admittance Overview", "04_Admittance_Measured.png"),
+    ("05: Admittance Fits vs Hanging Model", "05_Admittance_Fits.png"),
+    ("06: Admittance Fit Residuals", "06_Fit_Residuals.png"),
+    ("07: Alpha & Beta vs R0/Rn", "07_AlphaBeta_vs_R0Rn.png"),
+    ("08: Thermal Parameters vs R0/Rn", "08_OtherParams_vs_R0Rn.png"),
+    ("09: Alpha vs Beta Power Law Fit", "09_Alpha_vs_Beta_Fit.png"),
+]
+
+
+class AnalyzeWorker(QThread):
+    """
+    Executes ez_cz.analyze in a background process, streaming logs and progress to the GUI.
+    """
+    log_signal = pyqtSignal(str, str)
+    status_signal = pyqtSignal(str)
+    progress_signal = pyqtSignal(int)
+    finished_signal = pyqtSignal(bool, str)
+
+    def __init__(self, cmd_args, output_dir, parent=None):
+        super().__init__(parent)
+        self.cmd_args = cmd_args
+        self.output_dir = output_dir
+        self.process = None
+        self._is_aborted = False
+
+    def run(self):
+        try:
+            self.status_signal.emit("STATUS: RUNNING ANALYSIS...")
+            self.log_signal.emit("INFO", f"Starting analysis: {' '.join(self.cmd_args)}")
+            self.process = subprocess.Popen(
+                self.cmd_args,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1
+            )
+            step_count = 0
+            for line in self.process.stdout:
+                if self._is_aborted:
+                    break
+                line_str = line.strip()
+                if not line_str:
+                    continue
+                if "Processing Vbias =" in line_str:
+                    step_count += 1
+                    self.status_signal.emit(line_str)
+                    prog = min(int(step_count * 2.5), 95)
+                    self.progress_signal.emit(prog)
+                    self.log_signal.emit("INFO", line_str)
+                elif "Fit OK:" in line_str:
+                    self.log_signal.emit("INFO", line_str)
+                elif "Fit Warning:" in line_str or "Warning:" in line_str:
+                    self.log_signal.emit("WARN", line_str)
+                elif "Error:" in line_str or "Exception:" in line_str:
+                    self.log_signal.emit("ERROR", line_str)
+                else:
+                    self.log_signal.emit("INFO", line_str)
+
+            self.process.wait()
+            ret = self.process.returncode
+            if self._is_aborted:
+                self.finished_signal.emit(False, "Analysis was aborted by user.")
+            elif ret == 0:
+                self.progress_signal.emit(100)
+                self.status_signal.emit("STATUS: COMPLETE")
+                self.finished_signal.emit(True, str(self.output_dir))
+            else:
+                self.finished_signal.emit(False, f"Analysis exited with code {ret}")
+        except Exception as e:
+            self.finished_signal.emit(False, f"Analysis failed: {e}")
+
+    def abort(self):
+        self._is_aborted = True
+        if self.process and self.process.poll() is None:
+            self.process.terminate()
+            try:
+                self.process.wait(timeout=2.0)
+            except subprocess.TimeoutExpired:
+                self.process.kill()
+
+
+class AnalyzePlotCanvas(FigureCanvas):
+    """Matplotlib canvas for displaying generated analysis plots."""
+    def __init__(self, parent=None, width=9, height=8, dpi=100):
+        self.fig = Figure(figsize=(width, height), dpi=dpi)
+        self.fig.patch.set_facecolor("#151922")
+        self.ax = self.fig.add_subplot(111)
+        self.ax.set_facecolor("#151922")
+        self.ax.axis("off")
+        super().__init__(self.fig)
+        self.setParent(parent)
+        self.show_placeholder("No analysis plots loaded.\nRun an analysis or select an existing output folder.")
+
+    def show_placeholder(self, text):
+        self.fig.clear()
+        ax = self.fig.add_subplot(111)
+        ax.set_facecolor("#151922")
+        ax.text(0.5, 0.5, text, color="#90a4ae", fontsize=13,
+                ha="center", va="center", transform=ax.transAxes,
+                bbox=dict(boxstyle="round,pad=0.8", fc="#1b2028", ec="#2a313d"))
+        ax.axis("off")
         self.draw()
+
+    def display_image(self, image_path):
+        p = Path(image_path)
+        if not p.exists():
+            self.show_placeholder(f"Plot file not found:\n{p.name}")
+            return
+        try:
+            img = mpimg.imread(str(p))
+            self.fig.clear()
+            ax = self.fig.add_subplot(111)
+            ax.set_facecolor("#151922")
+            ax.imshow(img)
+            ax.axis("off")
+            self.fig.subplots_adjust(left=0.01, right=0.99, top=0.99, bottom=0.01)
+            self.draw()
+        except Exception as e:
+            self.show_placeholder(f"Failed to load image:\n{e}")
 
 
 # ---------------------------------------------------------------------------
@@ -931,6 +1309,8 @@ class CZMainWindow(QMainWindow):
         self.setWindowTitle("EZ-CZ Dashboard - Complex Impedance")
         self.resize(1600, 850)
         self.worker = None
+        self.analyze_worker = None
+        self.analyze_plot_files = {}
 
         self.dark_stylesheet = """
             QMainWindow, QWidget {
@@ -1021,24 +1401,66 @@ class CZMainWindow(QMainWindow):
                 color: #82b1ff;
                 border-bottom: 2px solid #2979ff;
             }
+            QTabWidget#main_tabs::pane {
+                border: 1px solid #2a313d;
+                border-radius: 6px;
+                background-color: #12141a;
+            }
+            QTabWidget#main_tabs > QTabBar::tab {
+                background-color: #1a202c;
+                color: #b0bec5;
+                font-size: 11pt;
+                font-weight: bold;
+                padding: 10px 24px;
+                margin-right: 4px;
+                border-top-left-radius: 6px;
+                border-top-right-radius: 6px;
+                border: 1px solid #2d3748;
+                border-bottom: none;
+            }
+            QTabWidget#main_tabs > QTabBar::tab:selected {
+                background-color: #151922;
+                color: #00e676;
+                border-top: 3px solid #00e676;
+                border-bottom: 2px solid #151922;
+            }
+            QTabWidget#main_tabs > QTabBar::tab:hover:!selected {
+                background-color: #232c3d;
+                color: #ffffff;
+            }
         """
 
         self.init_ui()
+        self.add_bias_range_row(0.5, 1.5, 0.01)
         self.load_settings_from_json()
         self.on_timing_source_changed()
         self.on_dc_source_changed()
+        self.update_comb_info()
         self.update_bias_preview()
         self.apply_theme()
 
     def init_ui(self):
         main_widget = QWidget()
         self.setCentralWidget(main_widget)
-        main_layout = QHBoxLayout(main_widget)
-        main_layout.setContentsMargins(10, 10, 10, 10)
-        main_layout.setSpacing(10)
+        main_layout = QVBoxLayout(main_widget)
+        main_layout.setContentsMargins(6, 6, 6, 6)
+        main_layout.setSpacing(6)
 
+        self.main_tabs = QTabWidget()
+        self.main_tabs.setObjectName("main_tabs")
+
+        # Tab 1: Measure
+        self.tab_measure = self._create_measure_tab()
+        self.main_tabs.addTab(self.tab_measure, "⚡ Measure")
+
+        # Tab 2: Analyze
+        self.tab_analyze = self._create_analyze_tab()
+        self.main_tabs.addTab(self.tab_analyze, "📊 Analyze")
+
+        main_layout.addWidget(self.main_tabs)
+
+    def _create_measure_tab(self):
         splitter = QSplitter(Qt.Horizontal)
-        main_layout.addWidget(splitter)
 
         # Left Pane: Config Tabs & Controls
         left_widget = QWidget()
@@ -1157,6 +1579,260 @@ class CZMainWindow(QMainWindow):
         splitter.addWidget(right_widget)
         splitter.setStretchFactor(0, 1)
         splitter.setStretchFactor(1, 1)
+        return splitter
+
+    def _create_analyze_tab(self):
+        splitter = QSplitter(Qt.Horizontal)
+
+        # Left Pane: Config & Execution Controls
+        left_widget = QWidget()
+        left_layout = QVBoxLayout(left_widget)
+        left_layout.setContentsMargins(0, 0, 0, 0)
+        left_layout.setSpacing(8)
+
+        # 1. Data & File Paths
+        paths_box = QGroupBox("Data & File Paths")
+        paths_layout = QGridLayout(paths_box)
+        paths_layout.setSpacing(6)
+
+        paths_layout.addWidget(QLabel("Raw Complex Z Dir:"), 0, 0)
+        self.edit_analyze_raw_dir = QLineEdit()
+        self.btn_browse_analyze_raw = QPushButton("Browse")
+        self.btn_browse_analyze_raw.setFixedWidth(80)
+        self.btn_browse_analyze_raw.clicked.connect(self.on_browse_analyze_raw_dir)
+        raw_h = QHBoxLayout()
+        raw_h.addWidget(self.edit_analyze_raw_dir)
+        raw_h.addWidget(self.btn_browse_analyze_raw)
+        paths_layout.addLayout(raw_h, 0, 1)
+
+        paths_layout.addWidget(QLabel("IV Curve File (.npz):"), 1, 0)
+        self.edit_analyze_iv_file = QLineEdit()
+        self.btn_browse_analyze_iv = QPushButton("Browse")
+        self.btn_browse_analyze_iv.setFixedWidth(80)
+        self.btn_browse_analyze_iv.clicked.connect(self.on_browse_analyze_iv_file)
+        iv_h = QHBoxLayout()
+        iv_h.addWidget(self.edit_analyze_iv_file)
+        iv_h.addWidget(self.btn_browse_analyze_iv)
+        paths_layout.addLayout(iv_h, 1, 1)
+
+        paths_layout.addWidget(QLabel("Output Base Dir:"), 2, 0)
+        self.edit_analyze_output_dir = QLineEdit("/data/Results/Complex_Z")
+        self.btn_browse_analyze_out = QPushButton("Browse")
+        self.btn_browse_analyze_out.setFixedWidth(80)
+        self.btn_browse_analyze_out.clicked.connect(self.on_browse_analyze_output_dir)
+        out_h = QHBoxLayout()
+        out_h.addWidget(self.edit_analyze_output_dir)
+        out_h.addWidget(self.btn_browse_analyze_out)
+        paths_layout.addLayout(out_h, 2, 1)
+
+        paths_layout.addWidget(QLabel("G CSV File (Optional):"), 3, 0)
+        self.edit_analyze_g_file = QLineEdit()
+        self.btn_browse_analyze_g = QPushButton("Browse")
+        self.btn_browse_analyze_g.setFixedWidth(80)
+        self.btn_browse_analyze_g.clicked.connect(self.on_browse_analyze_g_file)
+        g_h = QHBoxLayout()
+        g_h.addWidget(self.edit_analyze_g_file)
+        g_h.addWidget(self.btn_browse_analyze_g)
+        paths_layout.addLayout(g_h, 3, 1)
+
+        left_layout.addWidget(paths_box)
+
+        # 2. Analysis Parameters
+        param_box = QGroupBox("Channel & Analysis Circuit Parameters")
+        param_layout = QGridLayout(param_box)
+        param_layout.setSpacing(6)
+
+        param_layout.addWidget(QLabel("Channel ID:"), 0, 0)
+        self.spin_analyze_channel = QSpinBox()
+        self.spin_analyze_channel.setRange(0, 127)
+        self.spin_analyze_channel.setValue(63)
+        self.spin_analyze_channel.valueChanged.connect(self.on_analyze_channel_changed)
+        param_layout.addWidget(self.spin_analyze_channel, 0, 1)
+
+        param_layout.addWidget(QLabel("Pixel Number:"), 0, 2)
+        self.spin_analyze_pixel = QSpinBox()
+        self.spin_analyze_pixel.setRange(0, 127)
+        self.spin_analyze_pixel.setValue(63)
+        self.spin_analyze_pixel.valueChanged.connect(self.load_available_analyze_plots)
+        param_layout.addWidget(self.spin_analyze_pixel, 0, 3)
+
+        param_layout.addWidget(QLabel("Rbias IV (Ω):"), 1, 0)
+        self.spin_analyze_rbias = QDoubleSpinBox()
+        self.spin_analyze_rbias.setRange(1.0, 100000.0)
+        self.spin_analyze_rbias.setValue(2000.0)
+        param_layout.addWidget(self.spin_analyze_rbias, 1, 1)
+
+        param_layout.addWidget(QLabel("Rshunt (µΩ):"), 1, 2)
+        self.spin_analyze_rshunt = QDoubleSpinBox()
+        self.spin_analyze_rshunt.setRange(0.1, 50000.0)
+        self.spin_analyze_rshunt.setValue(250.0)
+        param_layout.addWidget(self.spin_analyze_rshunt, 1, 3)
+
+        param_layout.addWidget(QLabel("Lnyq (nH):"), 2, 0)
+        self.spin_analyze_lnyq = QDoubleSpinBox()
+        self.spin_analyze_lnyq.setRange(0.1, 10000.0)
+        self.spin_analyze_lnyq.setValue(74.8)
+        param_layout.addWidget(self.spin_analyze_lnyq, 2, 1)
+
+        param_layout.addWidget(QLabel("Zero-Bias τ (s):"), 2, 2)
+        tau_h = QHBoxLayout()
+        self.spin_analyze_tau = QDoubleSpinBox()
+        self.spin_analyze_tau.setRange(-1.0, 1.0)
+        self.spin_analyze_tau.setDecimals(7)
+        self.spin_analyze_tau.setSingleStep(0.0001)
+        self.spin_analyze_tau.setValue(-0.0270625)
+        self.chk_analyze_auto_tau = QCheckBox("Auto from file")
+        self.chk_analyze_auto_tau.setChecked(True)
+        self.chk_analyze_auto_tau.toggled.connect(lambda chk: self.spin_analyze_tau.setEnabled(not chk))
+        self.spin_analyze_tau.setEnabled(False)
+        tau_h.addWidget(self.spin_analyze_tau)
+        tau_h.addWidget(self.chk_analyze_auto_tau)
+        param_layout.addLayout(tau_h, 2, 3)
+
+        param_layout.addWidget(QLabel("Tc (K):"), 3, 0)
+        self.spin_analyze_tc = QDoubleSpinBox()
+        self.spin_analyze_tc.setRange(0.001, 5.0)
+        self.spin_analyze_tc.setDecimals(4)
+        self.spin_analyze_tc.setSingleStep(0.01)
+        self.spin_analyze_tc.setValue(0.12)
+        param_layout.addWidget(self.spin_analyze_tc, 3, 1)
+
+        param_layout.addWidget(QLabel("Tbath (K):"), 3, 2)
+        self.spin_analyze_tbath = QDoubleSpinBox()
+        self.spin_analyze_tbath.setRange(0.001, 1.0)
+        self.spin_analyze_tbath.setDecimals(4)
+        self.spin_analyze_tbath.setSingleStep(0.005)
+        self.spin_analyze_tbath.setValue(0.02)
+        param_layout.addWidget(self.spin_analyze_tbath, 3, 3)
+
+        param_layout.addWidget(QLabel("Thermal Exponent n:"), 4, 0)
+        self.spin_analyze_n = QDoubleSpinBox()
+        self.spin_analyze_n.setRange(1.0, 10.0)
+        self.spin_analyze_n.setValue(4.0)
+        param_layout.addWidget(self.spin_analyze_n, 4, 1)
+
+        param_layout.addWidget(QLabel("Dummy g_tes_b (W/K):"), 4, 2)
+        self.spin_analyze_dummy_g = QDoubleSpinBox()
+        self.spin_analyze_dummy_g.setRange(1e-12, 1e-3)
+        self.spin_analyze_dummy_g.setDecimals(10)
+        self.spin_analyze_dummy_g.setValue(2e-7)
+        param_layout.addWidget(self.spin_analyze_dummy_g, 4, 3)
+
+        flags_h = QHBoxLayout()
+        self.chk_analyze_flip_bias = QCheckBox("Flip bias (ensure Re(Z) > 0 at DC)")
+        self.chk_analyze_flip_bias.setChecked(False)
+        flags_h.addWidget(self.chk_analyze_flip_bias)
+        self.chk_analyze_save_plots = QCheckBox("Save Plots & CSV Results")
+        self.chk_analyze_save_plots.setChecked(True)
+        flags_h.addWidget(self.chk_analyze_save_plots)
+        param_layout.addLayout(flags_h, 5, 0, 1, 4)
+
+        left_layout.addWidget(param_box)
+
+        # 3. Execution Status & Controls
+        exec_box = QGroupBox("Execution & Controls")
+        exec_layout = QVBoxLayout(exec_box)
+        exec_layout.setSpacing(6)
+
+        status_h = QHBoxLayout()
+        self.lbl_analyze_status = QLabel("STATUS: IDLE")
+        self.lbl_analyze_status.setStyleSheet("font-weight: bold; color: #b0bec5; font-size: 11pt;")
+        status_h.addWidget(self.lbl_analyze_status)
+        status_h.addStretch()
+        exec_layout.addLayout(status_h)
+
+        self.prog_analyze = QProgressBar()
+        self.prog_analyze.setRange(0, 100)
+        self.prog_analyze.setValue(0)
+        exec_layout.addWidget(self.prog_analyze)
+
+        btn_grid = QGridLayout()
+        self.btn_run_analyze = QPushButton("RUN ANALYSIS")
+        self.btn_run_analyze.setStyleSheet("background-color: #2e7d32; color: #ffffff; font-size: 11pt; font-weight: bold; padding: 10px;")
+        self.btn_run_analyze.clicked.connect(self.on_run_analyze_clicked)
+
+        self.btn_abort_analyze = QPushButton("ABORT ANALYSIS")
+        self.btn_abort_analyze.setStyleSheet("background-color: #c62828; color: #ffffff; font-size: 11pt; font-weight: bold; padding: 10px;")
+        self.btn_abort_analyze.setEnabled(False)
+        self.btn_abort_analyze.clicked.connect(self.on_abort_analyze_clicked)
+
+        self.btn_open_analyze_dir = QPushButton("Open Output Folder")
+        self.btn_open_analyze_dir.setStyleSheet("background-color: #1976d2; color: #ffffff; font-weight: bold; padding: 8px;")
+        self.btn_open_analyze_dir.clicked.connect(self.on_open_analyze_dir)
+
+        self.btn_save_analyze_cfg = QPushButton("Save Settings as Default")
+        self.btn_save_analyze_cfg.setStyleSheet("background-color: #37474f; color: #cfd8dc; font-size: 9pt;")
+        self.btn_save_analyze_cfg.clicked.connect(self.save_settings_to_json)
+
+        for btn in (self.btn_run_analyze, self.btn_abort_analyze, self.btn_open_analyze_dir, self.btn_save_analyze_cfg):
+            btn.setFixedHeight(40)
+
+        btn_grid.addWidget(self.btn_run_analyze, 0, 0)
+        btn_grid.addWidget(self.btn_abort_analyze, 0, 1)
+        btn_grid.addWidget(self.btn_open_analyze_dir, 1, 0)
+        btn_grid.addWidget(self.btn_save_analyze_cfg, 1, 1)
+        exec_layout.addLayout(btn_grid)
+
+        left_layout.addWidget(exec_box)
+
+        # 4. Activity Log
+        log_box = QGroupBox("Analysis Activity Log")
+        log_layout = QVBoxLayout(log_box)
+        self.txt_analyze_log = QTextEdit()
+        self.txt_analyze_log.setReadOnly(True)
+        log_layout.addWidget(self.txt_analyze_log)
+        left_layout.addWidget(log_box, stretch=1)
+
+        splitter.addWidget(left_widget)
+
+        # Right Pane: Interactive Plot Viewer
+        right_widget = QWidget()
+        right_layout = QVBoxLayout(right_widget)
+        right_layout.setContentsMargins(0, 0, 0, 0)
+        right_layout.setSpacing(6)
+
+        # Selector toolbar
+        selector_box = QGroupBox("Plot Selection & Display")
+        selector_layout = QHBoxLayout(selector_box)
+        selector_layout.setSpacing(8)
+
+        selector_layout.addWidget(QLabel("Plot:"))
+        self.combo_analyze_plots = QComboBox()
+        for label, _ in ANALYZE_PLOT_TYPES:
+            self.combo_analyze_plots.addItem(label)
+        self.combo_analyze_plots.currentIndexChanged.connect(self.on_analyze_plot_selected)
+        selector_layout.addWidget(self.combo_analyze_plots, stretch=1)
+
+        self.btn_prev_plot = QPushButton("◀ Prev")
+        self.btn_prev_plot.clicked.connect(self.on_prev_plot_clicked)
+        selector_layout.addWidget(self.btn_prev_plot)
+
+        self.btn_next_plot = QPushButton("Next ▶")
+        self.btn_next_plot.clicked.connect(self.on_next_plot_clicked)
+        selector_layout.addWidget(self.btn_next_plot)
+
+        self.btn_reload_plots = QPushButton("Reload Plots")
+        self.btn_reload_plots.clicked.connect(self.load_available_analyze_plots)
+        selector_layout.addWidget(self.btn_reload_plots)
+
+        right_layout.addWidget(selector_box)
+
+        self.lbl_plot_filename = QLabel("No plot loaded")
+        self.lbl_plot_filename.setStyleSheet("color: #82b1ff; font-weight: bold; padding: 2px;")
+        right_layout.addWidget(self.lbl_plot_filename)
+
+        # Matplotlib canvas and navigation toolbar
+        self.analyze_canvas = AnalyzePlotCanvas(self, width=9, height=8)
+        self.analyze_toolbar = NavigationToolbar(self.analyze_canvas, self)
+        self.analyze_toolbar.setStyleSheet("background-color: #e4e8ed; border: 1px solid #c7cbd1; border-radius: 4px;")
+
+        right_layout.addWidget(self.analyze_toolbar)
+        right_layout.addWidget(self.analyze_canvas, stretch=1)
+
+        splitter.addWidget(right_widget)
+        splitter.setStretchFactor(0, 1)
+        splitter.setStretchFactor(1, 1)
+        return splitter
 
     def _create_bias_tab(self):
         tab = QWidget()
@@ -1181,9 +1857,15 @@ class CZMainWindow(QMainWindow):
         self.spin_channel.setValue(13)
         source_layout.addWidget(self.spin_channel, 0, 3)
 
+        self.chk_flip_bias = QCheckBox("Flip bias? (opposite model sign, Re(Z) > 0 at DC)")
+        self.chk_flip_bias.setChecked(False)
+        self.chk_flip_bias.setStyleSheet("font-weight: bold; color: #0288d1;")
+        self.chk_flip_bias.setToolTip("If enabled, the 0V SC transfer function model is generated with opposite sign so the delay fitter does not crash and Re(Z) is positive at DC.")
+        source_layout.addWidget(self.chk_flip_bias, 1, 0, 1, 4)
+
         self.lbl_dc_source_note = QLabel("AWG Direct Mode: DC offset is generated directly on AWG Channel 2 (no external DC box required).")
         self.lbl_dc_source_note.setStyleSheet("color: #00897b; font-size: 8.5pt; font-style: italic;")
-        source_layout.addWidget(self.lbl_dc_source_note, 1, 0, 1, 4)
+        source_layout.addWidget(self.lbl_dc_source_note, 2, 0, 1, 4)
 
         # SRS900 Configuration Sub-Group
         self.grp_srs = QGroupBox("SRS SIM900 / SIM928 Configuration")
@@ -1194,108 +1876,85 @@ class CZMainWindow(QMainWindow):
         self.edit_srs_url = QLineEdit("serial:///dev/ttyUSB1?baudrate=9600")
         srs_grid.addWidget(self.edit_srs_url, 0, 1)
 
-        srs_grid.addWidget(QLabel("SIM928 Port/Slot:"), 0, 2)
+        self.btn_test_srs = QPushButton("Test SRS")
+        self.btn_test_srs.setStyleSheet("background-color: #0288d1; color: #ffffff;")
+        self.btn_test_srs.clicked.connect(self.on_test_srs_clicked)
+        srs_grid.addWidget(self.btn_test_srs, 0, 2)
+
+        srs_grid.addWidget(QLabel("SIM928 Port/Slot:"), 1, 0)
         self.spin_srs_port = QSpinBox()
         self.spin_srs_port.setRange(1, 8)
         self.spin_srs_port.setValue(2)
-        srs_grid.addWidget(self.spin_srs_port, 0, 3)
+        srs_grid.addWidget(self.spin_srs_port, 1, 1)
+
+        self.lbl_srs_status = QLabel("Status: Not tested")
+        self.lbl_srs_status.setStyleSheet("color: #757575; font-style: italic;")
+        srs_grid.addWidget(self.lbl_srs_status, 2, 0, 1, 3)
 
         self.chk_srs_pulse_vnorm = QCheckBox("Pulse Vnorm (0.1 s) before each bias point")
         self.chk_srs_pulse_vnorm.setChecked(True)
-        srs_grid.addWidget(self.chk_srs_pulse_vnorm, 1, 0, 1, 4)
+        srs_grid.addWidget(self.chk_srs_pulse_vnorm, 3, 0, 1, 3)
 
-        source_layout.addWidget(self.grp_srs, 2, 0, 1, 4)
+        source_layout.addWidget(self.grp_srs, 3, 0, 1, 4)
         layout.addWidget(source_box)
 
         # Schedule Box
         sched_box = QGroupBox("Bias Voltage Schedule (V)")
-        grid = QGridLayout(sched_box)
-        grid.setSpacing(6)
+        sched_layout = QVBoxLayout(sched_box)
+        sched_layout.setSpacing(6)
 
-        grid.addWidget(QLabel("Baseline Point:"), 0, 0)
+        # Baseline & Conditioning Row
+        cond_grid = QGridLayout()
+        cond_grid.setSpacing(6)
+
+        cond_grid.addWidget(QLabel("Baseline Point:"), 0, 0)
         self.spin_base_bias = QDoubleSpinBox()
         self.spin_base_bias.setRange(0.0, 0.0)
         self.spin_base_bias.setValue(0.0)
         self.spin_base_bias.setDecimals(3)
         self.spin_base_bias.setEnabled(False)
-        grid.addWidget(self.spin_base_bias, 0, 1)
-        grid.addWidget(QLabel("(Fixed 0.0 V for SC calibration)"), 0, 2)
+        cond_grid.addWidget(self.spin_base_bias, 0, 1)
+        cond_grid.addWidget(QLabel("(Fixed 0.0 V for SC calibration)"), 0, 2)
 
         self.chk_normal_first = QCheckBox("SC check, then normalize TES for 1 s before sweep")
         self.chk_normal_first.setChecked(False)
         self.chk_normal_first.toggled.connect(self.update_bias_preview)
-        grid.addWidget(self.chk_normal_first, 0, 3, 1, 3)
+        cond_grid.addWidget(self.chk_normal_first, 0, 3)
 
-        grid.addWidget(QLabel("Vnorm:"), 3, 0)
+        cond_grid.addWidget(QLabel("Vnorm (V):"), 1, 0)
         self.spin_vnorm = QDoubleSpinBox()
         self.spin_vnorm.setRange(0.0, 10.0)
         self.spin_vnorm.setValue(9.5)
         self.spin_vnorm.setDecimals(3)
         self.spin_vnorm.setSingleStep(0.5)
         self.spin_vnorm.valueChanged.connect(self.update_bias_preview)
-        grid.addWidget(self.spin_vnorm, 3, 1)
-        grid.addWidget(QLabel("(Used as pre-sweep or conditioning offset)"), 3, 2, 1, 4)
+        cond_grid.addWidget(self.spin_vnorm, 1, 1)
 
-        grid.addWidget(QLabel("Post-normal recovery (s):"), 4, 0)
+        cond_grid.addWidget(QLabel("Post-normal recovery (s):"), 1, 2)
         self.spin_post_normal_settle = QDoubleSpinBox()
         self.spin_post_normal_settle.setRange(0.0, 60.0)
         self.spin_post_normal_settle.setValue(5.0)
         self.spin_post_normal_settle.setDecimals(1)
         self.spin_post_normal_settle.setSingleStep(1.0)
-        grid.addWidget(self.spin_post_normal_settle, 4, 1)
-        grid.addWidget(QLabel("(Wait before first sweep point)"), 4, 2, 1, 4)
+        cond_grid.addWidget(self.spin_post_normal_settle, 1, 3)
+        sched_layout.addLayout(cond_grid)
 
-        # Dense region
-        grid.addWidget(QLabel("Dense Region:"), 1, 0)
-        self.spin_dense_start = QDoubleSpinBox()
-        self.spin_dense_start.setRange(0.0, 10.0)
-        self.spin_dense_start.setValue(0.5)
-        self.spin_dense_start.setSingleStep(0.1)
-        self.spin_dense_start.valueChanged.connect(self.update_bias_preview)
-        grid.addWidget(self.spin_dense_start, 1, 1)
+        # Dynamic Bias Ranges Table
+        sched_layout.addWidget(QLabel("Sweep Voltage Regions (Start, Stop, Step):"))
+        self.tbl_bias_ranges = QTableWidget(0, 5)
+        self.tbl_bias_ranges.setHorizontalHeaderLabels(["Region", "Start (V)", "Stop (V)", "Step (V)", "Action"])
+        self.tbl_bias_ranges.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.tbl_bias_ranges.setMinimumHeight(120)
+        self.tbl_bias_ranges.setMaximumHeight(180)
+        sched_layout.addWidget(self.tbl_bias_ranges)
 
-        grid.addWidget(QLabel("to"), 1, 2)
-        self.spin_dense_stop = QDoubleSpinBox()
-        self.spin_dense_stop.setRange(0.0, 10.0)
-        self.spin_dense_stop.setValue(1.5)
-        self.spin_dense_stop.setSingleStep(0.1)
-        self.spin_dense_stop.valueChanged.connect(self.update_bias_preview)
-        grid.addWidget(self.spin_dense_stop, 1, 3)
-
-        grid.addWidget(QLabel("step:"), 1, 4)
-        self.spin_dense_step = QDoubleSpinBox()
-        self.spin_dense_step.setRange(0.001, 1.0)
-        self.spin_dense_step.setValue(0.01)
-        self.spin_dense_step.setDecimals(3)
-        self.spin_dense_step.setSingleStep(0.005)
-        self.spin_dense_step.valueChanged.connect(self.update_bias_preview)
-        grid.addWidget(self.spin_dense_step, 1, 5)
-
-        # Medium region
-        grid.addWidget(QLabel("Medium Region:"), 2, 0)
-        self.spin_med_start = QDoubleSpinBox()
-        self.spin_med_start.setRange(0.0, 10.0)
-        self.spin_med_start.setValue(1.5)
-        self.spin_med_start.setSingleStep(0.1)
-        self.spin_med_start.valueChanged.connect(self.update_bias_preview)
-        grid.addWidget(self.spin_med_start, 2, 1)
-
-        grid.addWidget(QLabel("to"), 2, 2)
-        self.spin_med_stop = QDoubleSpinBox()
-        self.spin_med_stop.setRange(0.0, 10.0)
-        self.spin_med_stop.setValue(5.0)
-        self.spin_med_stop.setSingleStep(0.5)
-        self.spin_med_stop.valueChanged.connect(self.update_bias_preview)
-        grid.addWidget(self.spin_med_stop, 2, 3)
-
-        grid.addWidget(QLabel("step:"), 2, 4)
-        self.spin_med_step = QDoubleSpinBox()
-        self.spin_med_step.setRange(0.01, 2.0)
-        self.spin_med_step.setValue(0.1)
-        self.spin_med_step.setDecimals(2)
-        self.spin_med_step.setSingleStep(0.05)
-        self.spin_med_step.valueChanged.connect(self.update_bias_preview)
-        grid.addWidget(self.spin_med_step, 2, 5)
+        btn_row_layout = QHBoxLayout()
+        self.btn_add_bias_row = QPushButton("+ Add Bias Range Row")
+        self.btn_add_bias_row.setStyleSheet("background-color: #2e7d32; color: #ffffff; font-weight: bold; padding: 5px 12px;")
+        self.btn_add_bias_row.clicked.connect(lambda: self.add_bias_range_row())
+        btn_row_layout.addWidget(self.btn_add_bias_row)
+        btn_row_layout.addStretch()
+        sched_layout.addLayout(btn_row_layout)
 
         layout.addWidget(sched_box)
 
@@ -1324,43 +1983,60 @@ class CZMainWindow(QMainWindow):
         self.edit_awg_addr = QLineEdit("USB::2391::22279::INSTR")
         grid.addWidget(self.edit_awg_addr, 0, 1)
 
-        grid.addWidget(QLabel("Output Channel:"), 1, 0)
+        awg_btn_layout = QHBoxLayout()
+        self.btn_test_awg = QPushButton("Test AWG")
+        self.btn_test_awg.setStyleSheet("background-color: #0288d1; color: #ffffff; font-weight: bold;")
+        self.btn_test_awg.clicked.connect(self.on_test_awg_clicked)
+        awg_btn_layout.addWidget(self.btn_test_awg)
+
+        self.btn_detect_awg = QPushButton("Auto-Detect USB")
+        self.btn_detect_awg.setStyleSheet("background-color: #455a64; color: #ffffff;")
+        self.btn_detect_awg.clicked.connect(self.on_detect_awg_clicked)
+        awg_btn_layout.addWidget(self.btn_detect_awg)
+        grid.addLayout(awg_btn_layout, 0, 2)
+
+        self.lbl_awg_status = QLabel("Instrument Status: Not tested")
+        self.lbl_awg_status.setStyleSheet("color: #757575; font-style: italic;")
+        grid.addWidget(self.lbl_awg_status, 1, 1, 1, 2)
+
+        grid.addWidget(QLabel("Output Channel:"), 2, 0)
         self.spin_awg_ch = QSpinBox()
         self.spin_awg_ch.setRange(1, 2)
         self.spin_awg_ch.setValue(2)
-        grid.addWidget(self.spin_awg_ch, 1, 1)
+        grid.addWidget(self.spin_awg_ch, 2, 1)
 
-        grid.addWidget(QLabel("Termination Load:"), 2, 0)
+        grid.addWidget(QLabel("Termination Load:"), 3, 0)
         self.combo_load = QComboBox()
         self.combo_load.addItems(["INFinity", "50"])
-        grid.addWidget(self.combo_load, 2, 1)
+        grid.addWidget(self.combo_load, 3, 1)
 
-        grid.addWidget(QLabel("AC Amplitude Vpp (V):"), 3, 0)
+        grid.addWidget(QLabel("AC Amplitude Vpp (V):"), 4, 0)
         self.spin_awg_vpp = QDoubleSpinBox()
         self.spin_awg_vpp.setRange(0.001, 1.0)
         self.spin_awg_vpp.setValue(0.02)
         self.spin_awg_vpp.setDecimals(4)
         self.spin_awg_vpp.setSingleStep(0.005)
-        grid.addWidget(self.spin_awg_vpp, 3, 1)
+        grid.addWidget(self.spin_awg_vpp, 4, 1)
 
-        grid.addWidget(QLabel("Multiplier per Sine:"), 4, 0)
+        grid.addWidget(QLabel("Multiplier per Sine:"), 5, 0)
         self.spin_sine_mult = QDoubleSpinBox()
         self.spin_sine_mult.setRange(0.001, 0.5)
         self.spin_sine_mult.setValue(0.04)
         self.spin_sine_mult.setDecimals(4)
-        grid.addWidget(self.spin_sine_mult, 4, 1)
+        self.spin_sine_mult.valueChanged.connect(self.update_comb_info)
+        grid.addWidget(self.spin_sine_mult, 5, 1)
 
-        grid.addWidget(QLabel("Nominal AWG Rate (MSa/s):"), 5, 0)
+        grid.addWidget(QLabel("Nominal AWG Rate (MSa/s):"), 6, 0)
         self.spin_awg_rate = QDoubleSpinBox()
         self.spin_awg_rate.setRange(0.1, 50.0)
         self.spin_awg_rate.setValue(5.0)
-        grid.addWidget(self.spin_awg_rate, 5, 1)
+        grid.addWidget(self.spin_awg_rate, 6, 1)
 
-        grid.addWidget(QLabel("Settle Time (s):"), 6, 0)
+        grid.addWidget(QLabel("Settle Time (s):"), 7, 0)
         self.spin_settle = QDoubleSpinBox()
         self.spin_settle.setRange(0.05, 5.0)
         self.spin_settle.setValue(0.3)
-        grid.addWidget(self.spin_settle, 6, 1)
+        grid.addWidget(self.spin_settle, 7, 1)
 
         layout.addLayout(grid)
         layout.addStretch()
@@ -1409,19 +2085,56 @@ class CZMainWindow(QMainWindow):
 
         grid.addWidget(QLabel("Num High-Freq Tones:"), 5, 0)
         self.spin_num_tones = QSpinBox()
-        self.spin_num_tones.setRange(5, 50)
-        self.spin_num_tones.setValue(30)
+        self.spin_num_tones.setRange(5, 250)
+        self.spin_num_tones.setValue(100)
+        self.spin_num_tones.valueChanged.connect(self.update_comb_info)
         grid.addWidget(self.spin_num_tones, 5, 1)
 
-        grid.addWidget(QLabel("Averages per Bias Point:"), 6, 0)
+        grid.addWidget(QLabel("High-Freq Cutoff (Hz):"), 6, 0)
+        self.spin_high_f_cutoff = QDoubleSpinBox()
+        self.spin_high_f_cutoff.setRange(100.0, 500000.0)
+        self.spin_high_f_cutoff.setValue(50000.0)
+        self.spin_high_f_cutoff.setSingleStep(5000.0)
+        self.spin_high_f_cutoff.setDecimals(1)
+        self.spin_high_f_cutoff.setToolTip("Upper frequency cutoff for comb tones. Internally rejected if >= Nyquist (fs/2).")
+        self.spin_high_f_cutoff.valueChanged.connect(self.update_comb_info)
+        grid.addWidget(self.spin_high_f_cutoff, 6, 1)
+
+        self.chk_schroeder = QCheckBox("Schroeder Phase Comb (Prevents AWG clipping for 20-100+ tones)")
+        self.chk_schroeder.setChecked(True)
+        self.chk_schroeder.setStyleSheet("color: #0288d1; font-weight: bold;")
+        self.chk_schroeder.toggled.connect(self.update_comb_info)
+        grid.addWidget(self.chk_schroeder, 7, 0, 1, 2)
+
+        line_layout = QHBoxLayout()
+        self.chk_skip_line = QCheckBox("Skip Line Noise Harmonics")
+        self.chk_skip_line.setChecked(True)
+        self.chk_skip_line.setStyleSheet("color: #7b1fa2; font-weight: bold;")
+        self.chk_skip_line.toggled.connect(self.update_comb_info)
+        line_layout.addWidget(self.chk_skip_line)
+
+        line_layout.addWidget(QLabel("Line Freq (Hz):"))
+        self.spin_line_freq = QDoubleSpinBox()
+        self.spin_line_freq.setRange(10.0, 400.0)
+        self.spin_line_freq.setValue(60.0)
+        self.spin_line_freq.setDecimals(1)
+        self.spin_line_freq.valueChanged.connect(self.update_comb_info)
+        line_layout.addWidget(self.spin_line_freq)
+        grid.addLayout(line_layout, 8, 0, 1, 2)
+
+        self.lbl_comb_info = QLabel("Comb Status: Initializing...")
+        self.lbl_comb_info.setStyleSheet("color: #00897b; font-style: italic;")
+        grid.addWidget(self.lbl_comb_info, 9, 0, 1, 2)
+
+        grid.addWidget(QLabel("Averages per Bias Point:"), 10, 0)
         self.spin_averages = QSpinBox()
         self.spin_averages.setRange(1, 32)
         self.spin_averages.setValue(4)
-        grid.addWidget(self.spin_averages, 6, 1)
+        grid.addWidget(self.spin_averages, 10, 1)
 
-        grid.addWidget(QLabel("Data Save Root Dir:"), 7, 0)
+        grid.addWidget(QLabel("Data Save Root Dir:"), 11, 0)
         self.edit_save_dir = QLineEdit("/data")
-        grid.addWidget(self.edit_save_dir, 7, 1)
+        grid.addWidget(self.edit_save_dir, 11, 1)
 
         layout.addLayout(grid)
         layout.addStretch()
@@ -1443,23 +2156,30 @@ class CZMainWindow(QMainWindow):
         self.chk_pause_0v.setStyleSheet("color: #f57f17;")
         grid.addWidget(self.chk_pause_0v, 1, 0, 1, 2)
 
-        grid.addWidget(QLabel("SC acquisition settle time (s):"), 2, 0)
+        self.chk_flip_bias_sc = QCheckBox("Flip bias? (opposite model sign so fitter doesn't crash, Re(Z) > 0 at DC)")
+        self.chk_flip_bias_sc.setChecked(self.chk_flip_bias.isChecked())
+        self.chk_flip_bias_sc.setStyleSheet("font-weight: bold; color: #0288d1;")
+        self.chk_flip_bias.toggled.connect(self.chk_flip_bias_sc.setChecked)
+        self.chk_flip_bias_sc.toggled.connect(self.chk_flip_bias.setChecked)
+        grid.addWidget(self.chk_flip_bias_sc, 2, 0, 1, 2)
+
+        grid.addWidget(QLabel("SC acquisition settle time (s):"), 3, 0)
         self.spin_sc_settle = QDoubleSpinBox()
         self.spin_sc_settle.setRange(0.0, 30.0)
         self.spin_sc_settle.setValue(2.0)
         self.spin_sc_settle.setDecimals(1)
         self.spin_sc_settle.setSingleStep(0.5)
-        grid.addWidget(self.spin_sc_settle, 2, 1)
+        grid.addWidget(self.spin_sc_settle, 3, 1)
 
-        grid.addWidget(QLabel("Minimum Acceptable R² Fit Quality:"), 3, 0)
+        grid.addWidget(QLabel("Minimum Acceptable R² Fit Quality:"), 4, 0)
         self.spin_min_r2 = QDoubleSpinBox()
         self.spin_min_r2.setRange(0.1, 0.999)
         self.spin_min_r2.setValue(0.85)
         self.spin_min_r2.setDecimals(3)
         self.spin_min_r2.setSingleStep(0.05)
-        grid.addWidget(self.spin_min_r2, 3, 1)
+        grid.addWidget(self.spin_min_r2, 4, 1)
 
-        grid.addWidget(QLabel("Allowed f_roll Range (Hz):"), 4, 0)
+        grid.addWidget(QLabel("Allowed f_roll Range (Hz):"), 5, 0)
         f_h = QHBoxLayout()
         self.spin_min_froll = QDoubleSpinBox()
         self.spin_min_froll.setRange(1.0, 1000.0)
@@ -1470,16 +2190,16 @@ class CZMainWindow(QMainWindow):
         self.spin_max_froll.setRange(100.0, 100000.0)
         self.spin_max_froll.setValue(25000.0)
         f_h.addWidget(self.spin_max_froll)
-        grid.addLayout(f_h, 4, 1)
+        grid.addLayout(f_h, 5, 1)
 
         self.chk_dry_run = QCheckBox("Simulation / Dry Run Mode (No physical instruments required)")
         self.chk_dry_run.setChecked(not (HAS_HARDWARE_LIBS and HAS_DASTARD_LIB))
-        grid.addWidget(self.chk_dry_run, 5, 0, 1, 2)
+        grid.addWidget(self.chk_dry_run, 6, 0, 1, 2)
 
         self.chk_dark_mode = QCheckBox("Dark mode")
         self.chk_dark_mode.setChecked(False)
         self.chk_dark_mode.toggled.connect(self.apply_theme)
-        grid.addWidget(self.chk_dark_mode, 6, 0, 1, 2)
+        grid.addWidget(self.chk_dark_mode, 7, 0, 1, 2)
 
         layout.addLayout(grid)
         layout.addStretch()
@@ -1504,11 +2224,99 @@ class CZMainWindow(QMainWindow):
         self.btn_browse_cfg.setEnabled(auto)
         self.spin_manual_tfr.setEnabled(not auto)
 
+    def on_test_awg_clicked(self):
+        addr = self.edit_awg_addr.text().strip()
+        self.log("INFO", f"Testing AWG connection at '{addr}'...")
+        if not HAS_HARDWARE_LIBS:
+            msg = "qsdumux hardware libraries are not available in this Python environment."
+            self.lbl_awg_status.setText(f"Status: {msg}")
+            self.lbl_awg_status.setStyleSheet("color: #d32f2f; font-weight: bold;")
+            self.log("ERROR", msg)
+            QMessageBox.critical(self, "AWG Connection Error", msg)
+            return
+
+        try:
+            if addr.startswith("vxi11://") or "://" in addr:
+                fg = keysight33600A_usb.Keysight33600A_usb(url=addr)
+            else:
+                fg = keysight33600A_usb.Keysight33600A_usb(device=addr)
+            idn = fg._ask("*IDN?").strip()
+            try:
+                fg.channel.close()
+            except Exception:
+                pass
+            self.lbl_awg_status.setText(f"Connected: {idn}")
+            self.lbl_awg_status.setStyleSheet("color: #2e7d32; font-weight: bold;")
+            self.log("INFO", f"AWG Identified: {idn}")
+            QMessageBox.information(self, "AWG Connected", f"Successfully connected to Keysight AWG!\n\n{idn}")
+        except Exception as e:
+            err = f"Failed to connect to AWG at '{addr}': {e}"
+            self.lbl_awg_status.setText(f"Error: {e}")
+            self.lbl_awg_status.setStyleSheet("color: #d32f2f; font-weight: bold;")
+            self.log("ERROR", err)
+            QMessageBox.warning(self, "AWG Connection Failed", err)
+
+    def on_detect_awg_clicked(self):
+        self.log("INFO", "Auto-detecting USB AWG...")
+        try:
+            import usbtmc
+            devs = usbtmc.list_devices()
+            found = None
+            for d in devs:
+                if d.idVendor in (0x0957, 0x2A8D):
+                    found = f"USB::{d.idVendor}::{d.idProduct}::INSTR"
+                    break
+            if found:
+                self.edit_awg_addr.setText(found)
+                self.log("INFO", f"Found USB instrument: {found}")
+                self.on_test_awg_clicked()
+            else:
+                msg = "No Keysight/Agilent USB instrument found."
+                self.lbl_awg_status.setText(f"Status: {msg}")
+                self.lbl_awg_status.setStyleSheet("color: #f57f17; font-weight: bold;")
+                self.log("WARN", msg)
+                QMessageBox.information(self, "Auto-Detect AWG", msg)
+        except Exception as e:
+            self.log("ERROR", f"Auto-detect error: {e}")
+            QMessageBox.warning(self, "Auto-Detect Error", str(e))
+
+    def on_test_srs_clicked(self):
+        url = self.edit_srs_url.text().strip()
+        port = self.spin_srs_port.value()
+        self.log("INFO", f"Testing SRS SIM900 mainframe at '{url}' (Port {port})...")
+        if not HAS_HARDWARE_LIBS:
+            msg = "qsdumux hardware libraries are not available in this Python environment."
+            self.log("ERROR", msg)
+            QMessageBox.critical(self, "SRS Connection Error", msg)
+            return
+
+        try:
+            mf = sim900.SRS_SIM900(url=url)
+            vb = sim928.SRS_SIM928(mf, port)
+            v = vb.getvolt()
+            try:
+                mf.close()
+            except Exception:
+                pass
+            msg = f"Connected to SRS SIM928 on Port {port}. Current output: {v:.4f} V"
+            self.lbl_srs_status.setText(f"Status: OK ({v:.3f} V)")
+            self.lbl_srs_status.setStyleSheet("color: #2e7d32; font-weight: bold;")
+            self.log("INFO", msg)
+            QMessageBox.information(self, "SRS Connected", msg)
+        except Exception as e:
+            err = f"Failed to connect to SRS SIM900/928: {e}"
+            self.lbl_srs_status.setText(f"Error: {e}")
+            self.lbl_srs_status.setStyleSheet("color: #d32f2f; font-weight: bold;")
+            self.log("ERROR", err)
+            QMessageBox.warning(self, "SRS Connection Failed", err)
+
     def apply_theme(self):
         dark_mode = self.chk_dark_mode.isChecked()
         if dark_mode:
             self.setStyleSheet(self.dark_stylesheet)
             self.toolbar.setStyleSheet("background-color: #1e2430; border: 1px solid #2a313d; border-radius: 4px;")
+            if hasattr(self, "analyze_toolbar"):
+                self.analyze_toolbar.setStyleSheet("background-color: #1e2430; border: 1px solid #2a313d; border-radius: 4px;")
         else:
             self.setStyleSheet("""
                 QMainWindow, QWidget {
@@ -1550,13 +2358,41 @@ class CZMainWindow(QMainWindow):
                 QTabBar::tab {
                     background-color: #e4e8ed;
                     color: #4f5965;
+                    padding: 8px 16px;
+                    font-weight: bold;
                 }
                 QTabBar::tab:selected {
                     background-color: #ffffff;
                     color: #245ea8;
+                    border-bottom: 2px solid #245ea8;
+                }
+                QTabWidget#main_tabs::pane {
+                    border: 1px solid #c7cbd1;
+                    border-radius: 6px;
+                    background-color: #ffffff;
+                }
+                QTabWidget#main_tabs > QTabBar::tab {
+                    background-color: #e4e8ed;
+                    color: #37474f;
+                    font-size: 11pt;
+                    font-weight: bold;
+                    padding: 10px 24px;
+                    margin-right: 4px;
+                    border-top-left-radius: 6px;
+                    border-top-right-radius: 6px;
+                    border: 1px solid #c7cbd1;
+                    border-bottom: none;
+                }
+                QTabWidget#main_tabs > QTabBar::tab:selected {
+                    background-color: #ffffff;
+                    color: #1976d2;
+                    border-top: 3px solid #1976d2;
+                    border-bottom: 2px solid #ffffff;
                 }
             """)
             self.toolbar.setStyleSheet("background-color: #e4e8ed; border: 1px solid #c7cbd1; border-radius: 4px;")
+            if hasattr(self, "analyze_toolbar"):
+                self.analyze_toolbar.setStyleSheet("background-color: #e4e8ed; border: 1px solid #c7cbd1; border-radius: 4px;")
         self.canvas.set_theme(dark_mode)
 
     def on_browse_cfg(self):
@@ -1564,19 +2400,108 @@ class CZMainWindow(QMainWindow):
         if filename:
             self.edit_cfg_path.setText(filename)
 
+    def add_bias_range_row(self, start=None, stop=None, step=None):
+        row = self.tbl_bias_ranges.rowCount()
+        self.tbl_bias_ranges.insertRow(row)
+
+        lbl = QLabel(f"Region {row + 1}")
+        lbl.setAlignment(Qt.AlignCenter)
+        lbl.setStyleSheet("font-weight: bold; color: #245ea8;")
+        self.tbl_bias_ranges.setCellWidget(row, 0, lbl)
+
+        if start is None or stop is None or step is None:
+            if row == 0:
+                def_start, def_stop, def_step = 0.5, 1.5, 0.01
+            else:
+                prev_stop_spin = self.tbl_bias_ranges.cellWidget(row - 1, 2)
+                prev_stop = prev_stop_spin.value() if prev_stop_spin else 1.5
+                def_start = prev_stop
+                def_stop = min(10.0, prev_stop + 3.5)
+                def_step = 0.1
+        else:
+            def_start, def_stop, def_step = float(start), float(stop), float(step)
+
+        spin_start = QDoubleSpinBox()
+        spin_start.setRange(0.0, 10.0)
+        spin_start.setDecimals(3)
+        spin_start.setSingleStep(0.1)
+        spin_start.setValue(def_start)
+        spin_start.valueChanged.connect(self.update_bias_preview)
+        self.tbl_bias_ranges.setCellWidget(row, 1, spin_start)
+
+        spin_stop = QDoubleSpinBox()
+        spin_stop.setRange(0.0, 10.0)
+        spin_stop.setDecimals(3)
+        spin_stop.setSingleStep(0.1)
+        spin_stop.setValue(def_stop)
+        spin_stop.valueChanged.connect(self.update_bias_preview)
+        self.tbl_bias_ranges.setCellWidget(row, 2, spin_stop)
+
+        spin_step = QDoubleSpinBox()
+        spin_step.setRange(0.001, 5.0)
+        spin_step.setDecimals(3)
+        spin_step.setSingleStep(0.01)
+        spin_step.setValue(def_step)
+        spin_step.valueChanged.connect(self.update_bias_preview)
+        self.tbl_bias_ranges.setCellWidget(row, 3, spin_step)
+
+        btn_del = QPushButton("✕ Remove")
+        btn_del.setStyleSheet("background-color: #c62828; color: #ffffff; padding: 2px 6px; font-size: 8.5pt;")
+        btn_del.clicked.connect(lambda _, r=row: self.remove_bias_range_row(r))
+        self.tbl_bias_ranges.setCellWidget(row, 4, btn_del)
+
+        self._refresh_bias_range_row_indices()
+        self.update_bias_preview()
+
+    def remove_bias_range_row(self, row):
+        if self.tbl_bias_ranges.rowCount() <= 1:
+            QMessageBox.information(self, "Minimum Rows", "At least one bias range row is required.")
+            return
+        self.tbl_bias_ranges.removeRow(row)
+        self._refresh_bias_range_row_indices()
+        self.update_bias_preview()
+
+    def _refresh_bias_range_row_indices(self):
+        for r in range(self.tbl_bias_ranges.rowCount()):
+            lbl = self.tbl_bias_ranges.cellWidget(r, 0)
+            if lbl:
+                lbl.setText(f"Region {r + 1}")
+            btn = self.tbl_bias_ranges.cellWidget(r, 4)
+            if btn:
+                try:
+                    btn.clicked.disconnect()
+                except Exception:
+                    pass
+                btn.clicked.connect(lambda _, row_idx=r: self.remove_bias_range_row(row_idx))
+
+    def get_configured_bias_ranges(self):
+        ranges = []
+        for r in range(self.tbl_bias_ranges.rowCount()):
+            s_w = self.tbl_bias_ranges.cellWidget(r, 1)
+            e_w = self.tbl_bias_ranges.cellWidget(r, 2)
+            st_w = self.tbl_bias_ranges.cellWidget(r, 3)
+            if s_w and e_w and st_w:
+                ranges.append([s_w.value(), e_w.value(), st_w.value()])
+        return ranges
+
+    def get_configured_bias_values(self):
+        ranges = self.get_configured_bias_ranges()
+        segments = [[0.0]]  # 0.0 V SC baseline is always first
+        for (start, stop, step) in ranges:
+            step = abs(step)
+            if step > 0:
+                if stop >= start:
+                    segments.append(np.arange(start, stop + 1e-9, step))
+                else:
+                    segments.append(np.arange(start, stop - 1e-9, -step))
+        bias_vals = np.concatenate(segments)
+        bias_vals = np.round(bias_vals, 4)
+        _, first_indices = np.unique(bias_vals, return_index=True)
+        return bias_vals[np.sort(first_indices)]
+
     def update_bias_preview(self):
         try:
-            dense = np.arange(self.spin_dense_start.value(), self.spin_dense_stop.value(), self.spin_dense_step.value())
-            medium = np.arange(self.spin_med_start.value(), self.spin_med_stop.value() + 1e-9, self.spin_med_step.value())
-            if self.chk_normal_first.isChecked():
-                bias_vals = np.concatenate([[0.0], dense, medium])
-            else:
-                bias_vals = np.concatenate([[0.0], dense, medium])
-                bias_vals = np.sort(bias_vals)
-            bias_vals = np.round(bias_vals, 4)
-            _, first_indices = np.unique(bias_vals, return_index=True)
-            bias_vals = bias_vals[np.sort(first_indices)]
-
+            bias_vals = self.get_configured_bias_values()
             self.lbl_bias_summary.setText(f"Total Points: {len(bias_vals)} | Max: {np.max(bias_vals):.3f} V")
             self.tbl_bias.setRowCount(len(bias_vals))
             for i, b in enumerate(bias_vals):
@@ -1589,17 +2514,35 @@ class CZMainWindow(QMainWindow):
         except Exception as e:
             self.lbl_bias_summary.setText(f"Error computing bias: {e}")
 
-    def get_configured_bias_values(self):
-        dense = np.arange(self.spin_dense_start.value(), self.spin_dense_stop.value(), self.spin_dense_step.value())
-        medium = np.arange(self.spin_med_start.value(), self.spin_med_stop.value() + 1e-9, self.spin_med_step.value())
-        if self.chk_normal_first.isChecked():
-            bias_vals = np.concatenate([[0.0], dense, medium])
-        else:
-            bias_vals = np.concatenate([[0.0], dense, medium])
-            bias_vals = np.sort(bias_vals)
-        bias_vals = np.round(bias_vals, 4)
-        _, first_indices = np.unique(bias_vals, return_index=True)
-        return bias_vals[np.sort(first_indices)]
+    def update_comb_info(self):
+        try:
+            num_tones = self.spin_num_tones.value()
+            mult = self.spin_sine_mult.value()
+            use_sch = self.chk_schroeder.isChecked()
+            skip_line = self.chk_skip_line.isChecked()
+            line_f = self.spin_line_freq.value()
+            cutoff = self.spin_high_f_cutoff.value()
+            line_str = f" ({line_f:.0f} Hz line harmonics skipped)" if skip_line else ""
+
+            if use_sch:
+                approx_peak = 1.6 * np.sqrt(num_tones) * mult
+                if approx_peak > 1.0:
+                    status_text = f"Comb: {num_tones} tones (cutoff {cutoff*1e-3:.1f} kHz < Nyquist){line_str} | Peak ~{approx_peak:.2f} V (Schroeder active; auto-scaled to ±1.0 V limit, NO clipping)"
+                    self.lbl_comb_info.setStyleSheet("color: #f57f17; font-weight: bold;")
+                else:
+                    status_text = f"Comb: {num_tones} tones (cutoff {cutoff*1e-3:.1f} kHz < Nyquist){line_str} | Peak ~{approx_peak:.2f} V (Schroeder active, below ±1.0 V limit, NO clipping)"
+                    self.lbl_comb_info.setStyleSheet("color: #2e7d32; font-weight: bold;")
+            else:
+                peak = (num_tones + 1) * mult
+                if peak > 1.0:
+                    status_text = f"Comb: {num_tones} tones (cutoff {cutoff*1e-3:.1f} kHz < Nyquist){line_str} | In-phase peak = {peak:.2f} V (Exceeds AWG ±1.0 V! Auto-scaled, reduced SNR)"
+                    self.lbl_comb_info.setStyleSheet("color: #d32f2f; font-weight: bold;")
+                else:
+                    status_text = f"Comb: {num_tones} tones (cutoff {cutoff*1e-3:.1f} kHz < Nyquist){line_str} | In-phase peak = {peak:.2f} V"
+                    self.lbl_comb_info.setStyleSheet("color: #00897b;")
+            self.lbl_comb_info.setText(status_text)
+        except Exception as e:
+            self.lbl_comb_info.setText(f"Comb info: {e}")
 
     def get_time_per_flux_ramp(self):
         if self.chk_auto_cfg.isChecked():
@@ -1628,6 +2571,11 @@ class CZMainWindow(QMainWindow):
             "target_f0_hz": self.spin_target_f0.value(),
             "nominal_awg_rate": self.spin_awg_rate.value() * 1e6,
             "num_high_freq_tones": self.spin_num_tones.value(),
+            "high_f_cutoff": self.spin_high_f_cutoff.value(),
+            "use_schroeder_phase": self.chk_schroeder.isChecked(),
+            "skip_line_harmonics": self.chk_skip_line.isChecked(),
+            "line_freq": self.spin_line_freq.value(),
+            "bias_ranges": self.get_configured_bias_ranges(),
             "n_averages": self.spin_averages.value(),
             "channel": self.spin_channel.value(),
             "bias_values": bias_vals,
@@ -1647,13 +2595,14 @@ class CZMainWindow(QMainWindow):
             "min_sc_r2": self.spin_min_r2.value(),
             "min_froll_hz": self.spin_min_froll.value(),
             "max_froll_hz": self.spin_max_froll.value(),
+            "flip_bias": self.chk_flip_bias.isChecked(),
             "single_0v_test_only": single_0v_only,
             "dry_run_mode": self.chk_dry_run.isChecked(),
         }
 
-    def load_settings_from_json(self):
+    def load_settings_from_json(self, filepath=None):
         """Loads default values from run_settings.json if present."""
-        path = Path(SETTINGS_FILE_PATH)
+        path = Path(filepath or SETTINGS_FILE_PATH)
         if not path.exists():
             return
         try:
@@ -1675,29 +2624,82 @@ class CZMainWindow(QMainWindow):
                 self.spin_awg_rate.setValue(float(m["awg_rate"]) / 1e6)
             if "f0" in m:
                 self.spin_target_f0.setValue(float(m["f0"]))
+            if "num_high_freq_tones" in m:
+                self.spin_num_tones.setValue(int(m["num_high_freq_tones"]))
+            if "high_f_cutoff" in m:
+                self.spin_high_f_cutoff.setValue(float(m["high_f_cutoff"]))
+            if "use_schroeder" in m:
+                self.chk_schroeder.setChecked(bool(m["use_schroeder"]))
+            if "skip_line_harmonics" in m:
+                self.chk_skip_line.setChecked(bool(m["skip_line_harmonics"]))
+            if "line_freq" in m:
+                self.spin_line_freq.setValue(float(m["line_freq"]))
+            if "flip_bias" in m:
+                self.chk_flip_bias.setChecked(bool(m["flip_bias"]))
             if "srs_url" in m:
                 self.edit_srs_url.setText(str(m["srs_url"]))
             if "srs_port" in m:
                 self.spin_srs_port.setValue(int(m["srs_port"]))
             if "keysight_url" in m:
                 self.edit_awg_addr.setText(str(m["keysight_url"]))
-            if "bias_dense" in m and len(m["bias_dense"]) == 3:
-                self.spin_dense_start.setValue(float(m["bias_dense"][0]))
-                self.spin_dense_stop.setValue(float(m["bias_dense"][1]))
-                self.spin_dense_step.setValue(float(m["bias_dense"][2]))
-            if "bias_medium" in m and len(m["bias_medium"]) == 3:
-                self.spin_med_start.setValue(float(m["bias_medium"][0]))
-                self.spin_med_stop.setValue(float(m["bias_medium"][1]))
-                self.spin_med_step.setValue(float(m["bias_medium"][2]))
+
+            if "bias_ranges" in m and isinstance(m["bias_ranges"], list) and len(m["bias_ranges"]) > 0:
+                self.tbl_bias_ranges.setRowCount(0)
+                for rng in m["bias_ranges"]:
+                    if len(rng) == 3:
+                        self.add_bias_range_row(rng[0], rng[1], rng[2])
+            elif "bias_dense" in m and len(m["bias_dense"]) == 3:
+                self.tbl_bias_ranges.setRowCount(0)
+                self.add_bias_range_row(m["bias_dense"][0], m["bias_dense"][1], m["bias_dense"][2])
+                if "bias_medium" in m and len(m["bias_medium"]) == 3:
+                    self.add_bias_range_row(m["bias_medium"][0], m["bias_medium"][1], m["bias_medium"][2])
+
             if "output_dir" in m and m["output_dir"]:
                 self.edit_save_dir.setText(str(m["output_dir"]))
-            self.log("INFO", f"Loaded parameters from {SETTINGS_FILE_PATH}")
-        except Exception as e:
-            self.log("WARN", f"Could not load {SETTINGS_FILE_PATH}: {e}")
 
-    def save_settings_to_json(self):
+            # Load analyze settings
+            a = data.get("analyze", {})
+            if "raw_dir" in a and a["raw_dir"]:
+                self.edit_analyze_raw_dir.setText(str(a["raw_dir"]))
+            if "iv_file" in a and a["iv_file"]:
+                self.edit_analyze_iv_file.setText(str(a["iv_file"]))
+            if "output_base_dir" in a and a["output_base_dir"]:
+                self.edit_analyze_output_dir.setText(str(a["output_base_dir"]))
+            if "g_data_file" in a and a["g_data_file"]:
+                self.edit_analyze_g_file.setText(str(a["g_data_file"]))
+            if "channel_id" in a:
+                self.spin_analyze_channel.setValue(int(a["channel_id"]))
+            if "pixel_map" in a and len(a["pixel_map"]) > 0:
+                self.spin_analyze_pixel.setValue(int(a["pixel_map"][0][1]))
+            if "zero_bias_time_shift" in a:
+                self.spin_analyze_tau.setValue(float(a["zero_bias_time_shift"]))
+            if "tc" in a:
+                self.spin_analyze_tc.setValue(float(a["tc"]))
+            if "tbath" in a:
+                self.spin_analyze_tbath.setValue(float(a["tbath"]))
+            if "n_thermal" in a:
+                self.spin_analyze_n.setValue(float(a["n_thermal"]))
+            if "dummy_g_tes_b" in a:
+                self.spin_analyze_dummy_g.setValue(float(a["dummy_g_tes_b"]))
+            if "rbias_iv" in a:
+                self.spin_analyze_rbias.setValue(float(a["rbias_iv"]))
+            if "rshunt_uOhm" in a:
+                self.spin_analyze_rshunt.setValue(float(a["rshunt_uOhm"]))
+            if "l_nyq_nH" in a:
+                self.spin_analyze_lnyq.setValue(float(a["l_nyq_nH"]))
+            if "save_plots" in a:
+                self.chk_analyze_save_plots.setChecked(bool(a["save_plots"]))
+            if "flip_bias" in a:
+                self.chk_analyze_flip_bias.setChecked(bool(a["flip_bias"]))
+
+            self.load_available_analyze_plots()
+            self.log("INFO", f"Loaded parameters from {path}")
+        except Exception as e:
+            self.log("WARN", f"Could not load {path}: {e}")
+
+    def save_settings_to_json(self, filepath=None):
         """Saves current GUI configuration back to run_settings.json."""
-        path = Path(SETTINGS_FILE_PATH)
+        path = Path(filepath or SETTINGS_FILE_PATH)
         existing = {}
         if path.exists():
             try:
@@ -1714,30 +2716,245 @@ class CZMainWindow(QMainWindow):
         measure_cfg["amp_mult"] = self.spin_sine_mult.value()
         measure_cfg["awg_rate"] = self.spin_awg_rate.value() * 1e6
         measure_cfg["f0"] = self.spin_target_f0.value()
+        measure_cfg["num_high_freq_tones"] = self.spin_num_tones.value()
+        measure_cfg["high_f_cutoff"] = self.spin_high_f_cutoff.value()
+        measure_cfg["use_schroeder"] = self.chk_schroeder.isChecked()
+        measure_cfg["skip_line_harmonics"] = self.chk_skip_line.isChecked()
+        measure_cfg["line_freq"] = self.spin_line_freq.value()
+        measure_cfg["flip_bias"] = self.chk_flip_bias.isChecked()
         measure_cfg["srs_url"] = self.edit_srs_url.text().strip()
         measure_cfg["srs_port"] = self.spin_srs_port.value()
         measure_cfg["keysight_url"] = self.edit_awg_addr.text().strip()
-        measure_cfg["bias_dense"] = [
-            self.spin_dense_start.value(),
-            self.spin_dense_stop.value(),
-            self.spin_dense_step.value()
-        ]
-        measure_cfg["bias_medium"] = [
-            self.spin_med_start.value(),
-            self.spin_med_stop.value(),
-            self.spin_med_step.value()
-        ]
+
+        ranges = self.get_configured_bias_ranges()
+        measure_cfg["bias_ranges"] = ranges
+        if len(ranges) >= 1:
+            measure_cfg["bias_dense"] = ranges[0]
+        if len(ranges) >= 2:
+            measure_cfg["bias_medium"] = ranges[1]
+
         measure_cfg["output_dir"] = self.edit_save_dir.text().strip()
         existing["measure"] = measure_cfg
+
+        analyze_cfg = existing.get("analyze", {})
+        analyze_cfg["raw_dir"] = self.edit_analyze_raw_dir.text().strip()
+        analyze_cfg["iv_file"] = self.edit_analyze_iv_file.text().strip()
+        analyze_cfg["output_base_dir"] = self.edit_analyze_output_dir.text().strip()
+        analyze_cfg["g_data_file"] = self.edit_analyze_g_file.text().strip()
+        analyze_cfg["channel_id"] = self.spin_analyze_channel.value()
+        analyze_cfg["pixel_map"] = [[self.spin_analyze_channel.value(), self.spin_analyze_pixel.value()]]
+        analyze_cfg["zero_bias_time_shift"] = self.spin_analyze_tau.value()
+        analyze_cfg["tc"] = self.spin_analyze_tc.value()
+        analyze_cfg["tbath"] = self.spin_analyze_tbath.value()
+        analyze_cfg["n_thermal"] = self.spin_analyze_n.value()
+        analyze_cfg["dummy_g_tes_b"] = self.spin_analyze_dummy_g.value()
+        analyze_cfg["rbias_iv"] = self.spin_analyze_rbias.value()
+        analyze_cfg["rshunt_uOhm"] = self.spin_analyze_rshunt.value()
+        analyze_cfg["l_nyq_nH"] = self.spin_analyze_lnyq.value()
+        analyze_cfg["save_plots"] = self.chk_analyze_save_plots.isChecked()
+        analyze_cfg["flip_bias"] = self.chk_analyze_flip_bias.isChecked()
+        existing["analyze"] = analyze_cfg
 
         try:
             with open(path, "w") as f:
                 json.dump(existing, f, indent=2)
-            self.log("INFO", f"Configuration successfully saved to {SETTINGS_FILE_PATH}")
-            QMessageBox.information(self, "Settings Saved", f"Successfully saved defaults to {SETTINGS_FILE_PATH}")
+            self.log("INFO", f"Configuration successfully saved to {path}")
+            QMessageBox.information(self, "Settings Saved", f"Successfully saved defaults to {path}")
         except Exception as e:
             self.log("ERROR", f"Failed to save settings: {e}")
             QMessageBox.critical(self, "Save Error", str(e))
+
+    # -----------------------------------------------------------------------
+    # Analyze Tab Handlers
+    # -----------------------------------------------------------------------
+    def on_browse_analyze_raw_dir(self):
+        curr = self.edit_analyze_raw_dir.text().strip() or "/data"
+        d = QFileDialog.getExistingDirectory(self, "Select Raw Complex Z Data Directory", curr)
+        if d:
+            self.edit_analyze_raw_dir.setText(d)
+            self.load_available_analyze_plots()
+
+    def on_browse_analyze_iv_file(self):
+        curr = self.edit_analyze_iv_file.text().strip() or "/data"
+        f, _ = QFileDialog.getOpenFileName(self, "Select IV Curve File", curr, "NPZ Files (*.npz);;All Files (*)")
+        if f:
+            self.edit_analyze_iv_file.setText(f)
+
+    def on_browse_analyze_output_dir(self):
+        curr = self.edit_analyze_output_dir.text().strip() or "/data/Results/Complex_Z"
+        d = QFileDialog.getExistingDirectory(self, "Select Output Base Directory", curr)
+        if d:
+            self.edit_analyze_output_dir.setText(d)
+            self.load_available_analyze_plots()
+
+    def on_browse_analyze_g_file(self):
+        curr = self.edit_analyze_g_file.text().strip() or ""
+        f, _ = QFileDialog.getOpenFileName(self, "Select Precomputed G Data CSV", curr, "CSV Files (*.csv);;All Files (*)")
+        if f:
+            self.edit_analyze_g_file.setText(f)
+
+    def on_open_analyze_dir(self):
+        output_base = Path(self.edit_analyze_output_dir.text().strip())
+        pixel_id = self.spin_analyze_pixel.value()
+        pixel_dir = output_base / f"Pixel_{pixel_id}"
+        target = pixel_dir if pixel_dir.exists() else output_base
+        if not target.exists():
+            target.mkdir(parents=True, exist_ok=True)
+        try:
+            if sys.platform == "win32":
+                os.startfile(str(target))
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", str(target)])
+            else:
+                subprocess.Popen(["xdg-open", str(target)])
+        except Exception as e:
+            self.log_analyze("ERROR", f"Could not open directory: {e}")
+
+    def on_analyze_channel_changed(self):
+        self.spin_analyze_pixel.setValue(self.spin_analyze_channel.value())
+
+    def log_analyze(self, level, message):
+        color_map = {
+            "INFO": "#90caf9",
+            "WARN": "#ffb74d",
+            "ERROR": "#ef5350",
+            "DEBUG": "#b0bec5",
+        }
+        color = color_map.get(level.upper(), "#ffffff")
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        self.txt_analyze_log.append(
+            f'<span style="color: #78909c;">[{timestamp}]</span> '
+            f'<b style="color: {color};">[{level.upper()}]</b> '
+            f'<span style="color: #eceff1;">{message}</span>'
+        )
+        self.txt_analyze_log.verticalScrollBar().setValue(
+            self.txt_analyze_log.verticalScrollBar().maximum()
+        )
+
+    def on_run_analyze_clicked(self):
+        raw_dir = self.edit_analyze_raw_dir.text().strip()
+        iv_file = self.edit_analyze_iv_file.text().strip()
+        output_dir = self.edit_analyze_output_dir.text().strip()
+
+        if not raw_dir or not Path(raw_dir).exists():
+            QMessageBox.critical(self, "Invalid Path", f"Raw data directory does not exist:\n{raw_dir}")
+            return
+        if not iv_file or not Path(iv_file).exists():
+            QMessageBox.critical(self, "Invalid Path", f"IV curve file does not exist:\n{iv_file}")
+            return
+
+        chan_id = self.spin_analyze_channel.value()
+        pixel_id = self.spin_analyze_pixel.value()
+
+        cmd = [
+            sys.executable, "-u", "-m", "ez_cz.analyze",
+            "--raw-dir", raw_dir,
+            "--iv-file", iv_file,
+            "--channel-id", str(chan_id),
+            "--pixel-map", f"{chan_id}:{pixel_id}",
+            "--output-base-dir", output_dir,
+            "--rbias-iv", str(self.spin_analyze_rbias.value()),
+            "--rshunt-uohm", str(self.spin_analyze_rshunt.value()),
+            "--l-nyq-nh", str(self.spin_analyze_lnyq.value()),
+            "--tc", str(self.spin_analyze_tc.value()),
+            "--tbath", str(self.spin_analyze_tbath.value()),
+            "--n-thermal", str(self.spin_analyze_n.value()),
+            "--dummy-g-tes-b", str(self.spin_analyze_dummy_g.value()),
+        ]
+
+        if not self.chk_analyze_auto_tau.isChecked():
+            cmd.extend(["--zero-bias-time-shift", str(self.spin_analyze_tau.value())])
+
+        if self.chk_analyze_flip_bias.isChecked():
+            cmd.append("--flip-bias")
+
+        g_file = self.edit_analyze_g_file.text().strip()
+        if g_file and Path(g_file).exists():
+            cmd.extend(["--g-data-file", g_file])
+
+        if self.chk_analyze_save_plots.isChecked():
+            cmd.append("--save-plots")
+        else:
+            cmd.append("--no-save-plots")
+
+        self.btn_run_analyze.setEnabled(False)
+        self.btn_abort_analyze.setEnabled(True)
+        self.lbl_analyze_status.setText("STATUS: RUNNING...")
+        self.lbl_analyze_status.setStyleSheet("font-weight: bold; color: #00e676; font-size: 11pt;")
+        self.prog_analyze.setValue(0)
+        self.txt_analyze_log.clear()
+
+        self.analyze_worker = AnalyzeWorker(cmd, output_dir)
+        self.analyze_worker.log_signal.connect(self.log_analyze)
+        self.analyze_worker.status_signal.connect(self.lbl_analyze_status.setText)
+        self.analyze_worker.progress_signal.connect(self.prog_analyze.setValue)
+        self.analyze_worker.finished_signal.connect(self.on_analyze_finished)
+        self.analyze_worker.start()
+
+    def on_abort_analyze_clicked(self):
+        if self.analyze_worker and self.analyze_worker.isRunning():
+            self.log_analyze("WARN", "Aborting analysis process...")
+            self.analyze_worker.abort()
+            self.btn_abort_analyze.setEnabled(False)
+
+    def on_analyze_finished(self, success, message):
+        self.btn_run_analyze.setEnabled(True)
+        self.btn_abort_analyze.setEnabled(False)
+        if success:
+            self.lbl_analyze_status.setText("STATUS: COMPLETE")
+            self.lbl_analyze_status.setStyleSheet("font-weight: bold; color: #00e676; font-size: 11pt;")
+            self.log_analyze("INFO", f"Analysis completed successfully. Output in {message}")
+            self.load_available_analyze_plots()
+            if 3 in self.analyze_plot_files:
+                self.combo_analyze_plots.setCurrentIndex(3)
+            elif 4 in self.analyze_plot_files:
+                self.combo_analyze_plots.setCurrentIndex(4)
+            elif 0 in self.analyze_plot_files:
+                self.combo_analyze_plots.setCurrentIndex(0)
+        else:
+            self.lbl_analyze_status.setText("STATUS: FAILED / ABORTED")
+            self.lbl_analyze_status.setStyleSheet("font-weight: bold; color: #ff1744; font-size: 11pt;")
+            self.log_analyze("ERROR", f"Analysis ended: {message}")
+
+    def load_available_analyze_plots(self):
+        output_base = Path(self.edit_analyze_output_dir.text().strip())
+        pixel_id = self.spin_analyze_pixel.value()
+        pixel_dir = output_base / f"Pixel_{pixel_id}"
+
+        self.analyze_plot_files = {}
+        if pixel_dir.exists():
+            for idx, (label, suffix) in enumerate(ANALYZE_PLOT_TYPES):
+                matches = list(pixel_dir.glob(f"*{suffix}"))
+                if matches:
+                    self.analyze_plot_files[idx] = matches[0]
+
+        self.on_analyze_plot_selected()
+
+    def on_analyze_plot_selected(self):
+        idx = self.combo_analyze_plots.currentIndex()
+        if idx in self.analyze_plot_files:
+            file_path = self.analyze_plot_files[idx]
+            self.analyze_canvas.display_image(file_path)
+            self.lbl_plot_filename.setText(f"Displaying: {file_path.name}")
+        else:
+            output_base = Path(self.edit_analyze_output_dir.text().strip())
+            pixel_id = self.spin_analyze_pixel.value()
+            pixel_dir = output_base / f"Pixel_{pixel_id}"
+            label, suffix = ANALYZE_PLOT_TYPES[idx]
+            self.analyze_canvas.show_placeholder(
+                f"Plot '{label}' not found.\nExpected in:\n{pixel_dir}"
+            )
+            self.lbl_plot_filename.setText("Plot file not found on disk")
+
+    def on_prev_plot_clicked(self):
+        cur = self.combo_analyze_plots.currentIndex()
+        if cur > 0:
+            self.combo_analyze_plots.setCurrentIndex(cur - 1)
+
+    def on_next_plot_clicked(self):
+        cur = self.combo_analyze_plots.currentIndex()
+        if cur < self.combo_analyze_plots.count() - 1:
+            self.combo_analyze_plots.setCurrentIndex(cur + 1)
 
     # -----------------------------------------------------------------------
     # Action Button Handlers
@@ -1820,11 +3037,57 @@ class CZMainWindow(QMainWindow):
         self.worker.finished_signal.connect(self.on_worker_finished)
         self.worker.start()
 
+    def _emergency_zero_hardware(self):
+        """Directly zeroes voltages from the GUI main thread in case the worker was terminated."""
+        self.log("WARN", "Safely zeroing hardware voltages from main thread...")
+        try:
+            awg_addr = self.edit_awg_addr.text().strip()
+            awg_ch = self.spin_awg_ch.value()
+            if HAS_HARDWARE_LIBS and keysight33600A_usb is not None:
+                if awg_addr.startswith("vxi11://") or "://" in awg_addr:
+                    fg = keysight33600A_usb.Keysight33600A_usb(url=awg_addr)
+                else:
+                    fg = keysight33600A_usb.Keysight33600A_usb(device=awg_addr)
+                fg.setOffset(source=awg_ch, offset=0.0)
+                fg.setOutputState(source=awg_ch, output_state="OFF")
+                try:
+                    fg.channel.close()
+                except Exception:
+                    pass
+                self.log("INFO", f"Emergency: AWG Ch{awg_ch} DC offset zeroed and output disabled.")
+        except Exception as e:
+            self.log("WARN", f"Emergency AWG zeroing note: {e}")
+
+        if self.combo_dc_source.currentIndex() == 1 and HAS_HARDWARE_LIBS and sim900 is not None:
+            try:
+                srs_url = self.edit_srs_url.text().strip()
+                srs_port = self.spin_srs_port.value()
+                mf = sim900.SRS_SIM900(url=srs_url)
+                vb = sim928.SRS_SIM928(mf, srs_port)
+                vb.setvolt(0.0)
+                try:
+                    mf.close()
+                except Exception:
+                    pass
+                self.log("INFO", f"Emergency: SRS SIM928 Port {srs_port} voltage zeroed.")
+            except Exception as e:
+                self.log("WARN", f"Emergency SRS zeroing note: {e}")
+
     def on_abort_clicked(self):
+        self.lbl_status.setText("STATE: ABORTING...")
+        self.lbl_status.setStyleSheet("font-weight: bold; color: #ff1744; font-size: 11pt;")
+        self.btn_abort.setEnabled(False)
+        self.log("WARN", "Abort button clicked by user! Halting worker and zeroing voltages...")
+
         if self.worker is not None and self.worker.isRunning():
-            self.lbl_status.setText("STATE: ABORTING...")
-            self.lbl_status.setStyleSheet("font-weight: bold; color: #ff1744; font-size: 11pt;")
             self.worker.abort()
+            if not self.worker.wait(1000):
+                self.log("WARN", "Worker thread blocked on external I/O. Forcing thread termination...")
+                self.worker.terminate()
+                self.worker.wait(500)
+
+        self._emergency_zero_hardware()
+        self.on_worker_finished(False, "Measurement sweep aborted. Hardware voltages safely zeroed.")
 
     def on_resume_clicked(self):
         if self.worker is not None and self.worker.isRunning():
@@ -1843,6 +3106,13 @@ class CZMainWindow(QMainWindow):
     @pyqtSlot(float, dict)
     def on_worker_step_completed(self, bias_v, plot_data):
         self.canvas.update_plots(plot_data, is_sc_eval=(bias_v == 0.0))
+        if "bias_dir" in plot_data:
+            try:
+                bias_str = f"{bias_v:.2f}".replace(".", "v")
+                plot_file = Path(plot_data["bias_dir"]) / f"vbias_{bias_str}_impedance_plot.png"
+                self.canvas.fig.savefig(plot_file, dpi=100)
+            except Exception as e:
+                self.log("WARN", f"Could not save bias plot image: {e}")
 
     @pyqtSlot(dict)
     def on_sc_calibrated(self, sc_stats):
@@ -1889,6 +3159,11 @@ class CZMainWindow(QMainWindow):
             self.lbl_status.setText("STATE: COMPLETED")
             self.lbl_status.setStyleSheet("font-weight: bold; color: #00e676; font-size: 11pt;")
             self.log("INFO", message)
+            save_dir = Path(self.edit_save_dir.text().strip())
+            if save_dir.exists():
+                candidates = sorted(save_dir.glob("*/Complex_Z/*"), key=lambda p: p.stat().st_mtime, reverse=True)
+                if candidates:
+                    self.edit_analyze_raw_dir.setText(str(candidates[0]))
             QMessageBox.information(self, "Acquisition Complete", message)
         else:
             self.lbl_status.setText("STATE: ABORTED / ERROR")
@@ -1920,7 +3195,10 @@ class CZMainWindow(QMainWindow):
             )
             if reply == QMessageBox.Yes:
                 self.worker.abort()
-                self.worker.wait(3000)
+                if not self.worker.wait(1000):
+                    self.worker.terminate()
+                    self.worker.wait(500)
+                self._emergency_zero_hardware()
                 event.accept()
             else:
                 event.ignore()

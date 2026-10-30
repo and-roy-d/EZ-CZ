@@ -143,7 +143,9 @@ def z_tes_hanging_model_for_lmfit(f, alpha, beta, C_1, C_tes, g_tes_1, R0, P0, T
 
 
 def power_law_model(beta_data, A, n_power):
-    return A * beta_data ** n_power
+    b = np.clip(np.asarray(beta_data, dtype=float), 1e-9, 1e9)
+    n_clip = np.clip(n_power, -20.0, 20.0)
+    return A * np.power(b, n_clip)
 
 
 def parse_pixel_map(s):
@@ -257,6 +259,10 @@ def main():
     parser.add_argument(
         "--no-save-plots", action="store_false", dest="save_plots",
         help="Do not save plots, only display them in GUI."
+    )
+    parser.add_argument(
+        "--flip-bias", action="store_true", default=get_default("flip_bias", False),
+        help="Flip bias polarity: inverts sign of measured impedance so Re(Z) is positive at DC (default: %(default)s)."
     )
 
     args = parser.parse_args(remaining_argv)
@@ -377,31 +383,62 @@ def main():
                 npz_file_raw_data_temp = npz_files_in_dir[0]
                 try:
                     data_raw_temp = np.load(npz_file_raw_data_temp, allow_pickle=True)
-                    raw_data_dict = data_raw_temp["data"].item()
-                    if channel_id_str not in raw_data_dict:
-                        print(f"Warning: {channel_id_str} not in zero-bias file {npz_file_raw_data_temp}. Skipping.")
+                    if "data" in data_raw_temp:
+                        raw_data_dict = data_raw_temp["data"].item()
+                        if channel_id_str not in raw_data_dict:
+                            print(f"Warning: {channel_id_str} not in zero-bias file {npz_file_raw_data_temp}. Skipping.")
+                            break
+                        raw_current_data_arb_temp = raw_data_dict[channel_id_str]
+                        raw_current_data_amps_temp = arb_to_amp(raw_current_data_arb_temp)
+                    elif "raw_data" in data_raw_temp:
+                        raw_current_data_amps_temp = arb_to_amp(data_raw_temp["raw_data"])
+                    elif "fft_unroll" in data_raw_temp:
+                        raw_current_data_amps_temp = None
+                    else:
+                        print(f"Warning: neither 'data', 'raw_data', nor 'fft_unroll' in {npz_file_raw_data_temp}. Skipping.")
                         break
-                    raw_current_data_arb_temp = raw_data_dict[channel_id_str]
-                    raw_current_data_amps_temp = arb_to_amp(raw_current_data_arb_temp)
+
                     fs_sch_array_temp = data_raw_temp['fs_sch']
                     if len(fs_sch_array_temp) == 0:
                         continue
-                    n_points_temp = len(raw_current_data_amps_temp)
-                    full_fft_frequencies_temp = rfftfreq(n_points_temp, 1 / FS_SAMPLE_RATE)
-                    idx_0_iv = np.argmin(np.abs(vbias_iv_full - 0.0))
-                    target_dc_level_0 = ites_iv_full[idx_0_iv]
-                    current_mean_0 = np.mean(raw_current_data_amps_temp)
-                    raw_current_data_dc_replaced_amps_0 = (raw_current_data_amps_temp - current_mean_0) + target_dc_level_0
-                    raw_current_fft_dc_replaced_0 = rfft(raw_current_data_dc_replaced_amps_0)
-                    phase_factor_0 = np.exp(-2j * np.pi * full_fft_frequencies_temp * args.zero_bias_time_shift)
-                    raw_current_fft_shifted_0 = raw_current_fft_dc_replaced_0 * phase_factor_0
-                    for stim_freq_0 in fs_sch_array_temp:
-                        f_idx_0 = np.searchsorted(full_fft_frequencies_temp, stim_freq_0)
-                        if f_idx_0 < len(raw_current_fft_shifted_0):
-                            zero_bias_freq_currents[stim_freq_0] = raw_current_fft_shifted_0[f_idx_0]
-                    print(f"Processed zero-bias data from {npz_file_raw_data_temp} for Ch {CHANNEL_ID}.")
-                    processed_zero_bias = True
-                    break
+
+                    # Dynamic sample rate from data file if present
+                    if "fs_global" in data_raw_temp:
+                        FS_SAMPLE_RATE = float(data_raw_temp["fs_global"])
+                    elif "time_per_flux_ramp" in data_raw_temp:
+                        FS_SAMPLE_RATE = 1.0 / float(data_raw_temp["time_per_flux_ramp"])
+
+                    zero_bias_time_shift = args.zero_bias_time_shift
+                    if "tau_shift" in data_raw_temp and args.zero_bias_time_shift == get_default("zero_bias_time_shift", -2.70625e-2):
+                        zero_bias_time_shift = float(data_raw_temp["tau_shift"])
+                        print(f"Using calibrated zero-bias tau_shift from data file: {zero_bias_time_shift:.6e} s")
+
+                    # If pre-unrolled FFT exists (Schroeder phases & delay tau already removed)
+                    if "fft_unroll" in data_raw_temp and len(data_raw_temp["fft_unroll"]) == len(fs_sch_array_temp):
+                        for stim_freq_0, unroll_val_0 in zip(fs_sch_array_temp, data_raw_temp["fft_unroll"]):
+                            zero_bias_freq_currents[stim_freq_0] = unroll_val_0
+                        print(f"Processed zero-bias fft_unroll ({len(fs_sch_array_temp)} tones) from {npz_file_raw_data_temp} for Ch {CHANNEL_ID}.")
+                        processed_zero_bias = True
+                        break
+
+                    if raw_current_data_amps_temp is not None:
+                        n_points_temp = len(raw_current_data_amps_temp)
+                        full_fft_frequencies_temp = rfftfreq(n_points_temp, 1 / FS_SAMPLE_RATE)
+                        idx_0_iv = np.argmin(np.abs(vbias_iv_full - 0.0))
+                        target_dc_level_0 = ites_iv_full[idx_0_iv]
+                        current_mean_0 = np.mean(raw_current_data_amps_temp)
+                        raw_current_data_dc_replaced_amps_0 = (raw_current_data_amps_temp - current_mean_0) + target_dc_level_0
+                        raw_current_fft_dc_replaced_0 = rfft(raw_current_data_dc_replaced_amps_0)
+
+                        phase_factor_0 = np.exp(-2j * np.pi * full_fft_frequencies_temp * zero_bias_time_shift)
+                        raw_current_fft_shifted_0 = raw_current_fft_dc_replaced_0 * phase_factor_0
+                        for stim_freq_0 in fs_sch_array_temp:
+                            f_idx_0 = np.argmin(np.abs(full_fft_frequencies_temp - stim_freq_0))
+                            if f_idx_0 < len(raw_current_fft_shifted_0):
+                                zero_bias_freq_currents[stim_freq_0] = raw_current_fft_shifted_0[f_idx_0]
+                        print(f"Processed zero-bias data from {npz_file_raw_data_temp} for Ch {CHANNEL_ID}.")
+                        processed_zero_bias = True
+                        break
                 except Exception as e:
                     print(f"Warning: Failed to load zero-bias file {npz_file_raw_data_temp}: {e}")
                     continue
@@ -424,19 +461,27 @@ def main():
             npz_file_raw_data = npz_files_in_dir[0]
             try:
                 data_raw = np.load(npz_file_raw_data, allow_pickle=True)
-                raw_data_dict = data_raw["data"].item()
-                if channel_id_str not in raw_data_dict:
-                    print(f"Warning: {channel_id_str} not in bias file {npz_file_raw_data}. Skipping bias {bias_val} V.")
+                if "data" in data_raw:
+                    raw_data_dict = data_raw["data"].item()
+                    if channel_id_str not in raw_data_dict:
+                        print(f"Warning: {channel_id_str} not in bias file {npz_file_raw_data}. Skipping bias {bias_val} V.")
+                        continue
+                    raw_current_data_arb = raw_data_dict[channel_id_str]
+                    raw_current_data_amps = arb_to_amp(raw_current_data_arb)
+                elif "raw_data" in data_raw:
+                    raw_current_data_amps = arb_to_amp(data_raw["raw_data"])
+                elif "fft_unroll" in data_raw:
+                    raw_current_data_amps = None
+                else:
+                    print(f"Warning: neither 'data', 'raw_data', nor 'fft_unroll' in {npz_file_raw_data}. Skipping bias {bias_val} V.")
                     continue
-                raw_current_data_arb = raw_data_dict[channel_id_str]
-                raw_current_data_amps = arb_to_amp(raw_current_data_arb)
                 fs_sch_array = data_raw['fs_sch']
                 if len(fs_sch_array) == 0:
                     continue
                 processed_bias_vals_plot.append(bias_val)
-                n_points = len(raw_current_data_amps)
-                full_fft_frequencies = rfftfreq(n_points, 1 / FS_SAMPLE_RATE)
-                all_raw_data_info.append((bias_val, raw_current_data_amps, fs_sch_array, full_fft_frequencies, n_points))
+                n_points = len(raw_current_data_amps) if raw_current_data_amps is not None else 0
+                full_fft_frequencies = rfftfreq(n_points, 1 / FS_SAMPLE_RATE) if n_points > 0 else np.array([])
+                all_raw_data_info.append((bias_val, raw_current_data_amps, fs_sch_array, full_fft_frequencies, n_points, data_raw))
             except Exception as e:
                 print(f"Warning: Error reading file {npz_file_raw_data}: {e}")
                 continue
@@ -452,46 +497,65 @@ def main():
 
         gmodel_ch = Model(z_tes_hanging_model_for_lmfit, independent_vars=['f'])
 
-        for bias_val, raw_current_data_amps, fs_sch_array, full_fft_frequencies, n_points in all_raw_data_info:
+        for bias_val, raw_current_data_amps, fs_sch_array, full_fft_frequencies, n_points, data_raw in all_raw_data_info:
             print(f"  Processing Vbias = {bias_val:.4f}V for Ch {CHANNEL_ID}...")
             idx_iv_op = np.argmin(np.abs(vbias_iv_full - bias_val))
             target_dc_level = ites_iv_full[idx_iv_op]
-            current_mean_raw = np.mean(raw_current_data_amps)
-            raw_current_dc_replaced = (raw_current_data_amps - current_mean_raw) + target_dc_level
-            current_time_shift = args.zero_bias_time_shift
-            raw_fft_dc_replaced = rfft(raw_current_dc_replaced)
-            phase_factor = np.exp(-2j * np.pi * full_fft_frequencies * current_time_shift)
-            raw_fft_shifted = raw_fft_dc_replaced * phase_factor
-            shifted_raw_data_by_bias.append((bias_val, irfft(raw_fft_shifted)))
+
+            raw_fft_shifted = None
+            if raw_current_data_amps is not None and len(full_fft_frequencies) > 0:
+                current_mean_raw = np.mean(raw_current_data_amps)
+                raw_current_dc_replaced = (raw_current_data_amps - current_mean_raw) + target_dc_level
+                current_time_shift = zero_bias_time_shift
+                raw_fft_dc_replaced = rfft(raw_current_dc_replaced)
+                phase_factor = np.exp(-2j * np.pi * full_fft_frequencies * current_time_shift)
+                raw_fft_shifted = raw_fft_dc_replaced * phase_factor
+                shifted_raw_data_by_bias.append((bias_val, irfft(raw_fft_shifted)))
 
             adm_re_measured, adm_im_measured = [], []
-            for stim_freq in fs_sch_array:
-                f_idx = np.searchsorted(full_fft_frequencies, stim_freq)
-                if f_idx >= len(raw_fft_shifted):
-                    Y_tes_calculated = np.nan + 1j * np.nan
-                else:
-                    I_bias_fft_component = raw_fft_shifted[f_idx]
-                    I_0_ref_fft_component = zero_bias_freq_currents.get(stim_freq)
-                    Z_shunt_L_circuit = 1j * 2 * np.pi * stim_freq * (args.l_nyq_nh * 1e-9) + (args.rshunt_uohm * 1e-6)
-                    if I_0_ref_fft_component is None or np.abs(I_0_ref_fft_component) < 1e-15:
-                        Z_tes_calculated = np.nan + 1j * np.nan
+            has_unroll = ("fft_unroll" in data_raw and len(data_raw["fft_unroll"]) == len(fs_sch_array))
+
+            for k, stim_freq in enumerate(fs_sch_array):
+                if has_unroll:
+                    I_bias_fft_component = data_raw["fft_unroll"][k]
+                elif raw_fft_shifted is not None:
+                    f_idx = np.argmin(np.abs(full_fft_frequencies - stim_freq))
+                    if f_idx < len(raw_fft_shifted):
+                        I_bias_fft_component = raw_fft_shifted[f_idx]
                     else:
-                        Ratio_I = I_bias_fft_component / I_0_ref_fft_component
-                        Z_tes_calculated = Z_shunt_L_circuit * (1 / Ratio_I - 1) if np.abs(
-                            Ratio_I) > 1e-12 else np.nan + 1j * np.nan
-                    Y_tes_calculated = 1.0 / Z_tes_calculated
+                        I_bias_fft_component = None
+                else:
+                    I_bias_fft_component = None
+
+                I_0_ref_fft_component = zero_bias_freq_currents.get(stim_freq)
+                Z_shunt_L_circuit = 1j * 2 * np.pi * stim_freq * (args.l_nyq_nh * 1e-9) + (args.rshunt_uohm * 1e-6)
+                if I_bias_fft_component is None or I_0_ref_fft_component is None or np.abs(I_0_ref_fft_component) < 1e-15:
+                    Z_tes_calculated = np.nan + 1j * np.nan
+                else:
+                    Ratio_I = I_bias_fft_component / I_0_ref_fft_component
+                    Z_tes_calculated = Z_shunt_L_circuit * (1 / Ratio_I - 1) if np.abs(
+                        Ratio_I) > 1e-12 else np.nan + 1j * np.nan
+                Y_tes_calculated = 1.0 / Z_tes_calculated
                 adm_re_measured.append(np.real(Y_tes_calculated))
                 adm_im_measured.append(np.imag(Y_tes_calculated))
-            admittance_data_shifted[bias_val] = (fs_sch_array, np.array(adm_re_measured), np.array(adm_im_measured))
+
+            Y_measured_complex = np.array(adm_re_measured) + 1j * np.array(adm_im_measured)
+            Z_measured_complex = 1.0 / Y_measured_complex
+            valid_Z_mask = np.isfinite(Z_measured_complex)
+
+            # Ensure Re(Z) is positive at DC: if flip_bias requested or data indicates inverted polarity
+            is_flip = args.flip_bias or bool(data_raw.get("flip_bias", False))
+            if is_flip or (np.sum(valid_Z_mask) > 0 and np.real(Z_measured_complex[valid_Z_mask][0]) < 0):
+                Z_measured_complex = -Z_measured_complex
+                Y_measured_complex = -Y_measured_complex
+
+            admittance_data_shifted[bias_val] = (fs_sch_array, np.real(Y_measured_complex), np.imag(Y_measured_complex))
 
             R0_op = rtes_iv_full[idx_iv_op]
             I0_op = ites_iv_full[idx_iv_op]
             P0_op = I0_op ** 2 * R0_op
             T0_for_model_fit = args.tc
 
-            Y_measured_complex = np.array(adm_re_measured) + 1j * np.array(adm_im_measured)
-            Z_measured_complex = 1.0 / Y_measured_complex
-            valid_Z_mask = np.isfinite(Z_measured_complex)
             fs_sch_for_fitting = fs_sch_array[valid_Z_mask]
 
             if len(fs_sch_for_fitting) < 5:
@@ -516,7 +580,7 @@ def main():
 
             try:
                 result = gmodel_ch.fit(y_data_to_fit_clean, params_lmfit, f=fs_sch_for_fitting,
-                                       method='leastsq', fit_kws={'ftol': 1e-9, 'xtol': 1e-9, 'maxfev': 30000})
+                                       method='leastsq', max_nfev=30000, fit_kws={'ftol': 1e-9, 'xtol': 1e-9})
                 if result.success:
                     popt_lmfit = result.params
                     fit_results[bias_val] = {
