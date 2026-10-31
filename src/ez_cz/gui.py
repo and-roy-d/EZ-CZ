@@ -3531,10 +3531,12 @@ class CZMainWindow(QMainWindow):
                 return
             p_tes_W = val * 1e-12
 
-        tc_cap = 0.045
-        if "T_tes" in self.current_model_params and self.current_model_params["T_tes"].max_val:
-            tc_cap = self.current_model_params["T_tes"].max_val
-        t_tes_pred = min(predict_ttes(p_tes_W, g_W_per_K, n_val, tbath_K, Tc_max_K=tc_cap), tc_cap)
+        tc_cap = None
+        if "T_tes" in self.current_model_params:
+            m_val = self.current_model_params["T_tes"].max_val
+            if m_val is not None and m_val < 0.99:
+                tc_cap = m_val
+        t_tes_pred = predict_ttes(p_tes_W, g_W_per_K, n_val, tbath_K, Tc_max_K=tc_cap)
 
         if "T_tes" in self.current_model_params:
             self.current_model_params["T_tes"].value = t_tes_pred
@@ -3676,11 +3678,13 @@ class CZMainWindow(QMainWindow):
                 g_val = g_param.value * 1e-9
                 n_val = self.current_model_params["n_mem"].value if "n_mem" in self.current_model_params else 3.5
                 tb_val = self.current_model_params["T_bath"].value if "T_bath" in self.current_model_params else 0.020
-                tc_cap = 0.045
-                if "T_tes" in self.current_model_params and self.current_model_params["T_tes"].max_val:
-                    tc_cap = self.current_model_params["T_tes"].max_val
+                tc_cap = None
+                if "T_tes" in self.current_model_params:
+                    m_val = self.current_model_params["T_tes"].max_val
+                    if m_val is not None and m_val < 0.99:
+                        tc_cap = m_val
                 try:
-                    ttes_k = min(predict_ttes(p0_w, g_val, n_val, tb_val, Tc_max_K=tc_cap), tc_cap)
+                    ttes_k = predict_ttes(p0_w, g_val, n_val, tb_val, Tc_max_K=tc_cap)
                     if "T_tes" in self.current_model_params:
                         self.current_model_params["T_tes"].value = ttes_k
                         self.sync_param_to_table("T_tes", ttes_k)
@@ -4107,11 +4111,13 @@ class CZMainWindow(QMainWindow):
                     g_val = g_param.value * 1e-9
                     n_val = self.current_model_params["n_mem"].value if "n_mem" in self.current_model_params else 3.5
                     tb_val = self.current_model_params["T_bath"].value if "T_bath" in self.current_model_params else 0.020
-                    tc_cap = 0.045
-                    if "T_tes" in self.current_model_params and self.current_model_params["T_tes"].max_val:
-                        tc_cap = self.current_model_params["T_tes"].max_val
+                    tc_cap = None
+                    if "T_tes" in self.current_model_params:
+                        m_val = self.current_model_params["T_tes"].max_val
+                        if m_val is not None and m_val < 0.99:
+                            tc_cap = m_val
                     try:
-                        ttes_k = min(predict_ttes(p0_w, g_val, n_val, tb_val, Tc_max_K=tc_cap), tc_cap)
+                        ttes_k = predict_ttes(p0_w, g_val, n_val, tb_val, Tc_max_K=tc_cap)
                         self.current_model_params["T_tes"].value = ttes_k
                     except Exception:
                         pass

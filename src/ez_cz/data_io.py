@@ -129,8 +129,9 @@ def load_iv_curve(
     elif rn_calc is not None and rn_calc > 0:
         rnormal = float(rn_calc)
     else:
-        # Fallback if IV curve fails to find Rn (~25 mOhm for channels >= 32)
-        rnormal = 0.025 if channel_id >= 32 else 0.003
+        # Fallback if IV curve slope calculation fails to find Rn
+        valid_r = rtes_full[np.isfinite(rtes_full) & (rtes_full > 0)]
+        rnormal = float(np.max(valid_r)) if len(valid_r) > 0 else 0.025
 
     out_dict: Dict[str, Any] = {
         "vbias": vbias_full,
