@@ -49,9 +49,13 @@ def load_iv_curve(
     channel_id: int = 63,
     rshunt: float = 250e-6,
     correct_shift: bool = True,
+    manual_rn: Optional[float] = None,
 ) -> Dict[str, Any]:
     """
     Loads an IV curve (.npz) and extracts Vbias, Ites, Rtes, and normal resistance.
+    Normal resistance Rn is calculated from the superconducting and normal slope ratio:
+        Rn = Rshunt * (slope_sc / slope_n - 1)
+    or taken from manual_rn if provided.
     """
     p = Path(iv_file_path)
     if not p.exists():
@@ -82,38 +86,53 @@ def load_iv_curve(
     ibias_full = convert_vbias_to_ibias(vbias_full, rbias)
     rtes_full = Rtes(ibias_full, ites_full, Rshunt=rshunt)
 
-    # Determine Normal Resistance Rnormal
-    rnormal = None
-    pos_indices = np.where((rtes_full > 50e-6) & np.isfinite(rtes_full))[0]
-    if len(pos_indices) > 0:
-        vbias_pos = vbias_full[pos_indices]
-        ites_pos = ites_full[pos_indices]
-        rtes_pos = rtes_full[pos_indices]
-        min_ites_idx = np.argmin(np.abs(ites_pos))
-        rnormal = float(rtes_pos[min_ites_idx])
+    # Determine Normal Resistance from slope ratio:
+    # Rn = Rshunt * (slope_sc / slope_n - 1)
+    slope_sc = None
+    slope_n = None
+    rn_calc = None
+
+    if len(vbias_full) >= 10:
+        sort_order = np.argsort(vbias_full)
+        vb_s = vbias_full[sort_order]
+        it_s = ites_full[sort_order]
+
+        # 1. Superconducting slope (low positive Vbias up to peak current)
+        max_idx = int(np.argmax(it_s))
+        vb_peak = float(vb_s[max_idx]) if max_idx > 0 else 0.2
+        sc_mask = (vb_s > 0.002) & (vb_s < max(vb_peak * 0.7, 0.05))
+        if np.sum(sc_mask) >= 3:
+            p_sc = np.polyfit(vb_s[sc_mask], it_s[sc_mask], 1)
+            slope_sc = float(p_sc[0])
+        elif vb_peak > 0:
+            slope_sc = float(it_s[max_idx] / vb_peak)
+
+        # 2. Normal slope (high Vbias ohmic branch)
+        v_max = float(vb_s.max())
+        v_norm_min = max(v_max * 0.65, 2.0)
+        norm_mask = vb_s >= v_norm_min
+        if np.sum(norm_mask) >= 3:
+            p_norm = np.polyfit(vb_s[norm_mask], it_s[norm_mask], 1)
+            slope_n = float(p_norm[0])
+        else:
+            norm_mask = vb_s >= (v_max * 0.5)
+            if np.sum(norm_mask) >= 3:
+                p_norm = np.polyfit(vb_s[norm_mask], it_s[norm_mask], 1)
+                slope_n = float(p_norm[0])
+
+        if slope_sc is not None and slope_n is not None and slope_n > 0 and slope_sc > slope_n:
+            ratio = slope_sc / slope_n
+            rn_calc = float(rshunt * (ratio - 1.0))
+
+    if manual_rn is not None and manual_rn > 0:
+        rnormal = float(manual_rn)
+    elif rn_calc is not None and rn_calc > 0:
+        rnormal = float(rn_calc)
     else:
-        valid_r = rtes_full[np.isfinite(rtes_full)]
-        rnormal = float(np.max(valid_r)) if len(valid_r) > 0 else 0.003
+        # Fallback if IV curve fails to find Rn (~25 mOhm for channels >= 32)
+        rnormal = 0.025 if channel_id >= 32 else 0.003
 
-    def lookup_op(vbias_target: float) -> Dict[str, float]:
-        idx = np.argmin(np.abs(vbias_full - vbias_target))
-        vb_match = float(vbias_full[idx])
-        ites_match = float(ites_full[idx])
-        rtes_match = float(rtes_full[idx])
-        if not np.isfinite(rtes_match) or rtes_match <= 0:
-            rtes_match = max(float(rnormal * (vb_match / max(vbias_full[0], 1e-3))), 1e-5)
-        p0_match = float(ites_match**2 * rtes_match)
-        rn_pct = float((rtes_match / rnormal) * 100.0) if rnormal > 0 else 0.0
-        return {
-            "vbias": vb_match,
-            "ites": ites_match,
-            "rtes": rtes_match,
-            "p0": p0_match,
-            "rn_pct": rn_pct,
-            "rnormal": rnormal,
-        }
-
-    return {
+    out_dict: Dict[str, Any] = {
         "vbias": vbias_full,
         "ites": ites_full,
         "ibias": ibias_full,
@@ -121,8 +140,32 @@ def load_iv_curve(
         "rnormal": rnormal,
         "channel_id": channel_id,
         "rbias": rbias,
-        "lookup_op": lookup_op,
+        "slope_sc": slope_sc,
+        "slope_n": slope_n,
+        "rn_calculated": rn_calc,
     }
+
+    def lookup_op(vbias_target: float) -> Dict[str, float]:
+        idx = np.argmin(np.abs(vbias_full - vbias_target))
+        vb_match = float(vbias_full[idx])
+        ites_match = float(ites_full[idx])
+        rtes_match = float(rtes_full[idx])
+        rn_curr = float(out_dict.get("rnormal", rnormal))
+        if not np.isfinite(rtes_match) or rtes_match <= 0:
+            rtes_match = max(float(rn_curr * (vb_match / max(vbias_full[0], 1e-3))), 1e-5)
+        p0_match = float(ites_match**2 * rtes_match)
+        rn_pct = float((rtes_match / rn_curr) * 100.0) if (rn_curr and rn_curr > 0) else 0.0
+        return {
+            "vbias": vb_match,
+            "ites": ites_match,
+            "rtes": rtes_match,
+            "p0": p0_match,
+            "rn_pct": rn_pct,
+            "rnormal": rn_curr,
+        }
+
+    out_dict["lookup_op"] = lookup_op
+    return out_dict
 
 
 def load_cz_sweep_dataset(

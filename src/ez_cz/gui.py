@@ -1997,11 +1997,23 @@ class CZMainWindow(QMainWindow):
         self.spin_analyze_rbias.valueChanged.connect(self.on_load_analyze_iv)
         data_layout.addWidget(self.spin_analyze_rbias, 2, 3)
 
-        data_layout.addWidget(QLabel("Bias Point:"), 3, 0)
+        data_layout.addWidget(QLabel("Normal Rn:"), 3, 0)
+        self.spin_analyze_rn = QDoubleSpinBox()
+        self.spin_analyze_rn.setRange(0.01, 2000.0)
+        self.spin_analyze_rn.setDecimals(2)
+        self.spin_analyze_rn.setSingleStep(0.5)
+        self.spin_analyze_rn.setValue(25.35)
+        self.spin_analyze_rn.setSuffix(" mΩ")
+        self.spin_analyze_rn.setKeyboardTracking(False)
+        self.spin_analyze_rn.setToolTip("Normal state resistance Rn (mΩ). Auto-calculated as Rshunt*(slope_sc/slope_n - 1), or update manually if IV fails to find it.")
+        self.spin_analyze_rn.valueChanged.connect(self.on_analyze_rn_changed)
+        data_layout.addWidget(self.spin_analyze_rn, 3, 1)
+
+        data_layout.addWidget(QLabel("Bias Point:"), 3, 2)
         self.combo_analyze_bias_points = QComboBox()
         self.combo_analyze_bias_points.addItem("Click 'Load Sweep' to populate")
         self.combo_analyze_bias_points.currentIndexChanged.connect(self.on_analyze_bias_changed)
-        data_layout.addWidget(self.combo_analyze_bias_points, 3, 1, 1, 3)
+        data_layout.addWidget(self.combo_analyze_bias_points, 3, 3)
 
         flags_h = QHBoxLayout()
         self.chk_analyze_flip_bias = QCheckBox("Flip bias (ensure Re(Z) > 0 at DC)")
@@ -3160,6 +3172,8 @@ class CZMainWindow(QMainWindow):
                 self.spin_analyze_channel.setValue(int(a["channel_id"]))
             if ("rbias" in a or "rbias_iv" in a) and hasattr(self, "spin_analyze_rbias"):
                 self.spin_analyze_rbias.setValue(float(a.get("rbias", a.get("rbias_iv", 1000.0))))
+            if "rnormal_mohm" in a and hasattr(self, "spin_analyze_rn"):
+                self.spin_analyze_rn.setValue(float(a["rnormal_mohm"]))
             if "flip_bias" in a and hasattr(self, "chk_analyze_flip_bias"):
                 self.chk_analyze_flip_bias.setChecked(bool(a["flip_bias"]))
             if "save_in_raw" in a and hasattr(self, "chk_analyze_save_in_raw"):
@@ -3227,6 +3241,8 @@ class CZMainWindow(QMainWindow):
             analyze_cfg["channel_id"] = self.spin_analyze_channel.value()
         if hasattr(self, "spin_analyze_rbias"):
             analyze_cfg["rbias_iv"] = self.spin_analyze_rbias.value()
+        if hasattr(self, "spin_analyze_rn"):
+            analyze_cfg["rnormal_mohm"] = self.spin_analyze_rn.value()
         if hasattr(self, "chk_analyze_flip_bias"):
             analyze_cfg["flip_bias"] = self.chk_analyze_flip_bias.isChecked()
         if hasattr(self, "combo_analyze_model"):
@@ -3294,6 +3310,15 @@ class CZMainWindow(QMainWindow):
             ch = self.spin_analyze_channel.value()
             rbias = self.spin_analyze_rbias.value() if hasattr(self, "spin_analyze_rbias") else 1000.0
             self.analyze_iv_data = load_iv_curve(iv_path, rbias=rbias, channel_id=ch)
+            rn_calc = self.analyze_iv_data.get("rn_calculated")
+            if rn_calc is not None and rn_calc > 0 and hasattr(self, "spin_analyze_rn"):
+                self.spin_analyze_rn.blockSignals(True)
+                self.spin_analyze_rn.setValue(rn_calc * 1e3)
+                self.spin_analyze_rn.blockSignals(False)
+            elif hasattr(self, "spin_analyze_rn"):
+                # If IV curve failed to find Rn, apply manual value from spin_analyze_rn
+                self.analyze_iv_data["rnormal"] = self.spin_analyze_rn.value() * 1e-3
+
             self.log_analyze("INFO", f"Loaded IV curve: Ch {ch}, Rbias = {rbias:.0f} Ω, Rn = {self.analyze_iv_data['rnormal']*1e3:.2f} mΩ from {iv_path.name}")
             if self.analyze_sweep_data:
                 curr_idx = self.combo_analyze_bias_points.currentIndex()
@@ -3318,6 +3343,34 @@ class CZMainWindow(QMainWindow):
         except Exception as e:
             self.log_analyze("ERROR", f"Failed loading IV curve: {e}")
 
+    def on_analyze_rn_changed(self):
+        new_rn = self.spin_analyze_rn.value() * 1e-3
+        if self.analyze_iv_data:
+            self.analyze_iv_data["rnormal"] = new_rn
+            self.log_analyze("INFO", f"Updated normal resistance Rn to {new_rn*1e3:.2f} mΩ")
+            if self.analyze_sweep_data:
+                curr_idx = self.combo_analyze_bias_points.currentIndex()
+                self.combo_analyze_bias_points.blockSignals(True)
+                self.combo_analyze_bias_points.clear()
+                lookup = self.analyze_iv_data["lookup_op"]
+                for vb in self.analyze_sweep_data["bias_voltages"]:
+                    op = lookup(vb)
+                    label = f"{vb:.3f} V  ({op['rn_pct']:.1f}% Rn)"
+                    self.combo_analyze_bias_points.addItem(label, userData=vb)
+                self.combo_analyze_bias_points.addItem("< All Bias Points (Batch) >", userData=None)
+                if 0 <= curr_idx < self.combo_analyze_bias_points.count():
+                    self.combo_analyze_bias_points.setCurrentIndex(curr_idx)
+                else:
+                    self.combo_analyze_bias_points.setCurrentIndex(0)
+                self.combo_analyze_bias_points.blockSignals(False)
+
+            if self.combo_analyze_plot_view.currentText().startswith("IV"):
+                self.on_analyze_plot_view_changed()
+            else:
+                self.on_analyze_bias_changed()
+        else:
+            self.log_analyze("INFO", f"Set manual normal resistance Rn to {new_rn*1e3:.2f} mΩ")
+
     def on_load_analyze_sweep(self):
         raw_dir = Path(self.edit_analyze_raw_dir.text().strip())
         if not raw_dir.exists():
@@ -3341,6 +3394,13 @@ class CZMainWindow(QMainWindow):
                 or self.analyze_iv_data.get("rbias") != rbias
             ):
                 self.analyze_iv_data = load_iv_curve(iv_path, rbias=rbias, channel_id=ch)
+                rn_calc = self.analyze_iv_data.get("rn_calculated")
+                if rn_calc is not None and rn_calc > 0 and hasattr(self, "spin_analyze_rn"):
+                    self.spin_analyze_rn.blockSignals(True)
+                    self.spin_analyze_rn.setValue(rn_calc * 1e3)
+                    self.spin_analyze_rn.blockSignals(False)
+                elif hasattr(self, "spin_analyze_rn"):
+                    self.analyze_iv_data["rnormal"] = self.spin_analyze_rn.value() * 1e-3
 
             self.analyze_sweep_data = load_cz_sweep_dataset(raw_dir, channel_id=ch, flip_bias=flip)
             n_biases = self.analyze_sweep_data["num_biases"]
