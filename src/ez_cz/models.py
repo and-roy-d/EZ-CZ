@@ -107,35 +107,36 @@ class ThermalModelBase:
         """Returns ordered dict of parameter definitions with defaults."""
         raise NotImplementedError
 
-    def calc_z_tes(self, f: np.ndarray, params: Dict[str, float]) -> np.ndarray:
+    def calc_z_tes(self, f: np.ndarray, params: Dict[str, float], flip_bias: bool = False) -> np.ndarray:
         """
         Calculates complex TES impedance Z_tes(f) for given frequency array.
         f: 1D array of frequencies (Hz)
         params: dict of parameter values in their display units (e.g. pJ/K, nW/K, mOhm)
+        flip_bias: if True, inverts model sign so Re(Z) > 0 at DC matching flipped data.
         Returns: 1D complex array of Z_tes values in Ohms.
         """
         raise NotImplementedError
 
-    def calc_z_total(self, f: np.ndarray, params: Dict[str, float]) -> np.ndarray:
+    def calc_z_total(self, f: np.ndarray, params: Dict[str, float], flip_bias: bool = False) -> np.ndarray:
         """
         Calculates total complex loop impedance:
             Z_total(f) = Z_tes(f) + R_shunt + 1j * 2*pi*f * L_nyq
         """
-        z_tes = self.calc_z_tes(f, params)
+        z_tes = self.calc_z_tes(f, params, flip_bias=flip_bias)
         rshunt = params.get("R_shunt", 250.0) * 1e-6
         lnyq = params.get("L_nyq", 74.8) * 1e-9
         omega = 2.0 * np.pi * f
         return z_tes + rshunt + 1j * omega * lnyq
 
-    def calc_y_tes(self, f: np.ndarray, params: Dict[str, float]) -> np.ndarray:
+    def calc_y_tes(self, f: np.ndarray, params: Dict[str, float], flip_bias: bool = False) -> np.ndarray:
         """Calculates TES complex admittance: Y_tes(f) = 1 / Z_tes(f)."""
-        z_tes = self.calc_z_tes(f, params)
+        z_tes = self.calc_z_tes(f, params, flip_bias=flip_bias)
         safe = np.where(np.abs(z_tes) > 1e-15, z_tes, np.nan + 1j * np.nan)
         return 1.0 / safe
 
-    def calc_y_total(self, f: np.ndarray, params: Dict[str, float]) -> np.ndarray:
+    def calc_y_total(self, f: np.ndarray, params: Dict[str, float], flip_bias: bool = False) -> np.ndarray:
         """Calculates total loop complex admittance: Y_total(f) = 1 / Z_total(f)."""
-        z_tot = self.calc_z_total(f, params)
+        z_tot = self.calc_z_total(f, params, flip_bias=flip_bias)
         safe = np.where(np.abs(z_tot) > 1e-15, z_tot, np.nan + 1j * np.nan)
         return 1.0 / safe
 
@@ -155,11 +156,13 @@ class ThermalModelBase:
         fit_target: str = "Z_tes",
         y_data: Optional[np.ndarray] = None,
         z_total_data: Optional[np.ndarray] = None,
+        flip_bias: bool = False,
     ) -> FitResult:
         """
         Fits floating (vary=True) parameters to complex impedance or admittance data.
         fit_target: 'Z_tes' (default), 'Y_tes', 'Z_total', or 'Y_total'
         where Z_total = Z_tes + R_shunt + 1j * 2*pi*f * L_nyq
+        flip_bias: if True, inverts model sign so Re(Z) > 0 at DC matching flipped data.
         """
         valid_mask = np.isfinite(z_data) & np.isfinite(f) & (f > 0)
         f_clean = np.asarray(f[valid_mask], dtype=float)
@@ -190,13 +193,13 @@ class ThermalModelBase:
         if not vary_keys:
             # All parameters frozen: just evaluate
             current_vals = {k: p.value for k, p in params.items()}
-            z_pred = self.calc_z_tes(f_clean, current_vals)
-            y_pred = self.calc_y_tes(f_clean, current_vals)
-            ztot_pred = self.calc_z_total(f_clean, current_vals)
+            z_pred = self.calc_z_tes(f_clean, current_vals, flip_bias=flip_bias)
+            y_pred = self.calc_y_tes(f_clean, current_vals, flip_bias=flip_bias)
+            ztot_pred = self.calc_z_total(f_clean, current_vals, flip_bias=flip_bias)
             f_dense = np.geomspace(min(f_clean[0], 1.0), max(f_clean[-1], 1e5), 300)
-            z_dense = self.calc_z_tes(f_dense, current_vals)
-            y_dense = self.calc_y_tes(f_dense, current_vals)
-            ztot_dense = self.calc_z_total(f_dense, current_vals)
+            z_dense = self.calc_z_tes(f_dense, current_vals, flip_bias=flip_bias)
+            y_dense = self.calc_y_tes(f_dense, current_vals, flip_bias=flip_bias)
+            ztot_dense = self.calc_z_total(f_dense, current_vals, flip_bias=flip_bias)
 
             if fit_target == "Y_tes":
                 diff = y_clean - y_pred
@@ -247,7 +250,7 @@ class ThermalModelBase:
             for k, val in zip(vary_keys, x):
                 cand[k] = val
 
-            z_mod = self.calc_z_tes(f_clean, cand)
+            z_mod = self.calc_z_tes(f_clean, cand, flip_bias=flip_bias)
             if not np.all(np.isfinite(z_mod)):
                 return np.full(2 * len(f_clean), 1e6)
 
@@ -308,13 +311,13 @@ class ThermalModelBase:
                 pass
 
             final_vals = {k: p.value for k, p in result_params.items()}
-            z_pred = self.calc_z_tes(f_clean, final_vals)
-            y_pred = self.calc_y_tes(f_clean, final_vals)
-            ztot_pred = self.calc_z_total(f_clean, final_vals)
+            z_pred = self.calc_z_tes(f_clean, final_vals, flip_bias=flip_bias)
+            y_pred = self.calc_y_tes(f_clean, final_vals, flip_bias=flip_bias)
+            ztot_pred = self.calc_z_total(f_clean, final_vals, flip_bias=flip_bias)
             f_dense = np.geomspace(min(f_clean[0], 1.0), max(f_clean[-1], 1e5), 300)
-            z_dense = self.calc_z_tes(f_dense, final_vals)
-            y_dense = self.calc_y_tes(f_dense, final_vals)
-            ztot_dense = self.calc_z_total(f_dense, final_vals)
+            z_dense = self.calc_z_tes(f_dense, final_vals, flip_bias=flip_bias)
+            y_dense = self.calc_y_tes(f_dense, final_vals, flip_bias=flip_bias)
+            ztot_dense = self.calc_z_total(f_dense, final_vals, flip_bias=flip_bias)
 
             chi2 = float(np.sum(opt.fun**2))
             dof = max(len(opt.fun) - len(opt.x), 1)
@@ -404,7 +407,7 @@ class SimpleModel(ThermalModelBase):
         ]
         return {p.name: p for p in defs}
 
-    def calc_z_tes(self, f: np.ndarray, params: Dict[str, float]) -> np.ndarray:
+    def calc_z_tes(self, f: np.ndarray, params: Dict[str, float], flip_bias: bool = False) -> np.ndarray:
         R0 = params["R_0"] * 1e-3
         alpha = params["alpha"]
         beta = params["beta"]
@@ -423,6 +426,8 @@ class SimpleModel(ThermalModelBase):
         omega = 2.0 * np.pi * f
         denom = 1.0 + 1j * omega * tau_I
         z_tes = R0 * (1.0 + beta) + (R0 * L_I / (1.0 - L_I)) * (2.0 + beta) / denom
+        if flip_bias or params.get("flip_bias", False):
+            z_tes = -z_tes
         return z_tes
 
     def calc_derived(self, params: Dict[str, float]) -> Dict[str, float]:
@@ -483,7 +488,7 @@ class DanglingModel(ThermalModelBase):
         ]
         return {p.name: p for p in defs}
 
-    def calc_z_tes(self, f: np.ndarray, params: Dict[str, float]) -> np.ndarray:
+    def calc_z_tes(self, f: np.ndarray, params: Dict[str, float], flip_bias: bool = False) -> np.ndarray:
         R0 = params["R_0"] * 1e-3
         alpha = params["alpha"]
         beta = params["beta"]
@@ -509,6 +514,8 @@ class DanglingModel(ThermalModelBase):
         safe_denom = np.where(np.abs(denom) > 1e-25, denom, 1e-25)
         num = L_I * G_tb * R0 * (2.0 + beta) * term2
         z_tes = R0 * (1.0 + beta) + (num / safe_denom)
+        if flip_bias or params.get("flip_bias", False):
+            z_tes = -z_tes
         return z_tes
 
     def calc_derived(self, params: Dict[str, float]) -> Dict[str, float]:
@@ -554,7 +561,7 @@ class InterveningModel(ThermalModelBase):
         ]
         return {p.name: p for p in defs}
 
-    def calc_z_tes(self, f: np.ndarray, params: Dict[str, float]) -> np.ndarray:
+    def calc_z_tes(self, f: np.ndarray, params: Dict[str, float], flip_bias: bool = False) -> np.ndarray:
         R0 = params["R_0"] * 1e-3
         alpha = params["alpha"]
         beta = params["beta"]
@@ -583,6 +590,8 @@ class InterveningModel(ThermalModelBase):
 
         num = G_etf * R0 * (2.0 + beta)
         z_tes = R0 * (1.0 + beta) + (num / safe_main_denom)
+        if flip_bias or params.get("flip_bias", False):
+            z_tes = -z_tes
         return z_tes
 
     def calc_derived(self, params: Dict[str, float]) -> Dict[str, float]:
@@ -645,7 +654,7 @@ class IntermediateDanglingModel(ThermalModelBase):
         ]
         return {p.name: p for p in defs}
 
-    def calc_z_tes(self, f: np.ndarray, params: Dict[str, float]) -> np.ndarray:
+    def calc_z_tes(self, f: np.ndarray, params: Dict[str, float], flip_bias: bool = False) -> np.ndarray:
         R0 = params["R_0"] * 1e-3
         alpha = params["alpha"]
         beta = params["beta"]
@@ -679,6 +688,8 @@ class IntermediateDanglingModel(ThermalModelBase):
 
         num = G_etf * R0 * (2.0 + beta)
         z_tes = R0 * (1.0 + beta) + (num / safe_main_denom)
+        if flip_bias or params.get("flip_bias", False):
+            z_tes = -z_tes
         return z_tes
 
     def calc_derived(self, params: Dict[str, float]) -> Dict[str, float]:
@@ -718,7 +729,7 @@ class TwoFluidModel(ThermalModelBase):
         ]
         return {p.name: p for p in defs}
 
-    def calc_z_tes(self, f: np.ndarray, params: Dict[str, float]) -> np.ndarray:
+    def calc_z_tes(self, f: np.ndarray, params: Dict[str, float], flip_bias: bool = False) -> np.ndarray:
         # Evaluates simple model modulated by two-fluid parameter w_L
         R0 = params["R_0"] * 1e-3
         alpha = params["alpha"]
@@ -741,7 +752,10 @@ class TwoFluidModel(ThermalModelBase):
         z_simple = R0 * (1.0 + beta) + (R0 * L_I / (1.0 - L_I)) * (2.0 + beta) / denom
         # Two-fluid dynamic phase correction
         phase_factor = 1.0 - 0.2 * w_L * (1j * omega * tau_I) / denom
-        return z_simple * phase_factor
+        z_tes = z_simple * phase_factor
+        if flip_bias or params.get("flip_bias", False):
+            z_tes = -z_tes
+        return z_tes
 
     def calc_derived(self, params: Dict[str, float]) -> Dict[str, float]:
         derived = SimpleModel().calc_derived(params)

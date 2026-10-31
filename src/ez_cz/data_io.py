@@ -265,9 +265,9 @@ def load_cz_sweep_dataset(
 
             valid_mask = np.isfinite(Z_tes)
 
-            # Flip polarity if requested or if Re(Z) is negative at DC
+            # Flip polarity if requested: ensure Re(Z) > 0 at DC
             is_flip = flip_bias or bool(data_bias.get("flip_bias", False))
-            if is_flip or (np.sum(valid_mask) > 0 and np.real(Z_tes[valid_mask][0]) < 0):
+            if is_flip and (np.sum(valid_mask) > 0 and np.real(Z_tes[valid_mask][0]) < 0):
                 Z_tes = -Z_tes
                 Z_total = Z_tes + Z_circuit
 
@@ -338,7 +338,7 @@ def recompute_dataset_circuit_impedance(
         Z_tot = Z_circ / safe_ratio
         Z_t = Z_tot - Z_circ
         valid = np.isfinite(Z_t)
-        if flip_bias or (np.sum(valid) > 0 and np.real(Z_t[valid][0]) < 0):
+        if flip_bias and (np.sum(valid) > 0 and np.real(Z_t[valid][0]) < 0):
             Z_t = -Z_t
             Z_tot = Z_t + Z_circ
 

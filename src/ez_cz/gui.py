@@ -3652,6 +3652,8 @@ class CZMainWindow(QMainWindow):
         self.is_updating_params = False
 
     def sync_param_to_table(self, name: str, value: float):
+        if name in self.current_model_params:
+            self.current_model_params[name].value = value
         if name in self.param_table_widgets:
             spin = self.param_table_widgets[name]["spin_val"]
             spin.blockSignals(True)
@@ -3706,9 +3708,10 @@ class CZMainWindow(QMainWindow):
 
         f_dense = np.geomspace(max(f_data[0] * 0.5, 1.0), max(f_data[-1] * 2.0, 1e5), 300)
         p_vals = {k: p.value for k, p in self.current_model_params.items()}
+        flip = self.chk_analyze_flip_bias.isChecked() if hasattr(self, "chk_analyze_flip_bias") else False
 
         try:
-            z_pred_dense = self.active_model.calc_z_tes(f_dense, p_vals)
+            z_pred_dense = self.active_model.calc_z_tes(f_dense, p_vals, flip_bias=flip)
             derived = self.active_model.calc_derived(p_vals)
 
             d_parts = []
@@ -3760,11 +3763,12 @@ class CZMainWindow(QMainWindow):
                 title=f"Admittance Y(f): Vbias = {vb:.3f} V",
             )
         elif mode_text.startswith("Total Loop Z"):
+            flip = self.chk_analyze_flip_bias.isChecked() if hasattr(self, "chk_analyze_flip_bias") else False
             b_info = self.analyze_sweep_data["bias_points"].get(vb, {}) if self.analyze_sweep_data else {}
             ztot_data = b_info.get("z_total", z_data)
             p_vals = {k: p.value for k, p in self.current_model_params.items()}
             f_m = f_model if f_model is not None else f_data
-            ztot_model = self.active_model.calc_z_total(f_m, p_vals)
+            ztot_model = self.active_model.calc_z_total(f_m, p_vals, flip_bias=flip)
             ztot_fit = None
             f_fit = None
             if self.current_fit_result:
@@ -3830,6 +3834,7 @@ class CZMainWindow(QMainWindow):
         fit_target = self.get_selected_fit_target()
         y_data = b_info.get("y_tes")
         ztot_data = b_info.get("z_total")
+        flip = self.chk_analyze_flip_bias.isChecked() if hasattr(self, "chk_analyze_flip_bias") else False
 
         res = self.active_model.fit(
             f_data,
@@ -3838,6 +3843,7 @@ class CZMainWindow(QMainWindow):
             fit_target=fit_target,
             y_data=y_data,
             z_total_data=ztot_data,
+            flip_bias=flip,
         )
         elapsed_ms = (time.time() - t0) * 1000.0
 
@@ -3848,6 +3854,8 @@ class CZMainWindow(QMainWindow):
 
             self.is_updating_params = True
             for k, p in res.params.items():
+                if k in self.current_model_params:
+                    self.current_model_params[k].value = p.value
                 if k in self.param_table_widgets:
                     spin = self.param_table_widgets[k]["spin_val"]
                     spin.blockSignals(True)
@@ -3916,6 +3924,7 @@ class CZMainWindow(QMainWindow):
                     if "R_0" in self.current_model_params:
                         self.current_model_params["R_0"].value = op["rtes"] * 1e3
 
+                flip = self.chk_analyze_flip_bias.isChecked() if hasattr(self, "chk_analyze_flip_bias") else False
                 res = self.active_model.fit(
                     f_d,
                     z_d,
@@ -3923,6 +3932,7 @@ class CZMainWindow(QMainWindow):
                     fit_target=fit_target,
                     y_data=y_d,
                     z_total_data=ztot_d,
+                    flip_bias=flip,
                 )
                 if res.success:
                     row = {"Vbias_V": vb, "fit_target": fit_target, "success": True, "chi2": res.chi2, "redchi": res.redchi}
