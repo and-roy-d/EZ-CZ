@@ -41,25 +41,19 @@
     "output_dir": "/data"
   },
   "analyze": {
-    "raw_dir": "/data/20250807/Complex_Z/20250807_141314",
-    "iv_file": "20250807_150622_iv.npz",
-    "channel_id": 13,
+    "raw_dir": "/data/20261030/Complex_Z/20261030_171549",
+    "iv_file": "/data/20261023/iv/20261023_181330_iv_IV_19.9mK.npz",
+    "channel_id": 63,
     "zero_bias_time_shift": -0.0270625,
     "tc": 0.12,
     "tbath": 0.02,
-    "n_thermal": 4.0,
+    "n_thermal": 3.3,
     "dummy_g_tes_b": 2e-07,
-    "g_data_file": "/home/pcuser/Runs/Cooldown_A18/Results/G_parameter_summary.csv",
-    "pixel_map": [
-      [
-        13,
-        13
-      ]
-    ],
     "rbias_iv": 2000.0,
     "rshunt_uOhm": 250.0,
     "l_nyq_nH": 74.8,
-    "output_base_dir": "/home/pcuser/Runs/Complex_Z/",
-    "save_plots": true
+    "save_in_raw": true,
+    "flip_bias": true,
+    "model": "Dangling / Hanging (2-body)"
   }
 }

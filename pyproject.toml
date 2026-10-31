@@ -22,11 +22,6 @@ dependencies = [
     "pyserial",
 ]
 
-[tool.uv]
-required-environments = [
-    "sys_platform == 'win32' and platform_machine == 'AMD64'",
-]
-
 [project.scripts]
 ez-cz-measure = "ez_cz.measure:main"
 ez-cz-analyze = "ez_cz.analyze:main"

@@ -58,6 +58,9 @@ from matplotlib.backends.backend_qt5agg import NavigationToolbar2QT as Navigatio
 from matplotlib.figure import Figure
 import matplotlib.image as mpimg
 
+from ez_cz.models import AVAILABLE_MODELS, get_model, ParameterDef, FitResult
+from ez_cz.data_io import load_iv_curve, load_cz_sweep_dataset
+
 # ---------------------------------------------------------------------------
 # Hardware Imports with Mock Fallbacks for Simulation / Offline Use
 # ---------------------------------------------------------------------------
@@ -1260,25 +1263,184 @@ class AnalyzeWorker(QThread):
 
 
 class AnalyzePlotCanvas(FigureCanvas):
-    """Matplotlib canvas for displaying generated analysis plots."""
+    """
+    Interactive Matplotlib canvas for live Complex Impedance analysis and fitting.
+    Supports Nyquist, Bode, Admittance, Residuals, and IV curve views.
+    """
     def __init__(self, parent=None, width=9, height=8, dpi=100):
         self.fig = Figure(figsize=(width, height), dpi=dpi)
         self.fig.patch.set_facecolor("#151922")
-        self.ax = self.fig.add_subplot(111)
-        self.ax.set_facecolor("#151922")
-        self.ax.axis("off")
         super().__init__(self.fig)
         self.setParent(parent)
-        self.show_placeholder("No analysis plots loaded.\nRun an analysis or select an existing output folder.")
+        self.show_placeholder("No Complex Z data loaded.\nSelect a raw directory and load data to begin analysis.")
 
-    def show_placeholder(self, text):
+    def show_placeholder(self, text: str):
         self.fig.clear()
         ax = self.fig.add_subplot(111)
         ax.set_facecolor("#151922")
-        ax.text(0.5, 0.5, text, color="#90a4ae", fontsize=13,
+        ax.text(0.5, 0.5, text, color="#90a4ae", fontsize=12,
                 ha="center", va="center", transform=ax.transAxes,
                 bbox=dict(boxstyle="round,pad=0.8", fc="#1b2028", ec="#2a313d"))
         ax.axis("off")
+        self.draw()
+
+    def plot_complex_z(
+        self,
+        f_data: np.ndarray,
+        z_data: np.ndarray,
+        f_model: Optional[np.ndarray] = None,
+        z_model: Optional[np.ndarray] = None,
+        f_fit: Optional[np.ndarray] = None,
+        z_fit: Optional[np.ndarray] = None,
+        plot_mode: str = "nyquist",
+        title: str = "Complex Impedance",
+        derived_text: str = "",
+    ):
+        self.fig.clear()
+        valid = np.isfinite(z_data) & np.isfinite(f_data) & (f_data > 0)
+        f_clean = f_data[valid]
+        z_clean = z_data[valid]
+
+        if len(z_clean) == 0:
+            self.show_placeholder("No valid impedance data points to display.")
+            return
+
+        max_val = np.max(np.abs(z_clean))
+        scale = 1e3 if max_val < 0.1 else 1.0
+        unit = "mΩ" if scale == 1e3 else "Ω"
+
+        if plot_mode == "nyquist":
+            ax = self.fig.add_subplot(111)
+            ax.set_facecolor("#1b2028")
+            ax.grid(True, color="#2a313d", ls=":", lw=0.8)
+
+            ax.plot(np.real(z_clean) * scale, -np.imag(z_clean) * scale, "o",
+                    color="#82b1ff", ms=5, alpha=0.85, label="Measured Data")
+
+            if z_model is not None and len(z_model) > 0:
+                ax.plot(np.real(z_model) * scale, -np.imag(z_model) * scale, "--",
+                        color="#ffb74d", lw=1.8, label="Predicted Model")
+
+            if z_fit is not None and len(z_fit) > 0:
+                ax.plot(np.real(z_fit) * scale, -np.imag(z_fit) * scale, "-",
+                        color="#00e676", lw=2.2, label="Fitted Model")
+
+            ax.set_xlabel(f"Re(Z) [{unit}]", color="#cfd8dc", fontsize=10)
+            ax.set_ylabel(f"-Im(Z) [{unit}]", color="#cfd8dc", fontsize=10)
+            ax.tick_params(colors="#cfd8dc")
+            ax.set_title(title, color="#eceff1", fontsize=11, fontweight="bold")
+            legend = ax.legend(facecolor="#151922", edgecolor="#37474f", labelcolor="#cfd8dc", loc="best")
+            if legend:
+                legend.get_frame().set_alpha(0.85)
+
+            if derived_text:
+                ax.text(0.03, 0.04, derived_text, transform=ax.transAxes, color="#b0bec5", fontsize=9,
+                        bbox=dict(boxstyle="round,pad=0.4", fc="#151922", ec="#37474f", alpha=0.8))
+
+        elif plot_mode == "bode":
+            ax1 = self.fig.add_subplot(211)
+            ax2 = self.fig.add_subplot(212, sharex=ax1)
+            for ax in (ax1, ax2):
+                ax.set_facecolor("#1b2028")
+                ax.grid(True, color="#2a313d", ls=":", lw=0.8)
+                ax.tick_params(colors="#cfd8dc")
+
+            ax1.semilogx(f_clean, np.real(z_clean) * scale, "o", color="#82b1ff", ms=4, label="Data Re(Z)")
+            if z_model is not None:
+                fm = f_model if f_model is not None else f_clean
+                ax1.semilogx(fm, np.real(z_model) * scale, "--", color="#ffb74d", lw=1.8, label="Model Re(Z)")
+            if z_fit is not None:
+                ff = f_fit if f_fit is not None else f_clean
+                ax1.semilogx(ff, np.real(z_fit) * scale, "-", color="#00e676", lw=2.0, label="Fit Re(Z)")
+            ax1.set_ylabel(f"Re(Z) [{unit}]", color="#cfd8dc")
+            ax1.set_title(title, color="#eceff1", fontsize=11, fontweight="bold")
+            ax1.legend(facecolor="#151922", edgecolor="#37474f", labelcolor="#cfd8dc", loc="best")
+
+            ax2.semilogx(f_clean, np.imag(z_clean) * scale, "o", color="#82b1ff", ms=4, label="Data Im(Z)")
+            if z_model is not None:
+                fm = f_model if f_model is not None else f_clean
+                ax2.semilogx(fm, np.imag(z_model) * scale, "--", color="#ffb74d", lw=1.8, label="Model Im(Z)")
+            if z_fit is not None:
+                ff = f_fit if f_fit is not None else f_clean
+                ax2.semilogx(ff, np.imag(z_fit) * scale, "-", color="#00e676", lw=2.0, label="Fit Im(Z)")
+            ax2.set_xlabel("Frequency [Hz]", color="#cfd8dc")
+            ax2.set_ylabel(f"Im(Z) [{unit}]", color="#cfd8dc")
+            ax2.legend(facecolor="#151922", edgecolor="#37474f", labelcolor="#cfd8dc", loc="best")
+
+        elif plot_mode == "admittance":
+            ax = self.fig.add_subplot(111)
+            ax.set_facecolor("#1b2028")
+            ax.grid(True, color="#2a313d", ls=":", lw=0.8)
+
+            y_clean = 1.0 / z_clean
+            ax.plot(np.real(y_clean), np.imag(y_clean), "o", color="#82b1ff", ms=5, label="Measured Y")
+            if z_model is not None:
+                y_mod = 1.0 / z_model
+                ax.plot(np.real(y_mod), np.imag(y_mod), "--", color="#ffb74d", lw=1.8, label="Model Y")
+            if z_fit is not None:
+                y_fit = 1.0 / z_fit
+                ax.plot(np.real(y_fit), np.imag(y_fit), "-", color="#00e676", lw=2.0, label="Fit Y")
+
+            ax.set_xlabel("Re(Y) [S]", color="#cfd8dc")
+            ax.set_ylabel("Im(Y) [S]", color="#cfd8dc")
+            ax.tick_params(colors="#cfd8dc")
+            ax.set_title(f"Admittance Y(f) - {title}", color="#eceff1", fontsize=11, fontweight="bold")
+            ax.legend(facecolor="#151922", edgecolor="#37474f", labelcolor="#cfd8dc")
+
+        elif plot_mode == "residuals":
+            ax1 = self.fig.add_subplot(211)
+            ax2 = self.fig.add_subplot(212, sharex=ax1)
+            for ax in (ax1, ax2):
+                ax.set_facecolor("#1b2028")
+                ax.grid(True, color="#2a313d", ls=":", lw=0.8)
+                ax.tick_params(colors="#cfd8dc")
+
+            comp_z = z_fit if z_fit is not None else z_model
+            if comp_z is not None:
+                res_re = (np.real(z_clean) - np.real(comp_z[:len(z_clean)])) * scale
+                res_im = (np.imag(z_clean) - np.imag(comp_z[:len(z_clean)])) * scale
+                ax1.semilogx(f_clean, res_re, "o-", color="#ff80ab", ms=4, label="Re(Data - Model)")
+                ax1.axhline(0, color="#78909c", ls="--", lw=1.0)
+                ax1.set_ylabel(f"Residual Re [{unit}]", color="#cfd8dc")
+                ax1.legend(facecolor="#151922", edgecolor="#37474f", labelcolor="#cfd8dc")
+                ax1.set_title(f"Fit Residuals - {title}", color="#eceff1", fontsize=11)
+
+                ax2.semilogx(f_clean, res_im, "o-", color="#80d8ff", ms=4, label="Im(Data - Model)")
+                ax2.axhline(0, color="#78909c", ls="--", lw=1.0)
+                ax2.set_xlabel("Frequency [Hz]", color="#cfd8dc")
+                ax2.set_ylabel(f"Residual Im [{unit}]", color="#cfd8dc")
+                ax2.legend(facecolor="#151922", edgecolor="#37474f", labelcolor="#cfd8dc")
+
+        self.fig.tight_layout()
+        self.draw()
+
+    def plot_iv(self, vbias: np.ndarray, ites: np.ndarray, rtes: np.ndarray, selected_bias: Optional[float] = None, rnormal: Optional[float] = None):
+        self.fig.clear()
+        ax1 = self.fig.add_subplot(211)
+        ax2 = self.fig.add_subplot(212, sharex=ax1)
+        for ax in (ax1, ax2):
+            ax.set_facecolor("#1b2028")
+            ax.grid(True, color="#2a313d", ls=":", lw=0.8)
+            ax.tick_params(colors="#cfd8dc")
+
+        ax1.plot(vbias, ites * 1e6, "-", color="#82b1ff", lw=1.8, label="IV Curve")
+        ax1.set_ylabel("TES Current [µA]", color="#cfd8dc")
+        ax1.set_title("TES Current-Voltage Characteristic", color="#eceff1", fontsize=11, fontweight="bold")
+
+        ax2.plot(vbias, rtes * 1e3, "-", color="#80cbc4", lw=1.8, label="R_tes(Vbias)")
+        if rnormal:
+            ax2.axhline(rnormal * 1e3, color="#ef5350", ls="--", lw=1.2, label=f"Rn = {rnormal*1e3:.2f} mΩ")
+        ax2.set_xlabel("Bias Voltage [V]", color="#cfd8dc")
+        ax2.set_ylabel("TES Resistance [mΩ]", color="#cfd8dc")
+
+        if selected_bias is not None:
+            idx = np.argmin(np.abs(vbias - selected_bias))
+            ax1.plot(vbias[idx], ites[idx] * 1e6, "o", color="#ff1744", ms=8, label=f"Selected: {selected_bias:.3f}V")
+            ax2.plot(vbias[idx], rtes[idx] * 1e3, "o", color="#ff1744", ms=8, label=f"Selected: {selected_bias:.3f}V")
+
+        ax1.legend(facecolor="#151922", edgecolor="#37474f", labelcolor="#cfd8dc")
+        ax2.legend(facecolor="#151922", edgecolor="#37474f", labelcolor="#cfd8dc")
+        self.fig.tight_layout()
         self.draw()
 
     def display_image(self, image_path):
@@ -1311,6 +1473,16 @@ class CZMainWindow(QMainWindow):
         self.worker = None
         self.analyze_worker = None
         self.analyze_plot_files = {}
+
+        # Interactive Analyze State
+        self.analyze_sweep_data = None
+        self.analyze_iv_data = None
+        self.active_model = get_model("Dangling / Hanging (2-body)")
+        self.current_model_params = self.active_model.get_parameter_defs()
+        self.current_fit_result = None
+        self.current_selected_bias = None
+        self.param_table_widgets = {}
+        self.is_updating_params = False
 
         self.dark_stylesheet = """
             QMainWindow, QWidget {
@@ -1406,6 +1578,24 @@ class CZMainWindow(QMainWindow):
                 border-radius: 6px;
                 background-color: #12141a;
             }
+            QTabBar::tab {
+                min-width: 90px;
+                padding: 8px 18px;
+            }
+            QTableWidget {
+                background-color: #151922;
+                border: 1px solid #2a313d;
+                gridline-color: #263238;
+                color: #eceff1;
+                font-size: 9pt;
+            }
+            QHeaderView::section {
+                background-color: #1e2530;
+                color: #82b1ff;
+                font-weight: bold;
+                padding: 4px;
+                border: 1px solid #2a313d;
+            }
             QTabWidget#main_tabs > QTabBar::tab {
                 background-color: #1a202c;
                 color: #b0bec5;
@@ -1417,6 +1607,7 @@ class CZMainWindow(QMainWindow):
                 border-top-right-radius: 6px;
                 border: 1px solid #2d3748;
                 border-bottom: none;
+                min-width: 110px;
             }
             QTabWidget#main_tabs > QTabBar::tab:selected {
                 background-color: #151922;
@@ -1451,11 +1642,11 @@ class CZMainWindow(QMainWindow):
 
         # Tab 1: Measure
         self.tab_measure = self._create_measure_tab()
-        self.main_tabs.addTab(self.tab_measure, "⚡ Measure")
+        self.main_tabs.addTab(self.tab_measure, "Measure")
 
         # Tab 2: Analyze
         self.tab_analyze = self._create_analyze_tab()
-        self.main_tabs.addTab(self.tab_analyze, "📊 Analyze")
+        self.main_tabs.addTab(self.tab_analyze, "Analyze")
 
         main_layout.addWidget(self.main_tabs)
 
@@ -1584,159 +1775,144 @@ class CZMainWindow(QMainWindow):
     def _create_analyze_tab(self):
         splitter = QSplitter(Qt.Horizontal)
 
-        # Left Pane: Config & Execution Controls
+        # Left Pane: Configuration, Parameters & Fitting Controls
         left_widget = QWidget()
         left_layout = QVBoxLayout(left_widget)
         left_layout.setContentsMargins(0, 0, 0, 0)
         left_layout.setSpacing(8)
 
-        # 1. Data & File Paths
-        paths_box = QGroupBox("Data & File Paths")
-        paths_layout = QGridLayout(paths_box)
-        paths_layout.setSpacing(6)
+        # 1. Complex Z Data & IV Operating Point
+        data_box = QGroupBox("Complex Z Data & IV Operating Point")
+        data_layout = QGridLayout(data_box)
+        data_layout.setSpacing(6)
 
-        paths_layout.addWidget(QLabel("Raw Complex Z Dir:"), 0, 0)
-        self.edit_analyze_raw_dir = QLineEdit()
+        data_layout.addWidget(QLabel("Raw Complex Z Dir:"), 0, 0)
+        self.edit_analyze_raw_dir = QLineEdit("/data/20261030/Complex_Z/20261030_171549")
         self.btn_browse_analyze_raw = QPushButton("Browse")
-        self.btn_browse_analyze_raw.setFixedWidth(80)
+        self.btn_browse_analyze_raw.setFixedWidth(75)
         self.btn_browse_analyze_raw.clicked.connect(self.on_browse_analyze_raw_dir)
+        self.btn_load_analyze_dir = QPushButton("Load Sweep")
+        self.btn_load_analyze_dir.setFixedWidth(95)
+        self.btn_load_analyze_dir.setStyleSheet("background-color: #0277bd; color: #ffffff; font-weight: bold;")
+        self.btn_load_analyze_dir.clicked.connect(self.on_load_analyze_sweep)
         raw_h = QHBoxLayout()
         raw_h.addWidget(self.edit_analyze_raw_dir)
         raw_h.addWidget(self.btn_browse_analyze_raw)
-        paths_layout.addLayout(raw_h, 0, 1)
+        raw_h.addWidget(self.btn_load_analyze_dir)
+        data_layout.addLayout(raw_h, 0, 1, 1, 3)
 
-        paths_layout.addWidget(QLabel("IV Curve File (.npz):"), 1, 0)
-        self.edit_analyze_iv_file = QLineEdit()
+        data_layout.addWidget(QLabel("IV Curve File (.npz):"), 1, 0)
+        self.edit_analyze_iv_file = QLineEdit("/data/20261023/iv/20261023_181330_iv_IV_19.9mK.npz")
         self.btn_browse_analyze_iv = QPushButton("Browse")
-        self.btn_browse_analyze_iv.setFixedWidth(80)
+        self.btn_browse_analyze_iv.setFixedWidth(75)
         self.btn_browse_analyze_iv.clicked.connect(self.on_browse_analyze_iv_file)
         iv_h = QHBoxLayout()
         iv_h.addWidget(self.edit_analyze_iv_file)
         iv_h.addWidget(self.btn_browse_analyze_iv)
-        paths_layout.addLayout(iv_h, 1, 1)
+        data_layout.addLayout(iv_h, 1, 1, 1, 3)
 
-        paths_layout.addWidget(QLabel("Output Base Dir:"), 2, 0)
-        self.edit_analyze_output_dir = QLineEdit("/data/Results/Complex_Z")
-        self.btn_browse_analyze_out = QPushButton("Browse")
-        self.btn_browse_analyze_out.setFixedWidth(80)
-        self.btn_browse_analyze_out.clicked.connect(self.on_browse_analyze_output_dir)
-        out_h = QHBoxLayout()
-        out_h.addWidget(self.edit_analyze_output_dir)
-        out_h.addWidget(self.btn_browse_analyze_out)
-        paths_layout.addLayout(out_h, 2, 1)
-
-        paths_layout.addWidget(QLabel("G CSV File (Optional):"), 3, 0)
-        self.edit_analyze_g_file = QLineEdit()
-        self.btn_browse_analyze_g = QPushButton("Browse")
-        self.btn_browse_analyze_g.setFixedWidth(80)
-        self.btn_browse_analyze_g.clicked.connect(self.on_browse_analyze_g_file)
-        g_h = QHBoxLayout()
-        g_h.addWidget(self.edit_analyze_g_file)
-        g_h.addWidget(self.btn_browse_analyze_g)
-        paths_layout.addLayout(g_h, 3, 1)
-
-        left_layout.addWidget(paths_box)
-
-        # 2. Analysis Parameters
-        param_box = QGroupBox("Channel & Analysis Circuit Parameters")
-        param_layout = QGridLayout(param_box)
-        param_layout.setSpacing(6)
-
-        param_layout.addWidget(QLabel("Channel ID:"), 0, 0)
+        data_layout.addWidget(QLabel("Channel ID:"), 2, 0)
         self.spin_analyze_channel = QSpinBox()
         self.spin_analyze_channel.setRange(0, 127)
         self.spin_analyze_channel.setValue(63)
         self.spin_analyze_channel.valueChanged.connect(self.on_analyze_channel_changed)
-        param_layout.addWidget(self.spin_analyze_channel, 0, 1)
+        data_layout.addWidget(self.spin_analyze_channel, 2, 1)
 
-        param_layout.addWidget(QLabel("Pixel Number:"), 0, 2)
-        self.spin_analyze_pixel = QSpinBox()
-        self.spin_analyze_pixel.setRange(0, 127)
-        self.spin_analyze_pixel.setValue(63)
-        self.spin_analyze_pixel.valueChanged.connect(self.load_available_analyze_plots)
-        param_layout.addWidget(self.spin_analyze_pixel, 0, 3)
-
-        param_layout.addWidget(QLabel("Rbias IV (Ω):"), 1, 0)
-        self.spin_analyze_rbias = QDoubleSpinBox()
-        self.spin_analyze_rbias.setRange(1.0, 100000.0)
-        self.spin_analyze_rbias.setValue(2000.0)
-        param_layout.addWidget(self.spin_analyze_rbias, 1, 1)
-
-        param_layout.addWidget(QLabel("Rshunt (µΩ):"), 1, 2)
-        self.spin_analyze_rshunt = QDoubleSpinBox()
-        self.spin_analyze_rshunt.setRange(0.1, 50000.0)
-        self.spin_analyze_rshunt.setValue(250.0)
-        param_layout.addWidget(self.spin_analyze_rshunt, 1, 3)
-
-        param_layout.addWidget(QLabel("Lnyq (nH):"), 2, 0)
-        self.spin_analyze_lnyq = QDoubleSpinBox()
-        self.spin_analyze_lnyq.setRange(0.1, 10000.0)
-        self.spin_analyze_lnyq.setValue(74.8)
-        param_layout.addWidget(self.spin_analyze_lnyq, 2, 1)
-
-        param_layout.addWidget(QLabel("Zero-Bias τ (s):"), 2, 2)
-        tau_h = QHBoxLayout()
-        self.spin_analyze_tau = QDoubleSpinBox()
-        self.spin_analyze_tau.setRange(-1.0, 1.0)
-        self.spin_analyze_tau.setDecimals(7)
-        self.spin_analyze_tau.setSingleStep(0.0001)
-        self.spin_analyze_tau.setValue(-0.0270625)
-        self.chk_analyze_auto_tau = QCheckBox("Auto from file")
-        self.chk_analyze_auto_tau.setChecked(True)
-        self.chk_analyze_auto_tau.toggled.connect(lambda chk: self.spin_analyze_tau.setEnabled(not chk))
-        self.spin_analyze_tau.setEnabled(False)
-        tau_h.addWidget(self.spin_analyze_tau)
-        tau_h.addWidget(self.chk_analyze_auto_tau)
-        param_layout.addLayout(tau_h, 2, 3)
-
-        param_layout.addWidget(QLabel("Tc (K):"), 3, 0)
-        self.spin_analyze_tc = QDoubleSpinBox()
-        self.spin_analyze_tc.setRange(0.001, 5.0)
-        self.spin_analyze_tc.setDecimals(4)
-        self.spin_analyze_tc.setSingleStep(0.01)
-        self.spin_analyze_tc.setValue(0.12)
-        param_layout.addWidget(self.spin_analyze_tc, 3, 1)
-
-        param_layout.addWidget(QLabel("Tbath (K):"), 3, 2)
-        self.spin_analyze_tbath = QDoubleSpinBox()
-        self.spin_analyze_tbath.setRange(0.001, 1.0)
-        self.spin_analyze_tbath.setDecimals(4)
-        self.spin_analyze_tbath.setSingleStep(0.005)
-        self.spin_analyze_tbath.setValue(0.02)
-        param_layout.addWidget(self.spin_analyze_tbath, 3, 3)
-
-        param_layout.addWidget(QLabel("Thermal Exponent n:"), 4, 0)
-        self.spin_analyze_n = QDoubleSpinBox()
-        self.spin_analyze_n.setRange(1.0, 10.0)
-        self.spin_analyze_n.setValue(4.0)
-        param_layout.addWidget(self.spin_analyze_n, 4, 1)
-
-        param_layout.addWidget(QLabel("Dummy g_tes_b (W/K):"), 4, 2)
-        self.spin_analyze_dummy_g = QDoubleSpinBox()
-        self.spin_analyze_dummy_g.setRange(1e-12, 1e-3)
-        self.spin_analyze_dummy_g.setDecimals(10)
-        self.spin_analyze_dummy_g.setValue(2e-7)
-        param_layout.addWidget(self.spin_analyze_dummy_g, 4, 3)
+        data_layout.addWidget(QLabel("Bias Point:"), 2, 2)
+        self.combo_analyze_bias_points = QComboBox()
+        self.combo_analyze_bias_points.addItem("Click 'Load Sweep' to populate")
+        self.combo_analyze_bias_points.currentIndexChanged.connect(self.on_analyze_bias_changed)
+        data_layout.addWidget(self.combo_analyze_bias_points, 2, 3)
 
         flags_h = QHBoxLayout()
         self.chk_analyze_flip_bias = QCheckBox("Flip bias (ensure Re(Z) > 0 at DC)")
-        self.chk_analyze_flip_bias.setChecked(False)
+        self.chk_analyze_flip_bias.setChecked(True)
+        self.chk_analyze_flip_bias.toggled.connect(self.on_flip_bias_toggled)
         flags_h.addWidget(self.chk_analyze_flip_bias)
-        self.chk_analyze_save_plots = QCheckBox("Save Plots & CSV Results")
-        self.chk_analyze_save_plots.setChecked(True)
-        flags_h.addWidget(self.chk_analyze_save_plots)
-        param_layout.addLayout(flags_h, 5, 0, 1, 4)
 
-        left_layout.addWidget(param_box)
+        self.chk_analyze_save_in_raw = QCheckBox("Save in <Complex_Z_Dir>/analysis/")
+        self.chk_analyze_save_in_raw.setChecked(True)
+        flags_h.addWidget(self.chk_analyze_save_in_raw)
+        data_layout.addLayout(flags_h, 3, 0, 1, 4)
 
-        # 3. Execution Status & Controls
-        exec_box = QGroupBox("Execution & Controls")
+        left_layout.addWidget(data_box)
+
+        # 2. Thermal Model & Dynamic Parameters
+        model_box = QGroupBox("Thermal Model & Dynamic Parameters")
+        model_layout = QVBoxLayout(model_box)
+        model_layout.setSpacing(6)
+
+        m_top_h = QHBoxLayout()
+        m_top_h.addWidget(QLabel("Thermal Model:"))
+        self.combo_analyze_model = QComboBox()
+        for m_name in AVAILABLE_MODELS.keys():
+            self.combo_analyze_model.addItem(m_name)
+        self.combo_analyze_model.setCurrentText("Dangling / Hanging (2-body)")
+        self.combo_analyze_model.currentIndexChanged.connect(self.on_analyze_model_changed)
+        m_top_h.addWidget(self.combo_analyze_model, stretch=1)
+        model_layout.addLayout(m_top_h)
+
+        # Dynamic Parameter Table
+        self.table_analyze_params = QTableWidget()
+        self.table_analyze_params.setColumnCount(6)
+        self.table_analyze_params.setHorizontalHeaderLabels(["Parameter", "Value", "Freeze", "Min", "Max", "± Error"])
+        self.table_analyze_params.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+        self.table_analyze_params.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        self.table_analyze_params.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        self.table_analyze_params.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        self.table_analyze_params.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeToContents)
+        self.table_analyze_params.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeToContents)
+        self.table_analyze_params.verticalHeader().setVisible(False)
+        self.table_analyze_params.setFixedHeight(230)
+        model_layout.addWidget(self.table_analyze_params)
+
+        # Operating point & derived parameters badges
+        self.lbl_analyze_op_info = QLabel("Operating Point: Load sweep and IV to inspect")
+        self.lbl_analyze_op_info.setStyleSheet("color: #82b1ff; font-weight: bold; font-size: 9pt;")
+        model_layout.addWidget(self.lbl_analyze_op_info)
+
+        self.lbl_analyze_derived = QLabel("Derived Parameters: --")
+        self.lbl_analyze_derived.setStyleSheet("color: #b0bec5; font-size: 9pt;")
+        model_layout.addWidget(self.lbl_analyze_derived)
+
+        left_layout.addWidget(model_box)
+
+        # 3. Model Fitting & Save Actions
+        exec_box = QGroupBox("Model Fitting & Save Controls")
         exec_layout = QVBoxLayout(exec_box)
         exec_layout.setSpacing(6)
 
+        btn_grid = QGridLayout()
+        btn_grid.setSpacing(6)
+
+        self.btn_fit_model = QPushButton("FIT MODEL (Selected Bias)")
+        self.btn_fit_model.setStyleSheet("background-color: #2e7d32; color: #ffffff; font-size: 10pt; font-weight: bold; padding: 8px;")
+        self.btn_fit_model.clicked.connect(self.on_fit_model_clicked)
+
+        self.btn_fit_all_biases = QPushButton("FIT ALL BIAS POINTS (Batch)")
+        self.btn_fit_all_biases.setStyleSheet("background-color: #1565c0; color: #ffffff; font-size: 10pt; font-weight: bold; padding: 8px;")
+        self.btn_fit_all_biases.clicked.connect(self.on_fit_all_biases_clicked)
+
+        self.btn_save_analysis = QPushButton("Save Fit Results & Plots")
+        self.btn_save_analysis.setStyleSheet("background-color: #37474f; color: #cfd8dc; font-weight: bold; padding: 6px;")
+        self.btn_save_analysis.clicked.connect(self.on_save_analysis_clicked)
+
+        self.btn_open_analyze_dir = QPushButton("Open analysis/ Folder")
+        self.btn_open_analyze_dir.setStyleSheet("background-color: #455a64; color: #cfd8dc; font-weight: bold; padding: 6px;")
+        self.btn_open_analyze_dir.clicked.connect(self.on_open_analyze_dir)
+
+        for btn in (self.btn_fit_model, self.btn_fit_all_biases, self.btn_save_analysis, self.btn_open_analyze_dir):
+            btn.setFixedHeight(36)
+
+        btn_grid.addWidget(self.btn_fit_model, 0, 0)
+        btn_grid.addWidget(self.btn_fit_all_biases, 0, 1)
+        btn_grid.addWidget(self.btn_save_analysis, 1, 0)
+        btn_grid.addWidget(self.btn_open_analyze_dir, 1, 1)
+        exec_layout.addLayout(btn_grid)
+
         status_h = QHBoxLayout()
         self.lbl_analyze_status = QLabel("STATUS: IDLE")
-        self.lbl_analyze_status.setStyleSheet("font-weight: bold; color: #b0bec5; font-size: 11pt;")
+        self.lbl_analyze_status.setStyleSheet("font-weight: bold; color: #b0bec5; font-size: 10pt;")
         status_h.addWidget(self.lbl_analyze_status)
         status_h.addStretch()
         exec_layout.addLayout(status_h)
@@ -1746,37 +1922,10 @@ class CZMainWindow(QMainWindow):
         self.prog_analyze.setValue(0)
         exec_layout.addWidget(self.prog_analyze)
 
-        btn_grid = QGridLayout()
-        self.btn_run_analyze = QPushButton("RUN ANALYSIS")
-        self.btn_run_analyze.setStyleSheet("background-color: #2e7d32; color: #ffffff; font-size: 11pt; font-weight: bold; padding: 10px;")
-        self.btn_run_analyze.clicked.connect(self.on_run_analyze_clicked)
-
-        self.btn_abort_analyze = QPushButton("ABORT ANALYSIS")
-        self.btn_abort_analyze.setStyleSheet("background-color: #c62828; color: #ffffff; font-size: 11pt; font-weight: bold; padding: 10px;")
-        self.btn_abort_analyze.setEnabled(False)
-        self.btn_abort_analyze.clicked.connect(self.on_abort_analyze_clicked)
-
-        self.btn_open_analyze_dir = QPushButton("Open Output Folder")
-        self.btn_open_analyze_dir.setStyleSheet("background-color: #1976d2; color: #ffffff; font-weight: bold; padding: 8px;")
-        self.btn_open_analyze_dir.clicked.connect(self.on_open_analyze_dir)
-
-        self.btn_save_analyze_cfg = QPushButton("Save Settings as Default")
-        self.btn_save_analyze_cfg.setStyleSheet("background-color: #37474f; color: #cfd8dc; font-size: 9pt;")
-        self.btn_save_analyze_cfg.clicked.connect(self.save_settings_to_json)
-
-        for btn in (self.btn_run_analyze, self.btn_abort_analyze, self.btn_open_analyze_dir, self.btn_save_analyze_cfg):
-            btn.setFixedHeight(40)
-
-        btn_grid.addWidget(self.btn_run_analyze, 0, 0)
-        btn_grid.addWidget(self.btn_abort_analyze, 0, 1)
-        btn_grid.addWidget(self.btn_open_analyze_dir, 1, 0)
-        btn_grid.addWidget(self.btn_save_analyze_cfg, 1, 1)
-        exec_layout.addLayout(btn_grid)
-
         left_layout.addWidget(exec_box)
 
         # 4. Activity Log
-        log_box = QGroupBox("Analysis Activity Log")
+        log_box = QGroupBox("Analysis Activity & Fit Summary")
         log_layout = QVBoxLayout(log_box)
         self.txt_analyze_log = QTextEdit()
         self.txt_analyze_log.setReadOnly(True)
@@ -1785,43 +1934,42 @@ class CZMainWindow(QMainWindow):
 
         splitter.addWidget(left_widget)
 
-        # Right Pane: Interactive Plot Viewer
+        # Right Pane: Interactive Live Plot Viewer
         right_widget = QWidget()
         right_layout = QVBoxLayout(right_widget)
         right_layout.setContentsMargins(0, 0, 0, 0)
         right_layout.setSpacing(6)
 
-        # Selector toolbar
-        selector_box = QGroupBox("Plot Selection & Display")
-        selector_layout = QHBoxLayout(selector_box)
-        selector_layout.setSpacing(8)
+        plot_ctl_box = QGroupBox("Interactive Plot Display")
+        plot_ctl_layout = QHBoxLayout(plot_ctl_box)
+        plot_ctl_layout.setSpacing(8)
 
-        selector_layout.addWidget(QLabel("Plot:"))
-        self.combo_analyze_plots = QComboBox()
-        for label, _ in ANALYZE_PLOT_TYPES:
-            self.combo_analyze_plots.addItem(label)
-        self.combo_analyze_plots.currentIndexChanged.connect(self.on_analyze_plot_selected)
-        selector_layout.addWidget(self.combo_analyze_plots, stretch=1)
+        plot_ctl_layout.addWidget(QLabel("View:"))
+        self.combo_analyze_plot_view = QComboBox()
+        self.combo_analyze_plot_view.addItems([
+            "Nyquist: -Im(Z) vs Re(Z)",
+            "Bode: Re(Z) & Im(Z) vs Frequency",
+            "Admittance: Im(Y) vs Re(Y)",
+            "Residuals: (Data - Model) vs Frequency",
+            "IV Curve & Operating Point",
+        ])
+        self.combo_analyze_plot_view.currentIndexChanged.connect(self.on_analyze_plot_view_changed)
+        plot_ctl_layout.addWidget(self.combo_analyze_plot_view, stretch=1)
 
-        self.btn_prev_plot = QPushButton("◀ Prev")
-        self.btn_prev_plot.clicked.connect(self.on_prev_plot_clicked)
-        selector_layout.addWidget(self.btn_prev_plot)
+        self.btn_prev_bias = QPushButton("< Prev Bias")
+        self.btn_prev_bias.clicked.connect(self.on_prev_bias_clicked)
+        plot_ctl_layout.addWidget(self.btn_prev_bias)
 
-        self.btn_next_plot = QPushButton("Next ▶")
-        self.btn_next_plot.clicked.connect(self.on_next_plot_clicked)
-        selector_layout.addWidget(self.btn_next_plot)
+        self.btn_next_bias = QPushButton("Next Bias >")
+        self.btn_next_bias.clicked.connect(self.on_next_bias_clicked)
+        plot_ctl_layout.addWidget(self.btn_next_bias)
 
-        self.btn_reload_plots = QPushButton("Reload Plots")
-        self.btn_reload_plots.clicked.connect(self.load_available_analyze_plots)
-        selector_layout.addWidget(self.btn_reload_plots)
+        self.lbl_analyze_view_info = QLabel("No data loaded")
+        self.lbl_analyze_view_info.setStyleSheet("color: #82b1ff; font-weight: bold; padding: 2px;")
+        plot_ctl_layout.addWidget(self.lbl_analyze_view_info)
 
-        right_layout.addWidget(selector_box)
+        right_layout.addWidget(plot_ctl_box)
 
-        self.lbl_plot_filename = QLabel("No plot loaded")
-        self.lbl_plot_filename.setStyleSheet("color: #82b1ff; font-weight: bold; padding: 2px;")
-        right_layout.addWidget(self.lbl_plot_filename)
-
-        # Matplotlib canvas and navigation toolbar
         self.analyze_canvas = AnalyzePlotCanvas(self, width=9, height=8)
         self.analyze_toolbar = NavigationToolbar(self.analyze_canvas, self)
         self.analyze_toolbar.setStyleSheet("background-color: #e4e8ed; border: 1px solid #c7cbd1; border-radius: 4px;")
@@ -1832,6 +1980,10 @@ class CZMainWindow(QMainWindow):
         splitter.addWidget(right_widget)
         splitter.setStretchFactor(0, 1)
         splitter.setStretchFactor(1, 1)
+
+        # Initial parameter table construction
+        self.build_parameter_table()
+
         return splitter
 
     def _create_bias_tab(self):
@@ -2659,41 +2811,21 @@ class CZMainWindow(QMainWindow):
 
             # Load analyze settings
             a = data.get("analyze", {})
-            if "raw_dir" in a and a["raw_dir"]:
+            if "raw_dir" in a and a["raw_dir"] and hasattr(self, "edit_analyze_raw_dir"):
                 self.edit_analyze_raw_dir.setText(str(a["raw_dir"]))
-            if "iv_file" in a and a["iv_file"]:
+            if "iv_file" in a and a["iv_file"] and hasattr(self, "edit_analyze_iv_file"):
                 self.edit_analyze_iv_file.setText(str(a["iv_file"]))
-            if "output_base_dir" in a and a["output_base_dir"]:
-                self.edit_analyze_output_dir.setText(str(a["output_base_dir"]))
-            if "g_data_file" in a and a["g_data_file"]:
-                self.edit_analyze_g_file.setText(str(a["g_data_file"]))
-            if "channel_id" in a:
+            if "channel_id" in a and hasattr(self, "spin_analyze_channel"):
                 self.spin_analyze_channel.setValue(int(a["channel_id"]))
-            if "pixel_map" in a and len(a["pixel_map"]) > 0:
-                self.spin_analyze_pixel.setValue(int(a["pixel_map"][0][1]))
-            if "zero_bias_time_shift" in a:
-                self.spin_analyze_tau.setValue(float(a["zero_bias_time_shift"]))
-            if "tc" in a:
-                self.spin_analyze_tc.setValue(float(a["tc"]))
-            if "tbath" in a:
-                self.spin_analyze_tbath.setValue(float(a["tbath"]))
-            if "n_thermal" in a:
-                self.spin_analyze_n.setValue(float(a["n_thermal"]))
-            if "dummy_g_tes_b" in a:
-                self.spin_analyze_dummy_g.setValue(float(a["dummy_g_tes_b"]))
-            if "rbias_iv" in a:
-                self.spin_analyze_rbias.setValue(float(a["rbias_iv"]))
-            if "rshunt_uOhm" in a:
-                self.spin_analyze_rshunt.setValue(float(a["rshunt_uOhm"]))
-            if "l_nyq_nH" in a:
-                self.spin_analyze_lnyq.setValue(float(a["l_nyq_nH"]))
-            if "save_plots" in a:
-                self.chk_analyze_save_plots.setChecked(bool(a["save_plots"]))
-            if "flip_bias" in a:
+            if "flip_bias" in a and hasattr(self, "chk_analyze_flip_bias"):
                 self.chk_analyze_flip_bias.setChecked(bool(a["flip_bias"]))
-
-            self.load_available_analyze_plots()
+            if "save_in_raw" in a and hasattr(self, "chk_analyze_save_in_raw"):
+                self.chk_analyze_save_in_raw.setChecked(bool(a["save_in_raw"]))
+            if "model" in a and hasattr(self, "combo_analyze_model"):
+                self.combo_analyze_model.setCurrentText(str(a["model"]))
             self.log("INFO", f"Loaded parameters from {path}")
+            if hasattr(self, "edit_analyze_raw_dir") and Path(self.edit_analyze_raw_dir.text().strip()).exists():
+                self.on_load_analyze_sweep()
         except Exception as e:
             self.log("WARN", f"Could not load {path}: {e}")
 
@@ -2737,22 +2869,18 @@ class CZMainWindow(QMainWindow):
         existing["measure"] = measure_cfg
 
         analyze_cfg = existing.get("analyze", {})
-        analyze_cfg["raw_dir"] = self.edit_analyze_raw_dir.text().strip()
-        analyze_cfg["iv_file"] = self.edit_analyze_iv_file.text().strip()
-        analyze_cfg["output_base_dir"] = self.edit_analyze_output_dir.text().strip()
-        analyze_cfg["g_data_file"] = self.edit_analyze_g_file.text().strip()
-        analyze_cfg["channel_id"] = self.spin_analyze_channel.value()
-        analyze_cfg["pixel_map"] = [[self.spin_analyze_channel.value(), self.spin_analyze_pixel.value()]]
-        analyze_cfg["zero_bias_time_shift"] = self.spin_analyze_tau.value()
-        analyze_cfg["tc"] = self.spin_analyze_tc.value()
-        analyze_cfg["tbath"] = self.spin_analyze_tbath.value()
-        analyze_cfg["n_thermal"] = self.spin_analyze_n.value()
-        analyze_cfg["dummy_g_tes_b"] = self.spin_analyze_dummy_g.value()
-        analyze_cfg["rbias_iv"] = self.spin_analyze_rbias.value()
-        analyze_cfg["rshunt_uOhm"] = self.spin_analyze_rshunt.value()
-        analyze_cfg["l_nyq_nH"] = self.spin_analyze_lnyq.value()
-        analyze_cfg["save_plots"] = self.chk_analyze_save_plots.isChecked()
-        analyze_cfg["flip_bias"] = self.chk_analyze_flip_bias.isChecked()
+        if hasattr(self, "edit_analyze_raw_dir"):
+            analyze_cfg["raw_dir"] = self.edit_analyze_raw_dir.text().strip()
+        if hasattr(self, "edit_analyze_iv_file"):
+            analyze_cfg["iv_file"] = self.edit_analyze_iv_file.text().strip()
+        if hasattr(self, "spin_analyze_channel"):
+            analyze_cfg["channel_id"] = self.spin_analyze_channel.value()
+        if hasattr(self, "chk_analyze_flip_bias"):
+            analyze_cfg["flip_bias"] = self.chk_analyze_flip_bias.isChecked()
+        if hasattr(self, "combo_analyze_model"):
+            analyze_cfg["model"] = self.combo_analyze_model.currentText()
+        if hasattr(self, "chk_analyze_save_in_raw"):
+            analyze_cfg["save_in_raw"] = self.chk_analyze_save_in_raw.isChecked()
         existing["analyze"] = analyze_cfg
 
         try:
@@ -2765,39 +2893,501 @@ class CZMainWindow(QMainWindow):
             QMessageBox.critical(self, "Save Error", str(e))
 
     # -----------------------------------------------------------------------
-    # Analyze Tab Handlers
+    # Analyze Tab Handlers (Interactive MDT Model Fitting & Sweeps)
     # -----------------------------------------------------------------------
     def on_browse_analyze_raw_dir(self):
         curr = self.edit_analyze_raw_dir.text().strip() or "/data"
         d = QFileDialog.getExistingDirectory(self, "Select Raw Complex Z Data Directory", curr)
         if d:
             self.edit_analyze_raw_dir.setText(d)
-            self.load_available_analyze_plots()
+            self.on_load_analyze_sweep()
 
     def on_browse_analyze_iv_file(self):
         curr = self.edit_analyze_iv_file.text().strip() or "/data"
         f, _ = QFileDialog.getOpenFileName(self, "Select IV Curve File", curr, "NPZ Files (*.npz);;All Files (*)")
         if f:
             self.edit_analyze_iv_file.setText(f)
+            self.on_load_analyze_iv()
 
-    def on_browse_analyze_output_dir(self):
-        curr = self.edit_analyze_output_dir.text().strip() or "/data/Results/Complex_Z"
-        d = QFileDialog.getExistingDirectory(self, "Select Output Base Directory", curr)
-        if d:
-            self.edit_analyze_output_dir.setText(d)
-            self.load_available_analyze_plots()
+    def on_analyze_channel_changed(self):
+        if hasattr(self, "spin_analyze_pixel"):
+            self.spin_analyze_pixel.setValue(self.spin_analyze_channel.value())
+        if hasattr(self, "edit_analyze_raw_dir") and Path(self.edit_analyze_raw_dir.text().strip()).exists():
+            self.on_load_analyze_sweep()
 
-    def on_browse_analyze_g_file(self):
-        curr = self.edit_analyze_g_file.text().strip() or ""
-        f, _ = QFileDialog.getOpenFileName(self, "Select Precomputed G Data CSV", curr, "CSV Files (*.csv);;All Files (*)")
-        if f:
-            self.edit_analyze_g_file.setText(f)
+    def on_flip_bias_toggled(self):
+        self.on_load_analyze_sweep()
+
+    def on_load_analyze_iv(self):
+        iv_path = Path(self.edit_analyze_iv_file.text().strip())
+        if not iv_path.exists():
+            return
+        try:
+            ch = self.spin_analyze_channel.value()
+            self.analyze_iv_data = load_iv_curve(iv_path, channel_id=ch)
+            self.log_analyze("INFO", f"Loaded IV curve: Ch {ch}, Rn = {self.analyze_iv_data['rnormal']*1e3:.2f} mΩ from {iv_path.name}")
+            if self.combo_analyze_plot_view.currentText().startswith("IV"):
+                self.on_analyze_plot_view_changed()
+            else:
+                self.on_analyze_bias_changed()
+        except Exception as e:
+            self.log_analyze("ERROR", f"Failed loading IV curve: {e}")
+
+    def on_load_analyze_sweep(self):
+        raw_dir = Path(self.edit_analyze_raw_dir.text().strip())
+        if not raw_dir.exists():
+            self.log_analyze("ERROR", f"Complex Z directory does not exist: {raw_dir}")
+            return
+
+        ch = self.spin_analyze_channel.value()
+        flip = self.chk_analyze_flip_bias.isChecked()
+
+        try:
+            self.lbl_analyze_status.setText("STATUS: LOADING DATA...")
+            self.lbl_analyze_status.setStyleSheet("font-weight: bold; color: #82b1ff; font-size: 10pt;")
+            QApplication.processEvents()
+
+            # Ensure IV curve is loaded first
+            iv_path = Path(self.edit_analyze_iv_file.text().strip())
+            if iv_path.exists() and (self.analyze_iv_data is None or self.analyze_iv_data.get("channel_id") != ch):
+                self.analyze_iv_data = load_iv_curve(iv_path, channel_id=ch)
+
+            self.analyze_sweep_data = load_cz_sweep_dataset(raw_dir, channel_id=ch, flip_bias=flip)
+            n_biases = self.analyze_sweep_data["num_biases"]
+            self.log_analyze("INFO", f"Loaded {n_biases} bias points from {raw_dir.name} (Ch {ch}, tones={len(self.analyze_sweep_data['fs_sch'])})")
+
+            # Update bias points dropdown
+            self.combo_analyze_bias_points.blockSignals(True)
+            self.combo_analyze_bias_points.clear()
+
+            lookup = self.analyze_iv_data["lookup_op"] if self.analyze_iv_data else None
+
+            preferred_idx = 0
+            best_diff = 1e9
+
+            for i, vb in enumerate(self.analyze_sweep_data["bias_voltages"]):
+                if lookup:
+                    op = lookup(vb)
+                    label = f"{vb:.3f} V  ({op['rn_pct']:.1f}% Rn)"
+                    if abs(op["rn_pct"] - 35.0) < best_diff:
+                        best_diff = abs(op["rn_pct"] - 35.0)
+                        preferred_idx = i
+                else:
+                    label = f"{vb:.3f} V"
+                self.combo_analyze_bias_points.addItem(label, userData=vb)
+
+            self.combo_analyze_bias_points.addItem("< All Bias Points (Batch) >", userData=None)
+            self.combo_analyze_bias_points.setCurrentIndex(preferred_idx)
+            self.combo_analyze_bias_points.blockSignals(False)
+
+            self.lbl_analyze_status.setText(f"STATUS: LOADED ({n_biases} BIASES)")
+            self.lbl_analyze_status.setStyleSheet("font-weight: bold; color: #00e676; font-size: 10pt;")
+
+            self.on_analyze_bias_changed()
+
+        except Exception as e:
+            self.lbl_analyze_status.setText("STATUS: LOAD FAILED")
+            self.lbl_analyze_status.setStyleSheet("font-weight: bold; color: #ff1744; font-size: 10pt;")
+            self.log_analyze("ERROR", f"Failed loading sweep: {e}")
+
+    def on_analyze_bias_changed(self):
+        if not self.analyze_sweep_data or self.combo_analyze_bias_points.count() == 0:
+            return
+
+        selected_vb = self.combo_analyze_bias_points.currentData()
+        if selected_vb is None:
+            self.lbl_analyze_view_info.setText("Batch mode (< All Bias Points >)")
+            return
+
+        self.current_selected_bias = selected_vb
+        b_info = self.analyze_sweep_data["bias_points"].get(selected_vb)
+        if not b_info:
+            return
+
+        ch = self.spin_analyze_channel.value()
+        self.lbl_analyze_view_info.setText(f"Ch {ch} | Bias: {selected_vb:.3f} V")
+
+        # Update operating point from IV curve if available
+        if self.analyze_iv_data:
+            op = self.analyze_iv_data["lookup_op"](selected_vb)
+            self.lbl_analyze_op_info.setText(
+                f"Operating Point: Vbias = {selected_vb:.3f}V ({op['rn_pct']:.1f}% Rn) | "
+                f"R0 = {op['rtes']*1e3:.3f} mΩ | I0 = {op['ites']*1e6:.1f} µA | P0 = {op['p0']*1e12:.2f} pW"
+            )
+            # Update R0 in parameter table if frozen
+            if "R_0" in self.current_model_params and not self.current_model_params["R_0"].vary:
+                self.current_model_params["R_0"].value = op["rtes"] * 1e3
+                self.sync_param_to_table("R_0", op["rtes"] * 1e3)
+        else:
+            self.lbl_analyze_op_info.setText(f"Operating Point: Vbias = {selected_vb:.3f}V (No IV file loaded)")
+
+        self.current_fit_result = None
+        self.update_live_model_prediction()
+
+    def on_prev_bias_clicked(self):
+        idx = self.combo_analyze_bias_points.currentIndex()
+        if idx > 0:
+            self.combo_analyze_bias_points.setCurrentIndex(idx - 1)
+
+    def on_next_bias_clicked(self):
+        idx = self.combo_analyze_bias_points.currentIndex()
+        if idx < self.combo_analyze_bias_points.count() - 2:
+            self.combo_analyze_bias_points.setCurrentIndex(idx + 1)
+
+    def on_analyze_model_changed(self):
+        m_name = self.combo_analyze_model.currentText()
+        self.active_model = get_model(m_name)
+        old_params = self.current_model_params
+        new_params = self.active_model.get_parameter_defs()
+        for k, p in new_params.items():
+            if k in old_params:
+                p.value = old_params[k].value
+                p.vary = old_params[k].vary
+                p.min_val = old_params[k].min_val
+                p.max_val = old_params[k].max_val
+
+        self.current_model_params = new_params
+        self.current_fit_result = None
+        self.build_parameter_table()
+        self.update_live_model_prediction()
+
+    def build_parameter_table(self):
+        """Constructs dynamic table rows for the active thermal model."""
+        self.is_updating_params = True
+        self.table_analyze_params.setRowCount(0)
+        self.param_table_widgets = {}
+
+        params = self.current_model_params
+        self.table_analyze_params.setRowCount(len(params))
+
+        for r, (k, p) in enumerate(params.items()):
+            item_name = QTableWidgetItem(p.label)
+            item_name.setToolTip(p.description)
+            item_name.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
+            self.table_analyze_params.setItem(r, 0, item_name)
+
+            spin_val = QDoubleSpinBox()
+            spin_val.setDecimals(4 if p.value < 10 else 2)
+            spin_val.setRange(p.min_val, p.max_val)
+            spin_val.setSingleStep(max(p.value * 0.05, 0.001))
+            spin_val.setValue(p.value)
+            spin_val.valueChanged.connect(lambda v, name=k: self.on_table_param_value_changed(name, v))
+            self.table_analyze_params.setCellWidget(r, 1, spin_val)
+
+            chk_freeze = QCheckBox("Freeze")
+            chk_freeze.setChecked(not p.vary)
+            chk_freeze.toggled.connect(lambda chk, name=k: self.on_table_param_freeze_changed(name, chk))
+            self.table_analyze_params.setCellWidget(r, 2, chk_freeze)
+
+            spin_min = QDoubleSpinBox()
+            spin_min.setDecimals(4 if p.min_val < 10 else 2)
+            spin_min.setRange(0.0, 1e7)
+            spin_min.setValue(p.min_val)
+            spin_min.valueChanged.connect(lambda v, name=k: self.on_table_param_limit_changed(name, min_v=v))
+            self.table_analyze_params.setCellWidget(r, 3, spin_min)
+
+            spin_max = QDoubleSpinBox()
+            spin_max.setDecimals(4 if p.max_val < 10 else 2)
+            spin_max.setRange(0.0, 1e7)
+            spin_max.setValue(p.max_val)
+            spin_max.valueChanged.connect(lambda v, name=k: self.on_table_param_limit_changed(name, max_v=v))
+            self.table_analyze_params.setCellWidget(r, 4, spin_max)
+
+            lbl_err = QLabel("± --")
+            lbl_err.setStyleSheet("color: #90a4ae; font-size: 8pt; padding-left: 4px;")
+            self.table_analyze_params.setCellWidget(r, 5, lbl_err)
+
+            self.param_table_widgets[k] = {
+                "spin_val": spin_val,
+                "chk_freeze": chk_freeze,
+                "spin_min": spin_min,
+                "spin_max": spin_max,
+                "lbl_err": lbl_err,
+            }
+
+        self.is_updating_params = False
+
+    def sync_param_to_table(self, name: str, value: float):
+        if name in self.param_table_widgets:
+            spin = self.param_table_widgets[name]["spin_val"]
+            spin.blockSignals(True)
+            spin.setValue(value)
+            spin.blockSignals(False)
+
+    def on_table_param_value_changed(self, name: str, val: float):
+        if self.is_updating_params:
+            return
+        if name in self.current_model_params:
+            self.current_model_params[name].value = val
+        self.update_live_model_prediction()
+
+    def on_table_param_freeze_changed(self, name: str, is_frozen: bool):
+        if name in self.current_model_params:
+            self.current_model_params[name].vary = not is_frozen
+
+    def on_table_param_limit_changed(self, name: str, min_v: Optional[float] = None, max_v: Optional[float] = None):
+        if name in self.current_model_params:
+            if min_v is not None:
+                self.current_model_params[name].min_val = min_v
+            if max_v is not None:
+                self.current_model_params[name].max_val = max_v
+
+    def update_live_model_prediction(self):
+        """Instantaneously re-evaluates the theoretical model and updates plot."""
+        if not self.analyze_sweep_data or self.current_selected_bias is None:
+            return
+
+        b_info = self.analyze_sweep_data["bias_points"].get(self.current_selected_bias)
+        if not b_info:
+            return
+
+        f_data = b_info["f"]
+        z_data = b_info["z_tes"]
+
+        f_dense = np.geomspace(max(f_data[0] * 0.5, 1.0), max(f_data[-1] * 2.0, 1e5), 300)
+        p_vals = {k: p.value for k, p in self.current_model_params.items()}
+
+        try:
+            z_pred_dense = self.active_model.calc_z_tes(f_dense, p_vals)
+            derived = self.active_model.calc_derived(p_vals)
+
+            d_parts = []
+            if "P0_pW" in derived:
+                d_parts.append(f"P0={derived['P0_pW']:.2f} pW")
+            if "L_I" in derived:
+                d_parts.append(f"LI={derived['L_I']:.2f}")
+            if "tau_ms" in derived:
+                d_parts.append(f"τ={derived['tau_ms']:.2f} ms")
+            if "tau_I_ms" in derived and np.isfinite(derived["tau_I_ms"]):
+                d_parts.append(f"τ_I={derived['tau_I_ms']:.2f} ms")
+            if "tau_abs_ms" in derived:
+                d_parts.append(f"τ_abs={derived['tau_abs_ms']:.2f} ms")
+            self.lbl_analyze_derived.setText("Derived: " + " | ".join(d_parts) if d_parts else "Derived: --")
+
+            self.draw_analyze_plot(f_data, z_data, f_dense, z_pred_dense)
+        except Exception:
+            pass
+
+    def draw_analyze_plot(self, f_data, z_data, f_model=None, z_model=None):
+        mode_text = self.combo_analyze_plot_view.currentText()
+        vb = self.current_selected_bias or 0.0
+
+        if mode_text.startswith("Nyquist"):
+            z_fit = self.current_fit_result.z_dense if self.current_fit_result else None
+            f_fit = self.current_fit_result.f_dense if self.current_fit_result else None
+            self.analyze_canvas.plot_complex_z(
+                f_data, z_data, f_model=f_model, z_model=z_model,
+                f_fit=f_fit, z_fit=z_fit,
+                plot_mode="nyquist",
+                title=f"Nyquist Plot: Vbias = {vb:.3f} V ({self.active_model.name})",
+            )
+        elif mode_text.startswith("Bode"):
+            z_fit = self.current_fit_result.z_dense if self.current_fit_result else None
+            f_fit = self.current_fit_result.f_dense if self.current_fit_result else None
+            self.analyze_canvas.plot_complex_z(
+                f_data, z_data, f_model=f_model, z_model=z_model,
+                f_fit=f_fit, z_fit=z_fit,
+                plot_mode="bode",
+                title=f"Frequency Response: Vbias = {vb:.3f} V",
+            )
+        elif mode_text.startswith("Admittance"):
+            z_fit = self.current_fit_result.z_dense if self.current_fit_result else None
+            f_fit = self.current_fit_result.f_dense if self.current_fit_result else None
+            self.analyze_canvas.plot_complex_z(
+                f_data, z_data, f_model=f_model, z_model=z_model,
+                f_fit=f_fit, z_fit=z_fit,
+                plot_mode="admittance",
+                title=f"Admittance Y(f): Vbias = {vb:.3f} V",
+            )
+        elif mode_text.startswith("Residuals"):
+            z_fit = self.current_fit_result.z_dense if self.current_fit_result else z_model
+            self.analyze_canvas.plot_complex_z(
+                f_data, z_data, f_model=f_model, z_model=z_model,
+                f_fit=f_model, z_fit=z_fit,
+                plot_mode="residuals",
+                title=f"Fit Residuals: Vbias = {vb:.3f} V",
+            )
+        elif mode_text.startswith("IV"):
+            if self.analyze_iv_data:
+                self.analyze_canvas.plot_iv(
+                    self.analyze_iv_data["vbias"],
+                    self.analyze_iv_data["ites"],
+                    self.analyze_iv_data["rtes"],
+                    selected_bias=vb,
+                    rnormal=self.analyze_iv_data.get("rnormal"),
+                )
+            else:
+                self.analyze_canvas.show_placeholder("No IV curve loaded. Browse to an IV file to view.")
+
+    def on_analyze_plot_view_changed(self):
+        if self.analyze_sweep_data and self.current_selected_bias is not None:
+            self.update_live_model_prediction()
+        elif self.combo_analyze_plot_view.currentText().startswith("IV"):
+            if self.analyze_iv_data:
+                self.analyze_canvas.plot_iv(
+                    self.analyze_iv_data["vbias"],
+                    self.analyze_iv_data["ites"],
+                    self.analyze_iv_data["rtes"],
+                    selected_bias=self.current_selected_bias,
+                    rnormal=self.analyze_iv_data.get("rnormal"),
+                )
+
+    def on_fit_model_clicked(self):
+        """Runs fast, stable bounded least-squares fit on selected bias point."""
+        if not self.analyze_sweep_data or self.current_selected_bias is None:
+            QMessageBox.warning(self, "No Data", "Please load a Complex Z sweep first.")
+            return
+
+        b_info = self.analyze_sweep_data["bias_points"].get(self.current_selected_bias)
+        if not b_info:
+            return
+
+        f_data = b_info["f"]
+        z_data = b_info["z_tes"]
+
+        t0 = time.time()
+        self.lbl_analyze_status.setText("STATUS: FITTING...")
+        self.lbl_analyze_status.setStyleSheet("font-weight: bold; color: #ffb74d; font-size: 10pt;")
+        QApplication.processEvents()
+
+        res = self.active_model.fit(f_data, z_data, self.current_model_params)
+        elapsed_ms = (time.time() - t0) * 1000.0
+
+        if res.success:
+            self.current_fit_result = res
+            self.lbl_analyze_status.setText(f"STATUS: FIT CONVERGED ({elapsed_ms:.1f} ms, χ²={res.chi2:.2e})")
+            self.lbl_analyze_status.setStyleSheet("font-weight: bold; color: #00e676; font-size: 10pt;")
+
+            self.is_updating_params = True
+            for k, p in res.params.items():
+                if k in self.param_table_widgets:
+                    spin = self.param_table_widgets[k]["spin_val"]
+                    spin.blockSignals(True)
+                    spin.setValue(p.value)
+                    spin.blockSignals(False)
+
+                    err = res.errors.get(k, 0.0)
+                    lbl_e = self.param_table_widgets[k]["lbl_err"]
+                    if p.vary and err > 0:
+                        lbl_e.setText(f"± {err:.3f}")
+                    else:
+                        lbl_e.setText("± --")
+            self.is_updating_params = False
+
+            vb = self.current_selected_bias
+            self.log_analyze("INFO", f"=== Fit OK: Vbias={vb:.3f}V ({self.active_model.name}) ===")
+            for k, p in res.params.items():
+                err = res.errors.get(k, 0.0)
+                status = f"± {err:.3f}" if p.vary else "[FROZEN]"
+                self.log_analyze("INFO", f"  {k}: {p.value:.4f} {p.unit} {status}")
+            self.log_analyze("INFO", f"  Convergence: {res.nfev} evals in {elapsed_ms:.1f} ms | redchi={res.redchi:.3e}")
+
+            self.update_live_model_prediction()
+        else:
+            self.lbl_analyze_status.setText("STATUS: FIT FAILED")
+            self.lbl_analyze_status.setStyleSheet("font-weight: bold; color: #ff1744; font-size: 10pt;")
+            self.log_analyze("ERROR", f"Fit failed: {res.message}")
+
+    def on_fit_all_biases_clicked(self):
+        """Batch fits all bias points across the transition and exports results."""
+        if not self.analyze_sweep_data:
+            QMessageBox.warning(self, "No Data", "Please load a Complex Z sweep first.")
+            return
+
+        voltages = self.analyze_sweep_data["bias_voltages"]
+        if not voltages:
+            return
+
+        raw_dir = Path(self.edit_analyze_raw_dir.text().strip())
+        out_dir = raw_dir / "analysis" if self.chk_analyze_save_in_raw.isChecked() else Path("/data/Results/Complex_Z")
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        ch = self.spin_analyze_channel.value()
+        self.btn_fit_all_biases.setEnabled(False)
+        self.btn_fit_model.setEnabled(False)
+        self.prog_analyze.setValue(0)
+
+        self.log_analyze("INFO", f"Starting batch fit across {len(voltages)} bias points using {self.active_model.name}...")
+        results_rows = []
+
+        try:
+            import pandas as pd
+            for idx, vb in enumerate(voltages):
+                b_info = self.analyze_sweep_data["bias_points"].get(vb)
+                if not b_info:
+                    continue
+
+                f_d = b_info["f"]
+                z_d = b_info["z_tes"]
+
+                if self.analyze_iv_data:
+                    op = self.analyze_iv_data["lookup_op"](vb)
+                    if "R_0" in self.current_model_params:
+                        self.current_model_params["R_0"].value = op["rtes"] * 1e3
+
+                res = self.active_model.fit(f_d, z_d, self.current_model_params)
+                if res.success:
+                    row = {"Vbias_V": vb, "success": True, "chi2": res.chi2, "redchi": res.redchi}
+                    for k, p in res.params.items():
+                        row[k] = p.value
+                        row[f"{k}_err"] = res.errors.get(k, 0.0)
+                    for dk, dv in res.derived.items():
+                        row[dk] = dv
+                    results_rows.append(row)
+
+                prog = int((idx + 1) / len(voltages) * 100)
+                self.prog_analyze.setValue(prog)
+                self.lbl_analyze_status.setText(f"BATCH FIT: {idx+1}/{len(voltages)} ({vb:.3f}V)")
+                QApplication.processEvents()
+
+            if results_rows:
+                df = pd.DataFrame(results_rows)
+                csv_path = out_dir / f"fit_summary_Ch{ch}_{self.active_model.name.split()[0]}.csv"
+                df.to_csv(csv_path, index=False)
+                self.log_analyze("INFO", f"Batch fit complete! {len(results_rows)} points fitted.")
+                self.log_analyze("INFO", f"Saved summary CSV to: {csv_path}")
+                self.lbl_analyze_status.setText("STATUS: BATCH FIT COMPLETE")
+                self.lbl_analyze_status.setStyleSheet("font-weight: bold; color: #00e676; font-size: 10pt;")
+            else:
+                self.lbl_analyze_status.setText("STATUS: NO FITS CONVERGED")
+                self.lbl_analyze_status.setStyleSheet("font-weight: bold; color: #ff1744; font-size: 10pt;")
+
+        except Exception as e:
+            self.log_analyze("ERROR", f"Batch fit failed: {e}")
+        finally:
+            self.btn_fit_all_biases.setEnabled(True)
+            self.btn_fit_model.setEnabled(True)
+
+    def on_save_analysis_clicked(self):
+        """Saves current plot and parameter JSON into <Complex_Z_Dir>/analysis/."""
+        raw_dir = Path(self.edit_analyze_raw_dir.text().strip())
+        out_dir = raw_dir / "analysis" if self.chk_analyze_save_in_raw.isChecked() else Path("/data/Results/Complex_Z")
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        ch = self.spin_analyze_channel.value()
+        vb = self.current_selected_bias or 0.0
+
+        fig_path = out_dir / f"Ch{ch}_Vbias_{vb:.3f}V_ComplexZ_fit.png"
+        self.analyze_canvas.fig.savefig(fig_path, dpi=200, bbox_inches="tight")
+
+        param_dict = {
+            "vbias": vb,
+            "channel": ch,
+            "model": self.active_model.name,
+            "params": {k: {"value": p.value, "vary": p.vary, "unit": p.unit, "error": self.current_fit_result.errors.get(k, 0.0) if self.current_fit_result else 0.0}
+                       for k, p in self.current_model_params.items()},
+        }
+        json_path = out_dir / f"Ch{ch}_Vbias_{vb:.3f}V_parameters.json"
+        with open(json_path, "w") as f:
+            json.dump(param_dict, f, indent=2)
+
+        self.log_analyze("INFO", f"Saved plot to: {fig_path.name}")
+        self.log_analyze("INFO", f"Saved parameters to: {json_path.name}")
+        QMessageBox.information(self, "Saved", f"Analysis results saved to:\n{out_dir}")
 
     def on_open_analyze_dir(self):
-        output_base = Path(self.edit_analyze_output_dir.text().strip())
-        pixel_id = self.spin_analyze_pixel.value()
-        pixel_dir = output_base / f"Pixel_{pixel_id}"
-        target = pixel_dir if pixel_dir.exists() else output_base
+        raw_dir = Path(self.edit_analyze_raw_dir.text().strip())
+        target = raw_dir / "analysis" if self.chk_analyze_save_in_raw.isChecked() else raw_dir
         if not target.exists():
             target.mkdir(parents=True, exist_ok=True)
         try:
@@ -2809,9 +3399,6 @@ class CZMainWindow(QMainWindow):
                 subprocess.Popen(["xdg-open", str(target)])
         except Exception as e:
             self.log_analyze("ERROR", f"Could not open directory: {e}")
-
-    def on_analyze_channel_changed(self):
-        self.spin_analyze_pixel.setValue(self.spin_analyze_channel.value())
 
     def log_analyze(self, level, message):
         color_map = {
@@ -2830,131 +3417,6 @@ class CZMainWindow(QMainWindow):
         self.txt_analyze_log.verticalScrollBar().setValue(
             self.txt_analyze_log.verticalScrollBar().maximum()
         )
-
-    def on_run_analyze_clicked(self):
-        raw_dir = self.edit_analyze_raw_dir.text().strip()
-        iv_file = self.edit_analyze_iv_file.text().strip()
-        output_dir = self.edit_analyze_output_dir.text().strip()
-
-        if not raw_dir or not Path(raw_dir).exists():
-            QMessageBox.critical(self, "Invalid Path", f"Raw data directory does not exist:\n{raw_dir}")
-            return
-        if not iv_file or not Path(iv_file).exists():
-            QMessageBox.critical(self, "Invalid Path", f"IV curve file does not exist:\n{iv_file}")
-            return
-
-        chan_id = self.spin_analyze_channel.value()
-        pixel_id = self.spin_analyze_pixel.value()
-
-        cmd = [
-            sys.executable, "-u", "-m", "ez_cz.analyze",
-            "--raw-dir", raw_dir,
-            "--iv-file", iv_file,
-            "--channel-id", str(chan_id),
-            "--pixel-map", f"{chan_id}:{pixel_id}",
-            "--output-base-dir", output_dir,
-            "--rbias-iv", str(self.spin_analyze_rbias.value()),
-            "--rshunt-uohm", str(self.spin_analyze_rshunt.value()),
-            "--l-nyq-nh", str(self.spin_analyze_lnyq.value()),
-            "--tc", str(self.spin_analyze_tc.value()),
-            "--tbath", str(self.spin_analyze_tbath.value()),
-            "--n-thermal", str(self.spin_analyze_n.value()),
-            "--dummy-g-tes-b", str(self.spin_analyze_dummy_g.value()),
-        ]
-
-        if not self.chk_analyze_auto_tau.isChecked():
-            cmd.extend(["--zero-bias-time-shift", str(self.spin_analyze_tau.value())])
-
-        if self.chk_analyze_flip_bias.isChecked():
-            cmd.append("--flip-bias")
-
-        g_file = self.edit_analyze_g_file.text().strip()
-        if g_file and Path(g_file).exists():
-            cmd.extend(["--g-data-file", g_file])
-
-        if self.chk_analyze_save_plots.isChecked():
-            cmd.append("--save-plots")
-        else:
-            cmd.append("--no-save-plots")
-
-        self.btn_run_analyze.setEnabled(False)
-        self.btn_abort_analyze.setEnabled(True)
-        self.lbl_analyze_status.setText("STATUS: RUNNING...")
-        self.lbl_analyze_status.setStyleSheet("font-weight: bold; color: #00e676; font-size: 11pt;")
-        self.prog_analyze.setValue(0)
-        self.txt_analyze_log.clear()
-
-        self.analyze_worker = AnalyzeWorker(cmd, output_dir)
-        self.analyze_worker.log_signal.connect(self.log_analyze)
-        self.analyze_worker.status_signal.connect(self.lbl_analyze_status.setText)
-        self.analyze_worker.progress_signal.connect(self.prog_analyze.setValue)
-        self.analyze_worker.finished_signal.connect(self.on_analyze_finished)
-        self.analyze_worker.start()
-
-    def on_abort_analyze_clicked(self):
-        if self.analyze_worker and self.analyze_worker.isRunning():
-            self.log_analyze("WARN", "Aborting analysis process...")
-            self.analyze_worker.abort()
-            self.btn_abort_analyze.setEnabled(False)
-
-    def on_analyze_finished(self, success, message):
-        self.btn_run_analyze.setEnabled(True)
-        self.btn_abort_analyze.setEnabled(False)
-        if success:
-            self.lbl_analyze_status.setText("STATUS: COMPLETE")
-            self.lbl_analyze_status.setStyleSheet("font-weight: bold; color: #00e676; font-size: 11pt;")
-            self.log_analyze("INFO", f"Analysis completed successfully. Output in {message}")
-            self.load_available_analyze_plots()
-            if 3 in self.analyze_plot_files:
-                self.combo_analyze_plots.setCurrentIndex(3)
-            elif 4 in self.analyze_plot_files:
-                self.combo_analyze_plots.setCurrentIndex(4)
-            elif 0 in self.analyze_plot_files:
-                self.combo_analyze_plots.setCurrentIndex(0)
-        else:
-            self.lbl_analyze_status.setText("STATUS: FAILED / ABORTED")
-            self.lbl_analyze_status.setStyleSheet("font-weight: bold; color: #ff1744; font-size: 11pt;")
-            self.log_analyze("ERROR", f"Analysis ended: {message}")
-
-    def load_available_analyze_plots(self):
-        output_base = Path(self.edit_analyze_output_dir.text().strip())
-        pixel_id = self.spin_analyze_pixel.value()
-        pixel_dir = output_base / f"Pixel_{pixel_id}"
-
-        self.analyze_plot_files = {}
-        if pixel_dir.exists():
-            for idx, (label, suffix) in enumerate(ANALYZE_PLOT_TYPES):
-                matches = list(pixel_dir.glob(f"*{suffix}"))
-                if matches:
-                    self.analyze_plot_files[idx] = matches[0]
-
-        self.on_analyze_plot_selected()
-
-    def on_analyze_plot_selected(self):
-        idx = self.combo_analyze_plots.currentIndex()
-        if idx in self.analyze_plot_files:
-            file_path = self.analyze_plot_files[idx]
-            self.analyze_canvas.display_image(file_path)
-            self.lbl_plot_filename.setText(f"Displaying: {file_path.name}")
-        else:
-            output_base = Path(self.edit_analyze_output_dir.text().strip())
-            pixel_id = self.spin_analyze_pixel.value()
-            pixel_dir = output_base / f"Pixel_{pixel_id}"
-            label, suffix = ANALYZE_PLOT_TYPES[idx]
-            self.analyze_canvas.show_placeholder(
-                f"Plot '{label}' not found.\nExpected in:\n{pixel_dir}"
-            )
-            self.lbl_plot_filename.setText("Plot file not found on disk")
-
-    def on_prev_plot_clicked(self):
-        cur = self.combo_analyze_plots.currentIndex()
-        if cur > 0:
-            self.combo_analyze_plots.setCurrentIndex(cur - 1)
-
-    def on_next_plot_clicked(self):
-        cur = self.combo_analyze_plots.currentIndex()
-        if cur < self.combo_analyze_plots.count() - 1:
-            self.combo_analyze_plots.setCurrentIndex(cur + 1)
 
     # -----------------------------------------------------------------------
     # Action Button Handlers

@@ -168,60 +168,47 @@ EZ-CZ/
 
 ---
 
-## Installation & Requirements
+## Installation
 
-### Recommended Setup (using `uv`)
+Installation is as simple as running:
 
 ```bash
-# Clone the repository
 git clone https://github.com/and-roy-d/EZ-CZ.git
 cd EZ-CZ
-
-# Create virtual environment and install in editable mode
-uv sync
+pip install -e .
 ```
 
-### Run `ez-cz-*` From Any Terminal (Without Touching Other Environments)
+This installs EZ-CZ into your active Python environment in editable mode and registers the command-line entry points:
+- `ez-cz-gui`: Interactive graphical user interface (Measure & Analyze tabs)
+- `ez-cz-measure`: Terminal automation for multi-sine impedance sweeps
+- `ez-cz-analyze`: Thermal impedance analysis and batch fitting
 
-`uv sync` installs EZ-CZ into its own private `.venv/` inside this folder, so the
-`ez-cz-gui`, `ez-cz-measure`, and `ez-cz-analyze` commands only exist in
-`.venv/bin/` and are **not** on your `PATH` by default.
+*(Optional: if you prefer using `uv`, you can run `uv pip install -e .` or `uv sync`)*.
 
-To launch them from any terminal, **even while another environment such as `~/daq`
-is activated**, symlink the three entry points into `~/.local/bin`. That folder is
-already on `PATH` on most Linux setups:
+---
 
-```bash
-cd ~/Downloads/EZ-CZ-master          # adjust to wherever this repo lives
-mkdir -p ~/.local/bin
-for c in ez-cz-gui ez-cz-measure ez-cz-analyze; do
-    ln -sfn "$PWD/.venv/bin/$c" ~/.local/bin/$c
-done
+## Thermal Impedance Models (MDT Integration)
 
-# Verify (open a new terminal first if ~/.local/bin was just created)
-which ez-cz-gui        # -> ~/.local/bin/ez-cz-gui
-ez-cz-gui
-```
+EZ-CZ includes self-contained implementations of the thermal models from the NIST `microcal_design_tools` (MDT) suite, eliminating any private repository dependencies. All models are available directly in the Analyze GUI dropdown and CLI:
 
-Why this is safe:
-- Each script's shebang hard-codes `.venv/bin/python` from this repo, so it always
-  runs with EZ-CZ's own Python and packages, whatever environment is active.
-- Nothing gets installed into, or changed in, any other environment (for example
-  `~/daq`), and it doesn't need `source .venv/bin/activate`.
-- The install is editable, so changes to `src/ez_cz/*.py` take effect immediately.
+1. **Simple (1-body)** (`TES_Simple`):
+   TES heat capacity $C_{\text{tes}}$ coupled directly to the thermal bath via thermal conductance $G_{\text{tes\_bath}}$.
+2. **Dangling / Hanging (2-body)** (`TES_Dangling`):
+   TES heat capacity $C_{\text{tes}}$ coupled to bath with an internal dangling absorber heat capacity $C_{\text{abs}}$ connected via internal conductance $G_{\text{abs\_tes}}$.
+3. **Intervening (2-body)** (`TES_Intervening`):
+   TES heat capacity $C_{\text{tes}}$ coupled to an intermediate stage $C_{\text{int}}$, which in turn connects to the bath.
+4. **Intermediate + Dangling (3-body)** (`TES_Inter_Dangle`):
+   3-body model incorporating TES, intermediate thermal stage, and hanging absorber.
+5. **Two-Fluid Model** (`TES_TwoFluid`):
+   Phenomenological two-fluid model parameterizing superconducting fraction $w_L$ and dynamic resistance.
 
-If `~/.local/bin` is not on your `PATH`, add this line to `~/.bashrc`, then open a
-new terminal:
-
-```bash
-export PATH="$HOME/.local/bin:$PATH"
-```
-
-> **Note:** If you move or re-clone this folder, re-run the `ln -sfn` loop above,
-> because the symlinks point to the absolute `.venv` path. To uninstall, run
-> `rm ~/.local/bin/ez-cz-{gui,measure,analyze}`.
-
-#### Installing extra packages (e.g. lab hardware drivers) into EZ-CZ only
+### Interactive Model Fitting in the GUI
+- **Dynamic Parameter Table**: Text boxes and numeric controls dynamically adapt to the selected model.
+- **Freeze / Float Flexibility**: Every parameter ($C$, $G$, $L$, $R_{\text{shunt}}$, $\alpha$, $\beta$, $T_c$, $T_{\text{bath}}$, $R_0$) has an individual **Freeze** checkbox to lock or float it during optimization.
+- **Physical Bounds**: User-specifiable **Min** and **Max** limits for every variable.
+- **Instantaneous Model Prediction**: The predicted theoretical curve updates on the plot in real time (< 1 ms) as any parameter is adjusted.
+- **Fast, Stable Fitter**: Bounded non-linear least squares converges in 10–30 ms with 1-sigma uncertainty ($\pm$) estimates.
+- **Automatic Output Archiving**: Fit summaries (CSV), high-resolution figures (PNG), and parameter exports (JSON) can be automatically saved directly inside `<Complex_Z_Dir>/analysis/`.
 
 Always target this repo's `.venv`. Never use a bare `pip install`, which would go
 into whatever environment is currently active (e.g. `~/daq`):
