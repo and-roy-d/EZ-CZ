@@ -237,7 +237,7 @@ def main():
         help="List of channel_id:pixel_number mapping items (default: %(default)s)."
     )
     parser.add_argument(
-        "--rbias-iv", type=float, default=get_default("rbias_iv", 2000.0),
+        "--rbias-iv", type=float, default=get_default("rbias_iv", 1000.0),
         help="Rbias used during IV curve in Ohms (default: %(default)s)."
     )
     parser.add_argument(

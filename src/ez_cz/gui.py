@@ -1969,9 +1969,14 @@ class CZMainWindow(QMainWindow):
         self.btn_browse_analyze_iv = QPushButton("Browse")
         self.btn_browse_analyze_iv.setFixedWidth(75)
         self.btn_browse_analyze_iv.clicked.connect(self.on_browse_analyze_iv_file)
+        self.btn_load_analyze_iv = QPushButton("Load IV")
+        self.btn_load_analyze_iv.setFixedWidth(75)
+        self.btn_load_analyze_iv.setStyleSheet("background-color: #0277bd; color: #ffffff; font-weight: bold;")
+        self.btn_load_analyze_iv.clicked.connect(self.on_load_analyze_iv)
         iv_h = QHBoxLayout()
         iv_h.addWidget(self.edit_analyze_iv_file)
         iv_h.addWidget(self.btn_browse_analyze_iv)
+        iv_h.addWidget(self.btn_load_analyze_iv)
         data_layout.addLayout(iv_h, 1, 1, 1, 3)
 
         data_layout.addWidget(QLabel("Channel ID:"), 2, 0)
@@ -1981,11 +1986,22 @@ class CZMainWindow(QMainWindow):
         self.spin_analyze_channel.valueChanged.connect(self.on_analyze_channel_changed)
         data_layout.addWidget(self.spin_analyze_channel, 2, 1)
 
-        data_layout.addWidget(QLabel("Bias Point:"), 2, 2)
+        data_layout.addWidget(QLabel("Rbias:"), 2, 2)
+        self.spin_analyze_rbias = QDoubleSpinBox()
+        self.spin_analyze_rbias.setRange(1.0, 1000000.0)
+        self.spin_analyze_rbias.setDecimals(1)
+        self.spin_analyze_rbias.setSingleStep(50.0)
+        self.spin_analyze_rbias.setValue(1000.0)
+        self.spin_analyze_rbias.setSuffix(" Ω")
+        self.spin_analyze_rbias.setKeyboardTracking(False)
+        self.spin_analyze_rbias.valueChanged.connect(self.on_load_analyze_iv)
+        data_layout.addWidget(self.spin_analyze_rbias, 2, 3)
+
+        data_layout.addWidget(QLabel("Bias Point:"), 3, 0)
         self.combo_analyze_bias_points = QComboBox()
         self.combo_analyze_bias_points.addItem("Click 'Load Sweep' to populate")
         self.combo_analyze_bias_points.currentIndexChanged.connect(self.on_analyze_bias_changed)
-        data_layout.addWidget(self.combo_analyze_bias_points, 2, 3)
+        data_layout.addWidget(self.combo_analyze_bias_points, 3, 1, 1, 3)
 
         flags_h = QHBoxLayout()
         self.chk_analyze_flip_bias = QCheckBox("Flip bias (ensure Re(Z) > 0 at DC)")
@@ -1996,7 +2012,7 @@ class CZMainWindow(QMainWindow):
         self.chk_analyze_save_in_raw = QCheckBox("Save in <Complex_Z_Dir>/analysis/")
         self.chk_analyze_save_in_raw.setChecked(True)
         flags_h.addWidget(self.chk_analyze_save_in_raw)
-        data_layout.addLayout(flags_h, 3, 0, 1, 4)
+        data_layout.addLayout(flags_h, 4, 0, 1, 4)
 
         left_layout.addWidget(data_box)
 
@@ -3142,6 +3158,8 @@ class CZMainWindow(QMainWindow):
                 self.edit_analyze_iv_file.setText(str(a["iv_file"]))
             if "channel_id" in a and hasattr(self, "spin_analyze_channel"):
                 self.spin_analyze_channel.setValue(int(a["channel_id"]))
+            if ("rbias" in a or "rbias_iv" in a) and hasattr(self, "spin_analyze_rbias"):
+                self.spin_analyze_rbias.setValue(float(a.get("rbias", a.get("rbias_iv", 1000.0))))
             if "flip_bias" in a and hasattr(self, "chk_analyze_flip_bias"):
                 self.chk_analyze_flip_bias.setChecked(bool(a["flip_bias"]))
             if "save_in_raw" in a and hasattr(self, "chk_analyze_save_in_raw"):
@@ -3207,6 +3225,8 @@ class CZMainWindow(QMainWindow):
             analyze_cfg["iv_file"] = self.edit_analyze_iv_file.text().strip()
         if hasattr(self, "spin_analyze_channel"):
             analyze_cfg["channel_id"] = self.spin_analyze_channel.value()
+        if hasattr(self, "spin_analyze_rbias"):
+            analyze_cfg["rbias_iv"] = self.spin_analyze_rbias.value()
         if hasattr(self, "chk_analyze_flip_bias"):
             analyze_cfg["flip_bias"] = self.chk_analyze_flip_bias.isChecked()
         if hasattr(self, "combo_analyze_model"):
@@ -3272,8 +3292,25 @@ class CZMainWindow(QMainWindow):
             return
         try:
             ch = self.spin_analyze_channel.value()
-            self.analyze_iv_data = load_iv_curve(iv_path, channel_id=ch)
-            self.log_analyze("INFO", f"Loaded IV curve: Ch {ch}, Rn = {self.analyze_iv_data['rnormal']*1e3:.2f} mΩ from {iv_path.name}")
+            rbias = self.spin_analyze_rbias.value() if hasattr(self, "spin_analyze_rbias") else 1000.0
+            self.analyze_iv_data = load_iv_curve(iv_path, rbias=rbias, channel_id=ch)
+            self.log_analyze("INFO", f"Loaded IV curve: Ch {ch}, Rbias = {rbias:.0f} Ω, Rn = {self.analyze_iv_data['rnormal']*1e3:.2f} mΩ from {iv_path.name}")
+            if self.analyze_sweep_data:
+                curr_idx = self.combo_analyze_bias_points.currentIndex()
+                self.combo_analyze_bias_points.blockSignals(True)
+                self.combo_analyze_bias_points.clear()
+                lookup = self.analyze_iv_data["lookup_op"]
+                for vb in self.analyze_sweep_data["bias_voltages"]:
+                    op = lookup(vb)
+                    label = f"{vb:.3f} V  ({op['rn_pct']:.1f}% Rn)"
+                    self.combo_analyze_bias_points.addItem(label, userData=vb)
+                self.combo_analyze_bias_points.addItem("< All Bias Points (Batch) >", userData=None)
+                if 0 <= curr_idx < self.combo_analyze_bias_points.count():
+                    self.combo_analyze_bias_points.setCurrentIndex(curr_idx)
+                else:
+                    self.combo_analyze_bias_points.setCurrentIndex(0)
+                self.combo_analyze_bias_points.blockSignals(False)
+
             if self.combo_analyze_plot_view.currentText().startswith("IV"):
                 self.on_analyze_plot_view_changed()
             else:
@@ -3297,8 +3334,13 @@ class CZMainWindow(QMainWindow):
 
             # Ensure IV curve is loaded first
             iv_path = Path(self.edit_analyze_iv_file.text().strip())
-            if iv_path.exists() and (self.analyze_iv_data is None or self.analyze_iv_data.get("channel_id") != ch):
-                self.analyze_iv_data = load_iv_curve(iv_path, channel_id=ch)
+            rbias = self.spin_analyze_rbias.value() if hasattr(self, "spin_analyze_rbias") else 1000.0
+            if iv_path.exists() and (
+                self.analyze_iv_data is None
+                or self.analyze_iv_data.get("channel_id") != ch
+                or self.analyze_iv_data.get("rbias") != rbias
+            ):
+                self.analyze_iv_data = load_iv_curve(iv_path, rbias=rbias, channel_id=ch)
 
             self.analyze_sweep_data = load_cz_sweep_dataset(raw_dir, channel_id=ch, flip_bias=flip)
             n_biases = self.analyze_sweep_data["num_biases"]
@@ -3429,7 +3471,10 @@ class CZMainWindow(QMainWindow):
                 return
             p_tes_W = val * 1e-12
 
-        t_tes_pred = predict_ttes(p_tes_W, g_W_per_K, n_val, tbath_K)
+        tc_cap = 0.045
+        if "T_tes" in self.current_model_params and self.current_model_params["T_tes"].max_val:
+            tc_cap = self.current_model_params["T_tes"].max_val
+        t_tes_pred = min(predict_ttes(p_tes_W, g_W_per_K, n_val, tbath_K, Tc_max_K=tc_cap), tc_cap)
 
         if "T_tes" in self.current_model_params:
             self.current_model_params["T_tes"].value = t_tes_pred
@@ -3571,8 +3616,11 @@ class CZMainWindow(QMainWindow):
                 g_val = g_param.value * 1e-9
                 n_val = self.current_model_params["n_mem"].value if "n_mem" in self.current_model_params else 3.5
                 tb_val = self.current_model_params["T_bath"].value if "T_bath" in self.current_model_params else 0.020
+                tc_cap = 0.045
+                if "T_tes" in self.current_model_params and self.current_model_params["T_tes"].max_val:
+                    tc_cap = self.current_model_params["T_tes"].max_val
                 try:
-                    ttes_k = predict_ttes(p0_w, g_val, n_val, tb_val)
+                    ttes_k = min(predict_ttes(p0_w, g_val, n_val, tb_val, Tc_max_K=tc_cap), tc_cap)
                     if "T_tes" in self.current_model_params:
                         self.current_model_params["T_tes"].value = ttes_k
                         self.sync_param_to_table("T_tes", ttes_k)
@@ -3999,8 +4047,11 @@ class CZMainWindow(QMainWindow):
                     g_val = g_param.value * 1e-9
                     n_val = self.current_model_params["n_mem"].value if "n_mem" in self.current_model_params else 3.5
                     tb_val = self.current_model_params["T_bath"].value if "T_bath" in self.current_model_params else 0.020
+                    tc_cap = 0.045
+                    if "T_tes" in self.current_model_params and self.current_model_params["T_tes"].max_val:
+                        tc_cap = self.current_model_params["T_tes"].max_val
                     try:
-                        ttes_k = predict_ttes(p0_w, g_val, n_val, tb_val)
+                        ttes_k = min(predict_ttes(p0_w, g_val, n_val, tb_val, Tc_max_K=tc_cap), tc_cap)
                         self.current_model_params["T_tes"].value = ttes_k
                     except Exception:
                         pass

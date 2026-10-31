@@ -45,7 +45,7 @@ def Rtes(ibias: np.ndarray, ites: np.ndarray, Rshunt: float = 250e-6) -> np.ndar
 
 def load_iv_curve(
     iv_file_path: Path,
-    rbias: float = 2000.0,
+    rbias: float = 1000.0,
     channel_id: int = 63,
     rshunt: float = 250e-6,
     correct_shift: bool = True,
@@ -120,6 +120,7 @@ def load_iv_curve(
         "rtes": rtes_full,
         "rnormal": rnormal,
         "channel_id": channel_id,
+        "rbias": rbias,
         "lookup_op": lookup_op,
     }
 

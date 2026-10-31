@@ -63,7 +63,7 @@ class FitResult:
     z_total_dense: Optional[np.ndarray] = None
 
 
-def predict_ttes(P_tes_W: float, G_W_per_K: float, n: float, T_bath_K: float) -> float:
+def predict_ttes(P_tes_W: float, G_W_per_K: float, n: float, T_bath_K: float, Tc_max_K: float = 0.045) -> float:
     """
     Predicts TES temperature T_tes (in Kelvin) from steady-state power balance:
         P_tes = (G / n) * T_tes * (1 - (T_bath / T_tes)^n)
@@ -72,10 +72,13 @@ def predict_ttes(P_tes_W: float, G_W_per_K: float, n: float, T_bath_K: float) ->
         G_W_per_K: Thermal conductance dP/dT at T_tes in W/K (e.g. G_tes_bath * 1e-9)
         n: Thermal conductance exponent n_mem (dimensionless, typically 3-4)
         T_bath_K: Bath temperature in Kelvin (T_bath)
+        Tc_max_K: Critical temperature ceiling in Kelvin (default 0.045 K = 45 mK for ch63).
+                 Within transition, T_tes cannot exceed Tc.
     """
     T_bath_K = max(T_bath_K, 1e-4)
+    Tc_max_K = max(Tc_max_K, T_bath_K)
     if P_tes_W <= 0 or G_W_per_K <= 0 or n <= 0:
-        return float(T_bath_K)
+        return float(min(T_bath_K, Tc_max_K))
     t_guess = (n * P_tes_W) / G_W_per_K
     low = max(T_bath_K * 1.000001, 1e-4)
     high = max(T_bath_K + t_guess * 5.0, 2.0)
@@ -85,7 +88,8 @@ def predict_ttes(P_tes_W: float, G_W_per_K: float, n: float, T_bath_K: float) ->
 
     try:
         from scipy.optimize import brentq
-        return float(brentq(func, low, high, xtol=1e-7, maxiter=100))
+        sol = float(brentq(func, low, high, xtol=1e-7, maxiter=100))
+        return float(min(sol, Tc_max_K))
     except Exception:
         # Fallback fixed-point iteration
         T = max(t_guess, T_bath_K * 1.2)
@@ -93,9 +97,9 @@ def predict_ttes(P_tes_W: float, G_W_per_K: float, n: float, T_bath_K: float) ->
             k = G_W_per_K / (n * max(T, 1e-5)**(n - 1.0))
             T_next = (T_bath_K**n + P_tes_W / max(k, 1e-15))**(1.0 / n)
             if abs(T_next - T) < 1e-7:
-                return float(T_next)
+                return float(min(T_next, Tc_max_K))
             T = 0.5 * (T + T_next)
-        return float(T)
+        return float(min(T, Tc_max_K))
 
 
 def get_p0_and_ttes(params: Dict[str, float], g_w_per_k: float) -> Tuple[float, float]:
@@ -103,10 +107,15 @@ def get_p0_and_ttes(params: Dict[str, float], g_w_per_k: float) -> Tuple[float, 
     Returns (P0_Watts, T_tes_Kelvin) ensuring both reflect the current operating point.
     If P_0 (in pW) is present in params and > 0, calculates T_tes from power balance:
         P0 = (g / n) * T_tes * (1 - (T_bath / T_tes)^n)
+    capped at Tc (0.045 K = 45 mK for ch63).
     Otherwise computes P0 from T_tes.
     """
     n = params.get("n_mem", 3.5)
     tbath = max(params.get("T_bath", 0.020), 1e-4)
+    tc_cap = params.get("Tc", params.get("T_tes", 0.045))
+    if tc_cap is None or tc_cap <= 0:
+        tc_cap = 0.045
+    tc_cap = min(tc_cap, 0.045)
 
     p0_val = None
     if "P_0" in params and params["P_0"] > 0:
@@ -118,9 +127,10 @@ def get_p0_and_ttes(params: Dict[str, float], g_w_per_k: float) -> Tuple[float, 
 
     if p0_val is not None:
         p0_w = float(p0_val)
-        ttes_k = predict_ttes(p0_w, g_w_per_k, n, tbath)
+        ttes_k = predict_ttes(p0_w, g_w_per_k, n, tbath, Tc_max_K=tc_cap)
+        ttes_k = min(ttes_k, tc_cap)
     else:
-        ttes_k = max(params.get("T_tes", 0.048), 1e-4)
+        ttes_k = min(max(params.get("T_tes", 0.045), 1e-4), tc_cap)
         k = g_w_per_k / (n * ttes_k**(n - 1.0))
         p0_w = k * (ttes_k**n - tbath**n)
 
@@ -406,7 +416,7 @@ class SimpleModel(ThermalModelBase):
         beta = kwargs.get("beta", 60.0)
         C_tes = kwargs.get("C_tes", 0.040)  # pJ/K (40 fJ/K)
         G_tb = kwargs.get("G_tes_bath", 0.220)  # nW/K (220 pW/K)
-        Tc = kwargs.get("Tc", kwargs.get("T_tes", 0.048))  # K
+        Tc = kwargs.get("Tc", kwargs.get("T_tes", 0.045))  # K (45 mK for ch63)
         Tbath = kwargs.get("Tbath", kwargs.get("T_bath", 0.020))  # K
         P0 = kwargs.get("P0", kwargs.get("P_0", 2.85))  # pW
         n = kwargs.get("n", kwargs.get("n_mem", 3.5))
@@ -430,8 +440,8 @@ class SimpleModel(ThermalModelBase):
                          category="circuit", description="Thevenin shunt resistance"),
             ParameterDef("L_nyq", "Lnyq (nH)", Lnyq, 1.0, 2000.0, vary=False, unit="nH", unit_scale=1e-9,
                          category="circuit", description="Total Nyquist loop inductance"),
-            ParameterDef("T_tes", "Tc / T_tes (K)", Tc, 0.005, 1.0, vary=False, unit="K", unit_scale=1.0,
-                         category="operating", description="Operating temperature of the TES"),
+            ParameterDef("T_tes", "Tc / T_tes (K)", Tc, 0.005, 0.045, vary=False, unit="K", unit_scale=1.0,
+                         category="operating", description="Operating temperature of the TES (capped at Tc = 45 mK)"),
             ParameterDef("T_bath", "Tbath (K)", Tbath, 0.001, 0.5, vary=False, unit="K", unit_scale=1.0,
                          category="operating", description="Bath temperature"),
             ParameterDef("n_mem", "Thermal n", n, 1.5, 6.0, vary=False, unit="", unit_scale=1.0,
