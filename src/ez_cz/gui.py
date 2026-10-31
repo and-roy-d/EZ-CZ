@@ -45,7 +45,7 @@ from PyQt5.QtWidgets import (
     QGridLayout, QGroupBox, QLabel, QLineEdit, QPushButton, QTextEdit,
     QCheckBox, QMessageBox, QComboBox, QDoubleSpinBox, QSpinBox, QSplitter,
     QProgressBar, QTabWidget, QTableWidget, QTableWidgetItem, QHeaderView,
-    QFileDialog
+    QFileDialog, QScrollArea, QFrame, QSizePolicy
 )
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, pyqtSlot
 from PyQt5.QtGui import QFont, QColor, QPalette
@@ -1074,6 +1074,8 @@ class CZPlotCanvas(FigureCanvas):
         self.fig.tight_layout(pad=3.0)
         super().__init__(self.fig)
         self.setParent(parent)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.setMinimumSize(300, 200)
         self.init_plots()
 
     def init_plots(self):
@@ -1272,6 +1274,8 @@ class AnalyzePlotCanvas(FigureCanvas):
         self.fig.patch.set_facecolor("#151922")
         super().__init__(self.fig)
         self.setParent(parent)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.setMinimumSize(300, 200)
         self.show_placeholder("No Complex Z data loaded.\nSelect a raw directory and load data to begin analysis.")
 
     def show_placeholder(self, text: str):
@@ -1469,7 +1473,8 @@ class CZMainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("EZ-CZ Dashboard - Complex Impedance")
-        self.resize(1600, 850)
+        self.setMinimumSize(850, 550)
+        self.resize(1350, 850)
         self.worker = None
         self.analyze_worker = None
         self.analyze_plot_files = {}
@@ -1729,7 +1734,8 @@ class CZMainWindow(QMainWindow):
             self.btn_abort,
             self.btn_resume,
         ):
-            button.setFixedSize(250, 44)
+            button.setMinimumHeight(38)
+            button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
 
         btn_layout.addWidget(self.btn_check_limits, 0, 0)
         btn_layout.addWidget(self.btn_test_0v, 0, 1)
@@ -1752,7 +1758,15 @@ class CZMainWindow(QMainWindow):
         log_layout.addWidget(self.txt_log)
         left_layout.addWidget(log_box, stretch=1)
 
-        splitter.addWidget(left_widget)
+        left_scroll = QScrollArea()
+        left_scroll.setWidgetResizable(True)
+        left_scroll.setWidget(left_widget)
+        left_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        left_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        left_scroll.setFrameShape(QFrame.NoFrame)
+        left_scroll.setStyleSheet("QScrollArea { border: none; background: transparent; }")
+        left_scroll.setMinimumWidth(360)
+        splitter.addWidget(left_scroll)
 
         # Right Pane: 4-Panel Live Canvas & Toolbar
         right_widget = QWidget()
@@ -1767,9 +1781,13 @@ class CZMainWindow(QMainWindow):
         right_layout.addWidget(self.toolbar)
         right_layout.addWidget(self.canvas, stretch=1)
 
+        right_widget.setMinimumSize(350, 250)
         splitter.addWidget(right_widget)
-        splitter.setStretchFactor(0, 1)
-        splitter.setStretchFactor(1, 1)
+        splitter.setCollapsible(0, False)
+        splitter.setCollapsible(1, False)
+        splitter.setStretchFactor(0, 4)
+        splitter.setStretchFactor(1, 6)
+        splitter.setSizes([520, 780])
         return splitter
 
     def _create_analyze_tab(self):
@@ -1863,7 +1881,8 @@ class CZMainWindow(QMainWindow):
         self.table_analyze_params.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeToContents)
         self.table_analyze_params.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeToContents)
         self.table_analyze_params.verticalHeader().setVisible(False)
-        self.table_analyze_params.setFixedHeight(230)
+        self.table_analyze_params.setMinimumHeight(160)
+        self.table_analyze_params.setMaximumHeight(280)
         model_layout.addWidget(self.table_analyze_params)
 
         # Operating point & derived parameters badges
@@ -1932,7 +1951,15 @@ class CZMainWindow(QMainWindow):
         log_layout.addWidget(self.txt_analyze_log)
         left_layout.addWidget(log_box, stretch=1)
 
-        splitter.addWidget(left_widget)
+        left_scroll = QScrollArea()
+        left_scroll.setWidgetResizable(True)
+        left_scroll.setWidget(left_widget)
+        left_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        left_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        left_scroll.setFrameShape(QFrame.NoFrame)
+        left_scroll.setStyleSheet("QScrollArea { border: none; background: transparent; }")
+        left_scroll.setMinimumWidth(360)
+        splitter.addWidget(left_scroll)
 
         # Right Pane: Interactive Live Plot Viewer
         right_widget = QWidget()
@@ -1941,10 +1968,10 @@ class CZMainWindow(QMainWindow):
         right_layout.setSpacing(6)
 
         plot_ctl_box = QGroupBox("Interactive Plot Display")
-        plot_ctl_layout = QHBoxLayout(plot_ctl_box)
-        plot_ctl_layout.setSpacing(8)
+        plot_ctl_layout = QGridLayout(plot_ctl_box)
+        plot_ctl_layout.setSpacing(6)
 
-        plot_ctl_layout.addWidget(QLabel("View:"))
+        plot_ctl_layout.addWidget(QLabel("View:"), 0, 0)
         self.combo_analyze_plot_view = QComboBox()
         self.combo_analyze_plot_view.addItems([
             "Nyquist: -Im(Z) vs Re(Z)",
@@ -1954,19 +1981,19 @@ class CZMainWindow(QMainWindow):
             "IV Curve & Operating Point",
         ])
         self.combo_analyze_plot_view.currentIndexChanged.connect(self.on_analyze_plot_view_changed)
-        plot_ctl_layout.addWidget(self.combo_analyze_plot_view, stretch=1)
+        plot_ctl_layout.addWidget(self.combo_analyze_plot_view, 0, 1, 1, 3)
 
         self.btn_prev_bias = QPushButton("< Prev Bias")
         self.btn_prev_bias.clicked.connect(self.on_prev_bias_clicked)
-        plot_ctl_layout.addWidget(self.btn_prev_bias)
+        plot_ctl_layout.addWidget(self.btn_prev_bias, 1, 0)
 
         self.btn_next_bias = QPushButton("Next Bias >")
         self.btn_next_bias.clicked.connect(self.on_next_bias_clicked)
-        plot_ctl_layout.addWidget(self.btn_next_bias)
+        plot_ctl_layout.addWidget(self.btn_next_bias, 1, 1)
 
         self.lbl_analyze_view_info = QLabel("No data loaded")
         self.lbl_analyze_view_info.setStyleSheet("color: #82b1ff; font-weight: bold; padding: 2px;")
-        plot_ctl_layout.addWidget(self.lbl_analyze_view_info)
+        plot_ctl_layout.addWidget(self.lbl_analyze_view_info, 1, 2, 1, 2)
 
         right_layout.addWidget(plot_ctl_box)
 
@@ -1977,9 +2004,13 @@ class CZMainWindow(QMainWindow):
         right_layout.addWidget(self.analyze_toolbar)
         right_layout.addWidget(self.analyze_canvas, stretch=1)
 
+        right_widget.setMinimumSize(350, 250)
         splitter.addWidget(right_widget)
-        splitter.setStretchFactor(0, 1)
-        splitter.setStretchFactor(1, 1)
+        splitter.setCollapsible(0, False)
+        splitter.setCollapsible(1, False)
+        splitter.setStretchFactor(0, 4)
+        splitter.setStretchFactor(1, 6)
+        splitter.setSizes([520, 780])
 
         # Initial parameter table construction
         self.build_parameter_table()
