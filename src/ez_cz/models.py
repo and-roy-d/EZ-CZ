@@ -373,24 +373,24 @@ class SimpleModel(ThermalModelBase):
 
     def get_parameter_defs(self, **kwargs) -> Dict[str, ParameterDef]:
         R0 = kwargs.get("R0", 1.5)  # in mOhm
-        alpha = kwargs.get("alpha", 40.0)
-        beta = kwargs.get("beta", 1.5)
-        C_tes = kwargs.get("C_tes", 1.0)  # pJ/K
-        G_tb = kwargs.get("G_tes_bath", 5.0)  # nW/K
-        Tc = kwargs.get("Tc", 0.120)  # K
+        alpha = kwargs.get("alpha", 1200.0)
+        beta = kwargs.get("beta", 60.0)
+        C_tes = kwargs.get("C_tes", 0.040)  # pJ/K (40 fJ/K)
+        G_tb = kwargs.get("G_tes_bath", 0.220)  # nW/K (220 pW/K)
+        Tc = kwargs.get("Tc", 0.048)  # K
         Tbath = kwargs.get("Tbath", 0.020)  # K
-        n = kwargs.get("n", 3.3)
+        n = kwargs.get("n", 3.5)
         Rshunt = kwargs.get("Rshunt", 250.0)  # uOhm
-        Lnyq = kwargs.get("Lnyq", 74.8)  # nH
+        Lnyq = kwargs.get("Lnyq", 119.13)  # nH (from SC fit)
 
         defs = [
-            ParameterDef("C_tes", "C_tes (pJ/K)", C_tes, 0.001, 50.0, vary=True, unit="pJ/K", unit_scale=1e-12,
+            ParameterDef("C_tes", "C_tes (pJ/K)", C_tes, 0.0001, 50.0, vary=True, unit="pJ/K", unit_scale=1e-12,
                          category="thermal", description="Heat capacity of the TES"),
-            ParameterDef("G_tes_bath", "G_tes_bath (nW/K)", G_tb, 0.0001, 50.0, vary=True, unit="nW/K", unit_scale=1e-9,
+            ParameterDef("G_tes_bath", "G_tes_bath (nW/K)", G_tb, 0.0001, 50.0, vary=False, unit="nW/K", unit_scale=1e-9,
                          category="thermal", description="Thermal conductance from TES to cold bath"),
-            ParameterDef("alpha", "alpha (dlnR/dlnT)", alpha, 0.0, 1500.0, vary=True, unit="", unit_scale=1.0,
+            ParameterDef("alpha", "alpha (dlnR/dlnT)", alpha, 0.0, 5000.0, vary=True, unit="", unit_scale=1.0,
                          category="sensitivity", description="Logarithmic temperature sensitivity"),
-            ParameterDef("beta", "beta (dlnR/dlnI)", beta, 0.0, 30.0, vary=True, unit="", unit_scale=1.0,
+            ParameterDef("beta", "beta (dlnR/dlnI)", beta, 0.0, 200.0, vary=True, unit="", unit_scale=1.0,
                          category="sensitivity", description="Logarithmic current sensitivity"),
             ParameterDef("R_0", "R0 (mOhm)", R0, 0.001, 500.0, vary=False, unit="mOhm", unit_scale=1e-3,
                          category="circuit", description="TES DC bias operating resistance"),
