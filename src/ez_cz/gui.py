@@ -835,9 +835,12 @@ class CZWorker(QThread):
                         self.log_signal.emit("WARN", f"Fine tau fitting note ({e}); using coherent matched filter estimate.")
                         tau_shift_0V = tau_guess
 
+                    rshunt_val = p.get("rshunt_uohm", 250.0)
+                    pred_lnyq = (rshunt_val * 1e3) / (2.0 * np.pi * f_roll) if f_roll > 0 else 0.0
                     sc_stats = {
                         "amp0": amp0,
                         "f_roll": f_roll,
+                        "predicted_lnyq_nh": pred_lnyq,
                         "r_squared": r_squared,
                         "tau_shift": tau_shift_0V,
                         "y_data": y_data,
@@ -848,7 +851,7 @@ class CZWorker(QThread):
                     self.sc_calibrated.emit(sc_stats)
                     self.log_signal.emit("INFO", (
                         f"0 V Fit Results: R² = {r_squared:.4f}, f_roll = {f_roll:.1f} Hz, "
-                        f"amp0 = {amp0:.1f}, τ_shift = {tau_shift_0V*1e6:.2f} µs (flip_bias={flip_bias})"
+                        f"predicted L_nyq = {pred_lnyq:.1f} nH, amp0 = {amp0:.1f}, τ_shift = {tau_shift_0V*1e6:.2f} µs (flip_bias={flip_bias})"
                     ))
 
                     # Evaluate failure criteria
@@ -1269,23 +1272,44 @@ class AnalyzePlotCanvas(FigureCanvas):
     """
     Interactive Matplotlib canvas for live Complex Impedance analysis and fitting.
     Supports Nyquist, Bode, Admittance, Residuals, and IV curve views.
+    Default: Light background for high-contrast, publication-grade clarity.
     """
     def __init__(self, parent=None, width=9, height=8, dpi=100):
+        self.dark_mode = False
         self.fig = Figure(figsize=(width, height), dpi=dpi)
-        self.fig.patch.set_facecolor("#151922")
+        self.fig.patch.set_facecolor("#ffffff")
         super().__init__(self.fig)
         self.setParent(parent)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.setMinimumSize(250, 180)
+        self._last_plot_call = None
         self.show_placeholder("No Complex Z data loaded.\nSelect a raw directory and load data to begin analysis.")
 
+    def set_theme(self, dark_mode: bool):
+        self.dark_mode = dark_mode
+        self.fig.patch.set_facecolor("#151922" if dark_mode else "#ffffff")
+        if self._last_plot_call is not None:
+            fn, args, kwargs = self._last_plot_call
+            try:
+                fn(*args, **kwargs)
+            except Exception:
+                self.draw()
+        else:
+            self.draw()
+
     def show_placeholder(self, text: str):
+        self._last_plot_call = (self.show_placeholder, (text,), {})
         self.fig.clear()
+        bg_fig = "#151922" if self.dark_mode else "#ffffff"
+        bg_box = "#1b2028" if self.dark_mode else "#f8f9fa"
+        ec_box = "#2a313d" if self.dark_mode else "#dadce0"
+        txt_col = "#90a4ae" if self.dark_mode else "#5f6368"
+        self.fig.patch.set_facecolor(bg_fig)
         ax = self.fig.add_subplot(111)
-        ax.set_facecolor("#151922")
-        ax.text(0.5, 0.5, text, color="#90a4ae", fontsize=12,
+        ax.set_facecolor(bg_fig)
+        ax.text(0.5, 0.5, text, color=txt_col, fontsize=11,
                 ha="center", va="center", transform=ax.transAxes,
-                bbox=dict(boxstyle="round,pad=0.8", fc="#1b2028", ec="#2a313d"))
+                bbox=dict(boxstyle="round,pad=0.8", fc=bg_box, ec=ec_box))
         ax.axis("off")
         self.draw()
 
@@ -1301,7 +1325,25 @@ class AnalyzePlotCanvas(FigureCanvas):
         title: str = "Complex Impedance",
         derived_text: str = "",
     ):
+        self._last_plot_call = (self.plot_complex_z, (f_data, z_data), {
+            "f_model": f_model, "z_model": z_model, "f_fit": f_fit, "z_fit": z_fit,
+            "plot_mode": plot_mode, "title": title, "derived_text": derived_text
+        })
         self.fig.clear()
+        bg_fig = "#151922" if self.dark_mode else "#ffffff"
+        bg_ax = "#1b2028" if self.dark_mode else "#ffffff"
+        grid_col = "#2a313d" if self.dark_mode else "#e0e0e0"
+        text_col = "#cfd8dc" if self.dark_mode else "#202124"
+        title_col = "#eceff1" if self.dark_mode else "#0d47a1"
+        legend_bg = "#151922" if self.dark_mode else "#ffffff"
+        legend_ec = "#37474f" if self.dark_mode else "#cccccc"
+        spine_col = "#444b58" if self.dark_mode else "#b0bec5"
+
+        c_data = "#82b1ff" if self.dark_mode else "#1565c0"
+        c_model = "#ffb74d" if self.dark_mode else "#e65100"
+        c_fit = "#00e676" if self.dark_mode else "#2e7d32"
+
+        self.fig.patch.set_facecolor(bg_fig)
         valid = np.isfinite(z_data) & np.isfinite(f_data) & (f_data > 0)
         f_clean = f_data[valid]
         z_clean = z_data[valid]
@@ -1316,135 +1358,171 @@ class AnalyzePlotCanvas(FigureCanvas):
 
         if plot_mode == "nyquist":
             ax = self.fig.add_subplot(111)
-            ax.set_facecolor("#1b2028")
-            ax.grid(True, color="#2a313d", ls=":", lw=0.8)
+            ax.set_facecolor(bg_ax)
+            ax.grid(True, color=grid_col, ls=":", lw=0.8)
+            for s in ax.spines.values():
+                s.set_color(spine_col)
 
             ax.plot(np.real(z_clean) * scale, -np.imag(z_clean) * scale, "o",
-                    color="#82b1ff", ms=5, alpha=0.85, label="Measured Data")
+                    color=c_data, ms=5, alpha=0.9, label="Measured Data")
 
             if z_model is not None and len(z_model) > 0:
                 ax.plot(np.real(z_model) * scale, -np.imag(z_model) * scale, "--",
-                        color="#ffb74d", lw=1.8, label="Predicted Model")
+                        color=c_model, lw=2.0, label="Predicted Model")
 
             if z_fit is not None and len(z_fit) > 0:
                 ax.plot(np.real(z_fit) * scale, -np.imag(z_fit) * scale, "-",
-                        color="#00e676", lw=2.2, label="Fitted Model")
+                        color=c_fit, lw=2.2, label="Fitted Model")
 
-            ax.set_xlabel(f"Re(Z) [{unit}]", color="#cfd8dc", fontsize=10)
-            ax.set_ylabel(f"-Im(Z) [{unit}]", color="#cfd8dc", fontsize=10)
-            ax.tick_params(colors="#cfd8dc")
-            ax.set_title(title, color="#eceff1", fontsize=11, fontweight="bold")
-            legend = ax.legend(facecolor="#151922", edgecolor="#37474f", labelcolor="#cfd8dc", loc="best")
+            ax.set_xlabel(f"Re(Z) [{unit}]", color=text_col, fontsize=10)
+            ax.set_ylabel(f"-Im(Z) [{unit}]", color=text_col, fontsize=10)
+            ax.tick_params(colors=text_col)
+            ax.set_title(title, color=title_col, fontsize=11, fontweight="bold")
+            legend = ax.legend(facecolor=legend_bg, edgecolor=legend_ec, labelcolor=text_col, loc="best")
             if legend:
-                legend.get_frame().set_alpha(0.85)
+                legend.get_frame().set_alpha(0.92)
 
             if derived_text:
-                ax.text(0.03, 0.04, derived_text, transform=ax.transAxes, color="#b0bec5", fontsize=9,
-                        bbox=dict(boxstyle="round,pad=0.4", fc="#151922", ec="#37474f", alpha=0.8))
+                fc_d = "#151922" if self.dark_mode else "#f8f9fa"
+                ec_d = "#37474f" if self.dark_mode else "#cfd8dc"
+                tc_d = "#b0bec5" if self.dark_mode else "#37474f"
+                ax.text(0.03, 0.04, derived_text, transform=ax.transAxes, color=tc_d, fontsize=9,
+                        bbox=dict(boxstyle="round,pad=0.4", fc=fc_d, ec=ec_d, alpha=0.9))
 
         elif plot_mode == "bode":
             ax1 = self.fig.add_subplot(211)
+            ax1.set_xscale("log")
+            if len(f_clean) > 0 and np.all(f_clean > 0):
+                ax1.set_xlim(np.min(f_clean) * 0.8, np.max(f_clean) * 1.2)
             ax2 = self.fig.add_subplot(212, sharex=ax1)
             for ax in (ax1, ax2):
-                ax.set_facecolor("#1b2028")
-                ax.grid(True, color="#2a313d", ls=":", lw=0.8)
-                ax.tick_params(colors="#cfd8dc")
+                ax.set_facecolor(bg_ax)
+                ax.grid(True, color=grid_col, ls=":", lw=0.8)
+                ax.tick_params(colors=text_col)
+                for s in ax.spines.values():
+                    s.set_color(spine_col)
 
-            ax1.semilogx(f_clean, np.real(z_clean) * scale, "o", color="#82b1ff", ms=4, label="Data Re(Z)")
+            ax1.semilogx(f_clean, np.real(z_clean) * scale, "o", color=c_data, ms=4, label="Data Re(Z)")
             if z_model is not None:
                 fm = f_model if f_model is not None else f_clean
-                ax1.semilogx(fm, np.real(z_model) * scale, "--", color="#ffb74d", lw=1.8, label="Model Re(Z)")
+                ax1.semilogx(fm, np.real(z_model) * scale, "--", color=c_model, lw=2.0, label="Model Re(Z)")
             if z_fit is not None:
                 ff = f_fit if f_fit is not None else f_clean
-                ax1.semilogx(ff, np.real(z_fit) * scale, "-", color="#00e676", lw=2.0, label="Fit Re(Z)")
-            ax1.set_ylabel(f"Re(Z) [{unit}]", color="#cfd8dc")
-            ax1.set_title(title, color="#eceff1", fontsize=11, fontweight="bold")
-            ax1.legend(facecolor="#151922", edgecolor="#37474f", labelcolor="#cfd8dc", loc="best")
+                ax1.semilogx(ff, np.real(z_fit) * scale, "-", color=c_fit, lw=2.2, label="Fit Re(Z)")
+            ax1.set_ylabel(f"Re(Z) [{unit}]", color=text_col)
+            ax1.set_title(title, color=title_col, fontsize=11, fontweight="bold")
+            ax1.legend(facecolor=legend_bg, edgecolor=legend_ec, labelcolor=text_col, loc="best")
 
-            ax2.semilogx(f_clean, np.imag(z_clean) * scale, "o", color="#82b1ff", ms=4, label="Data Im(Z)")
+            ax2.semilogx(f_clean, np.imag(z_clean) * scale, "o", color=c_data, ms=4, label="Data Im(Z)")
             if z_model is not None:
                 fm = f_model if f_model is not None else f_clean
-                ax2.semilogx(fm, np.imag(z_model) * scale, "--", color="#ffb74d", lw=1.8, label="Model Im(Z)")
+                ax2.semilogx(fm, np.imag(z_model) * scale, "--", color=c_model, lw=2.0, label="Model Im(Z)")
             if z_fit is not None:
                 ff = f_fit if f_fit is not None else f_clean
-                ax2.semilogx(ff, np.imag(z_fit) * scale, "-", color="#00e676", lw=2.0, label="Fit Im(Z)")
-            ax2.set_xlabel("Frequency [Hz]", color="#cfd8dc")
-            ax2.set_ylabel(f"Im(Z) [{unit}]", color="#cfd8dc")
-            ax2.legend(facecolor="#151922", edgecolor="#37474f", labelcolor="#cfd8dc", loc="best")
+                ax2.semilogx(ff, np.imag(z_fit) * scale, "-", color=c_fit, lw=2.2, label="Fit Im(Z)")
+            ax2.set_xlabel("Frequency [Hz]", color=text_col)
+            ax2.set_ylabel(f"Im(Z) [{unit}]", color=text_col)
+            ax2.legend(facecolor=legend_bg, edgecolor=legend_ec, labelcolor=text_col, loc="best")
 
         elif plot_mode == "admittance":
             ax = self.fig.add_subplot(111)
-            ax.set_facecolor("#1b2028")
-            ax.grid(True, color="#2a313d", ls=":", lw=0.8)
+            ax.set_facecolor(bg_ax)
+            ax.grid(True, color=grid_col, ls=":", lw=0.8)
+            for s in ax.spines.values():
+                s.set_color(spine_col)
 
             y_clean = 1.0 / z_clean
-            ax.plot(np.real(y_clean), np.imag(y_clean), "o", color="#82b1ff", ms=5, label="Measured Y")
+            ax.plot(np.real(y_clean), np.imag(y_clean), "o", color=c_data, ms=5, label="Measured Y")
             if z_model is not None:
                 y_mod = 1.0 / z_model
-                ax.plot(np.real(y_mod), np.imag(y_mod), "--", color="#ffb74d", lw=1.8, label="Model Y")
+                ax.plot(np.real(y_mod), np.imag(y_mod), "--", color=c_model, lw=2.0, label="Model Y")
             if z_fit is not None:
                 y_fit = 1.0 / z_fit
-                ax.plot(np.real(y_fit), np.imag(y_fit), "-", color="#00e676", lw=2.0, label="Fit Y")
+                ax.plot(np.real(y_fit), np.imag(y_fit), "-", color=c_fit, lw=2.2, label="Fit Y")
 
-            ax.set_xlabel("Re(Y) [S]", color="#cfd8dc")
-            ax.set_ylabel("Im(Y) [S]", color="#cfd8dc")
-            ax.tick_params(colors="#cfd8dc")
-            ax.set_title(f"Admittance Y(f) - {title}", color="#eceff1", fontsize=11, fontweight="bold")
-            ax.legend(facecolor="#151922", edgecolor="#37474f", labelcolor="#cfd8dc")
+            ax.set_xlabel("Re(Y) [S]", color=text_col)
+            ax.set_ylabel("Im(Y) [S]", color=text_col)
+            ax.tick_params(colors=text_col)
+            ax.set_title(f"Admittance Y(f) - {title}", color=title_col, fontsize=11, fontweight="bold")
+            ax.legend(facecolor=legend_bg, edgecolor=legend_ec, labelcolor=text_col)
 
         elif plot_mode == "residuals":
             ax1 = self.fig.add_subplot(211)
+            ax1.set_xscale("log")
+            if len(f_clean) > 0 and np.all(f_clean > 0):
+                ax1.set_xlim(np.min(f_clean) * 0.8, np.max(f_clean) * 1.2)
             ax2 = self.fig.add_subplot(212, sharex=ax1)
             for ax in (ax1, ax2):
-                ax.set_facecolor("#1b2028")
-                ax.grid(True, color="#2a313d", ls=":", lw=0.8)
-                ax.tick_params(colors="#cfd8dc")
+                ax.set_facecolor(bg_ax)
+                ax.grid(True, color=grid_col, ls=":", lw=0.8)
+                ax.tick_params(colors=text_col)
+                for s in ax.spines.values():
+                    s.set_color(spine_col)
 
             comp_z = z_fit if z_fit is not None else z_model
+            c_res_re = "#ff80ab" if self.dark_mode else "#c2185b"
+            c_res_im = "#80d8ff" if self.dark_mode else "#0277bd"
             if comp_z is not None:
                 res_re = (np.real(z_clean) - np.real(comp_z[:len(z_clean)])) * scale
                 res_im = (np.imag(z_clean) - np.imag(comp_z[:len(z_clean)])) * scale
-                ax1.semilogx(f_clean, res_re, "o-", color="#ff80ab", ms=4, label="Re(Data - Model)")
+                ax1.semilogx(f_clean, res_re, "o-", color=c_res_re, ms=4, label="Re(Data - Model)")
                 ax1.axhline(0, color="#78909c", ls="--", lw=1.0)
-                ax1.set_ylabel(f"Residual Re [{unit}]", color="#cfd8dc")
-                ax1.legend(facecolor="#151922", edgecolor="#37474f", labelcolor="#cfd8dc")
-                ax1.set_title(f"Fit Residuals - {title}", color="#eceff1", fontsize=11)
+                ax1.set_ylabel(f"Residual Re [{unit}]", color=text_col)
+                ax1.legend(facecolor=legend_bg, edgecolor=legend_ec, labelcolor=text_col)
+                ax1.set_title(f"Fit Residuals - {title}", color=title_col, fontsize=11)
 
-                ax2.semilogx(f_clean, res_im, "o-", color="#80d8ff", ms=4, label="Im(Data - Model)")
+                ax2.semilogx(f_clean, res_im, "o-", color=c_res_im, ms=4, label="Im(Data - Model)")
                 ax2.axhline(0, color="#78909c", ls="--", lw=1.0)
-                ax2.set_xlabel("Frequency [Hz]", color="#cfd8dc")
-                ax2.set_ylabel(f"Residual Im [{unit}]", color="#cfd8dc")
-                ax2.legend(facecolor="#151922", edgecolor="#37474f", labelcolor="#cfd8dc")
+                ax2.set_xlabel("Frequency [Hz]", color=text_col)
+                ax2.set_ylabel(f"Residual Im [{unit}]", color=text_col)
+                ax2.legend(facecolor=legend_bg, edgecolor=legend_ec, labelcolor=text_col)
 
         self.fig.tight_layout()
         self.draw()
 
     def plot_iv(self, vbias: np.ndarray, ites: np.ndarray, rtes: np.ndarray, selected_bias: Optional[float] = None, rnormal: Optional[float] = None):
+        self._last_plot_call = (self.plot_iv, (vbias, ites, rtes), {"selected_bias": selected_bias, "rnormal": rnormal})
         self.fig.clear()
+        bg_fig = "#151922" if self.dark_mode else "#ffffff"
+        bg_ax = "#1b2028" if self.dark_mode else "#ffffff"
+        grid_col = "#2a313d" if self.dark_mode else "#e0e0e0"
+        text_col = "#cfd8dc" if self.dark_mode else "#202124"
+        title_col = "#eceff1" if self.dark_mode else "#0d47a1"
+        legend_bg = "#151922" if self.dark_mode else "#ffffff"
+        legend_ec = "#37474f" if self.dark_mode else "#cccccc"
+        spine_col = "#444b58" if self.dark_mode else "#b0bec5"
+
+        c_iv = "#82b1ff" if self.dark_mode else "#1565c0"
+        c_rtes = "#80cbc4" if self.dark_mode else "#00695c"
+
+        self.fig.patch.set_facecolor(bg_fig)
         ax1 = self.fig.add_subplot(211)
         ax2 = self.fig.add_subplot(212, sharex=ax1)
         for ax in (ax1, ax2):
-            ax.set_facecolor("#1b2028")
-            ax.grid(True, color="#2a313d", ls=":", lw=0.8)
-            ax.tick_params(colors="#cfd8dc")
+            ax.set_facecolor(bg_ax)
+            ax.grid(True, color=grid_col, ls=":", lw=0.8)
+            ax.tick_params(colors=text_col)
+            for s in ax.spines.values():
+                s.set_color(spine_col)
 
-        ax1.plot(vbias, ites * 1e6, "-", color="#82b1ff", lw=1.8, label="IV Curve")
-        ax1.set_ylabel("TES Current [µA]", color="#cfd8dc")
-        ax1.set_title("TES Current-Voltage Characteristic", color="#eceff1", fontsize=11, fontweight="bold")
+        ax1.plot(vbias, ites * 1e6, "-", color=c_iv, lw=2.0, label="IV Curve")
+        ax1.set_ylabel("TES Current [µA]", color=text_col)
+        ax1.set_title("TES Current-Voltage Characteristic", color=title_col, fontsize=11, fontweight="bold")
 
-        ax2.plot(vbias, rtes * 1e3, "-", color="#80cbc4", lw=1.8, label="R_tes(Vbias)")
+        ax2.plot(vbias, rtes * 1e3, "-", color=c_rtes, lw=2.0, label="R_tes(Vbias)")
         if rnormal:
-            ax2.axhline(rnormal * 1e3, color="#ef5350", ls="--", lw=1.2, label=f"Rn = {rnormal*1e3:.2f} mΩ")
-        ax2.set_xlabel("Bias Voltage [V]", color="#cfd8dc")
-        ax2.set_ylabel("TES Resistance [mΩ]", color="#cfd8dc")
+            ax2.axhline(rnormal * 1e3, color="#ef5350" if self.dark_mode else "#c62828", ls="--", lw=1.2, label=f"Rn = {rnormal*1e3:.2f} mΩ")
+        ax2.set_xlabel("Bias Voltage [V]", color=text_col)
+        ax2.set_ylabel("TES Resistance [mΩ]", color=text_col)
 
         if selected_bias is not None:
             idx = np.argmin(np.abs(vbias - selected_bias))
-            ax1.plot(vbias[idx], ites[idx] * 1e6, "o", color="#ff1744", ms=8, label=f"Selected: {selected_bias:.3f}V")
-            ax2.plot(vbias[idx], rtes[idx] * 1e3, "o", color="#ff1744", ms=8, label=f"Selected: {selected_bias:.3f}V")
+            pt_col = "#ff1744" if self.dark_mode else "#d50000"
+            ax1.plot(vbias[idx], ites[idx] * 1e6, "o", color=pt_col, ms=8, label=f"Selected: {selected_bias:.3f}V")
+            ax2.plot(vbias[idx], rtes[idx] * 1e3, "o", color=pt_col, ms=8, label=f"Selected: {selected_bias:.3f}V")
 
-        ax1.legend(facecolor="#151922", edgecolor="#37474f", labelcolor="#cfd8dc")
-        ax2.legend(facecolor="#151922", edgecolor="#37474f", labelcolor="#cfd8dc")
+        ax1.legend(facecolor=legend_bg, edgecolor=legend_ec, labelcolor=text_col)
+        ax2.legend(facecolor=legend_bg, edgecolor=legend_ec, labelcolor=text_col)
         self.fig.tight_layout()
         self.draw()
 
@@ -1456,8 +1534,10 @@ class AnalyzePlotCanvas(FigureCanvas):
         try:
             img = mpimg.imread(str(p))
             self.fig.clear()
+            bg_fig = "#151922" if self.dark_mode else "#ffffff"
+            self.fig.patch.set_facecolor(bg_fig)
             ax = self.fig.add_subplot(111)
-            ax.set_facecolor("#151922")
+            ax.set_facecolor(bg_fig)
             ax.imshow(img)
             ax.axis("off")
             self.fig.subplots_adjust(left=0.01, right=0.99, top=0.99, bottom=0.01)
@@ -1632,6 +1712,58 @@ class CZMainWindow(QMainWindow):
                 background-color: #232c3d;
                 color: #ffffff;
             }
+            QScrollBar:vertical {
+                background: #181c24;
+                width: 14px;
+                margin: 0px;
+                border: 1px solid #2a313d;
+                border-radius: 4px;
+            }
+            QScrollBar::handle:vertical {
+                background: #475569;
+                min-height: 24px;
+                border-radius: 4px;
+                margin: 1px;
+            }
+            QScrollBar::handle:vertical:hover {
+                background: #64748b;
+            }
+            QScrollBar::handle:vertical:pressed {
+                background: #94a3b8;
+            }
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+                height: 0px;
+                background: none;
+            }
+            QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {
+                background: none;
+            }
+            QScrollBar:horizontal {
+                background: #181c24;
+                height: 14px;
+                margin: 0px;
+                border: 1px solid #2a313d;
+                border-radius: 4px;
+            }
+            QScrollBar::handle:horizontal {
+                background: #475569;
+                min-width: 24px;
+                border-radius: 4px;
+                margin: 1px;
+            }
+            QScrollBar::handle:horizontal:hover {
+                background: #64748b;
+            }
+            QScrollBar::handle:horizontal:pressed {
+                background: #94a3b8;
+            }
+            QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {
+                width: 0px;
+                background: none;
+            }
+            QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
+                background: none;
+            }
         """
 
         self.init_ui()
@@ -1774,7 +1906,6 @@ class CZMainWindow(QMainWindow):
         left_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         left_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         left_scroll.setFrameShape(QFrame.NoFrame)
-        left_scroll.setStyleSheet("QScrollArea { border: none; background: transparent; }")
         left_scroll.setMinimumWidth(320)
         splitter.addWidget(left_scroll)
 
@@ -1878,7 +2009,18 @@ class CZMainWindow(QMainWindow):
         self.combo_analyze_model.setCurrentText("Dangling / Hanging (2-body)")
         self.combo_analyze_model.currentIndexChanged.connect(self.on_analyze_model_changed)
         m_top_h.addWidget(self.combo_analyze_model, stretch=1)
+
+        self.btn_predict_lnyq = QPushButton("Predict Lnyq")
+        self.btn_predict_lnyq.setToolTip("Predict Lnyq = R_shunt / (2*pi*f_roll) from SC 0V transfer function")
+        self.btn_predict_lnyq.setStyleSheet("background-color: #0277bd; color: #ffffff; font-weight: bold; padding: 4px 10px;")
+        self.btn_predict_lnyq.clicked.connect(self.on_predict_lnyq_clicked)
+        m_top_h.addWidget(self.btn_predict_lnyq)
         model_layout.addLayout(m_top_h)
+
+        self.lbl_analyze_sc_info = QLabel("SC 0V Transfer Function: Not loaded")
+        self.lbl_analyze_sc_info.setWordWrap(True)
+        self.lbl_analyze_sc_info.setStyleSheet("color: #0277bd; font-size: 8.5pt; font-weight: bold;")
+        model_layout.addWidget(self.lbl_analyze_sc_info)
 
         # Dynamic Parameter Table
         self.table_analyze_params = QTableWidget()
@@ -1895,8 +2037,10 @@ class CZMainWindow(QMainWindow):
         self.table_analyze_params.setColumnWidth(3, 75)
         self.table_analyze_params.setColumnWidth(4, 75)
         self.table_analyze_params.verticalHeader().setVisible(False)
-        self.table_analyze_params.setMinimumHeight(170)
-        self.table_analyze_params.setMaximumHeight(280)
+        self.table_analyze_params.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.table_analyze_params.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.table_analyze_params.setMinimumHeight(130)
+        self.table_analyze_params.setMaximumHeight(350)
         model_layout.addWidget(self.table_analyze_params)
 
         # Operating point & derived parameters badges
@@ -1973,7 +2117,6 @@ class CZMainWindow(QMainWindow):
         left_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         left_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         left_scroll.setFrameShape(QFrame.NoFrame)
-        left_scroll.setStyleSheet("QScrollArea { border: none; background: transparent; }")
         left_scroll.setMinimumWidth(320)
         splitter.addWidget(left_scroll)
 
@@ -2608,11 +2751,65 @@ class CZMainWindow(QMainWindow):
                     border-top: 3px solid #1976d2;
                     border-bottom: 2px solid #ffffff;
                 }
+                QScrollBar:vertical {
+                    background: #f0f2f5;
+                    width: 14px;
+                    margin: 0px;
+                    border: 1px solid #dcdfe6;
+                    border-radius: 4px;
+                }
+                QScrollBar::handle:vertical {
+                    background: #a0aab5;
+                    min-height: 24px;
+                    border-radius: 4px;
+                    margin: 1px;
+                }
+                QScrollBar::handle:vertical:hover {
+                    background: #788594;
+                }
+                QScrollBar::handle:vertical:pressed {
+                    background: #546373;
+                }
+                QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+                    height: 0px;
+                    background: none;
+                }
+                QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {
+                    background: none;
+                }
+                QScrollBar:horizontal {
+                    background: #f0f2f5;
+                    height: 14px;
+                    margin: 0px;
+                    border: 1px solid #dcdfe6;
+                    border-radius: 4px;
+                }
+                QScrollBar::handle:horizontal {
+                    background: #a0aab5;
+                    min-width: 24px;
+                    border-radius: 4px;
+                    margin: 1px;
+                }
+                QScrollBar::handle:horizontal:hover {
+                    background: #788594;
+                }
+                QScrollBar::handle:horizontal:pressed {
+                    background: #546373;
+                }
+                QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {
+                    width: 0px;
+                    background: none;
+                }
+                QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
+                    background: none;
+                }
             """)
             self.toolbar.setStyleSheet("background-color: #e4e8ed; border: 1px solid #c7cbd1; border-radius: 4px;")
             if hasattr(self, "analyze_toolbar"):
                 self.analyze_toolbar.setStyleSheet("background-color: #e4e8ed; border: 1px solid #c7cbd1; border-radius: 4px;")
         self.canvas.set_theme(dark_mode)
+        if hasattr(self, "analyze_canvas"):
+            self.analyze_canvas.set_theme(dark_mode)
 
     def on_browse_cfg(self):
         filename, _ = QFileDialog.getOpenFileName(self, "Select experiment.cfg", "/data", "Config Files (*.cfg *.ini);;All Files (*)")
@@ -3035,6 +3232,26 @@ class CZMainWindow(QMainWindow):
             n_biases = self.analyze_sweep_data["num_biases"]
             self.log_analyze("INFO", f"Loaded {n_biases} bias points from {raw_dir.name} (Ch {ch}, tones={len(self.analyze_sweep_data['fs_sch'])})")
 
+            # Auto-predict / populate Lnyq from 0V SC transfer function
+            f_roll_0v = self.analyze_sweep_data.get("f_roll_0v")
+            rshunt_uohm = 250.0
+            if "R_shunt" in self.current_model_params:
+                rshunt_uohm = self.current_model_params["R_shunt"].value
+
+            if f_roll_0v is not None and f_roll_0v > 0:
+                pred_lnyq = (rshunt_uohm * 1e3) / (2.0 * np.pi * f_roll_0v)
+                self.analyze_sweep_data["predicted_lnyq_nh"] = pred_lnyq
+                if "L_nyq" in self.current_model_params:
+                    self.current_model_params["L_nyq"].value = float(pred_lnyq)
+                    self.sync_param_to_table("L_nyq", float(pred_lnyq))
+                if hasattr(self, "lbl_analyze_sc_info"):
+                    self.lbl_analyze_sc_info.setText(
+                        f"SC 0V: f_roll = {f_roll_0v:.1f} Hz | Pred Lnyq = {pred_lnyq:.1f} nH (R_sh = {rshunt_uohm:.1f} µΩ)"
+                    )
+                self.log_analyze("INFO", f"SC 0V Transfer Function: f_roll = {f_roll_0v:.1f} Hz -> Auto-predicted L_nyq = {pred_lnyq:.2f} nH (R_shunt = {rshunt_uohm:.2f} µΩ)")
+            elif hasattr(self, "lbl_analyze_sc_info"):
+                self.lbl_analyze_sc_info.setText("SC 0V: No f_roll roll-off detected")
+
             # Update bias points dropdown
             self.combo_analyze_bias_points.blockSignals(True)
             self.combo_analyze_bias_points.clear()
@@ -3068,6 +3285,28 @@ class CZMainWindow(QMainWindow):
             self.lbl_analyze_status.setText("STATUS: LOAD FAILED")
             self.lbl_analyze_status.setStyleSheet("font-weight: bold; color: #ff1744; font-size: 10pt;")
             self.log_analyze("ERROR", f"Failed loading sweep: {e}")
+
+    def on_predict_lnyq_clicked(self):
+        if not self.analyze_sweep_data:
+            self.log_analyze("WARN", "No Complex Z sweep data loaded to predict L_nyq.")
+            return
+        f_roll = self.analyze_sweep_data.get("f_roll_0v")
+        if f_roll is None or f_roll <= 0:
+            self.log_analyze("WARN", "No valid 0V SC roll-off frequency (f_roll) found in dataset.")
+            return
+        rshunt = 250.0
+        if "R_shunt" in self.current_model_params:
+            rshunt = self.current_model_params["R_shunt"].value
+        pred_lnyq = (rshunt * 1e3) / (2.0 * np.pi * f_roll)
+        if "L_nyq" in self.current_model_params:
+            self.current_model_params["L_nyq"].value = pred_lnyq
+            self.sync_param_to_table("L_nyq", pred_lnyq)
+        if hasattr(self, "lbl_analyze_sc_info"):
+            self.lbl_analyze_sc_info.setText(
+                f"SC 0V: f_roll = {f_roll:.1f} Hz | Pred Lnyq = {pred_lnyq:.1f} nH (R_sh = {rshunt:.1f} µΩ)"
+            )
+        self.log_analyze("INFO", f"Predicted L_nyq = {pred_lnyq:.2f} nH from SC f_roll = {f_roll:.1f} Hz (R_shunt = {rshunt:.2f} µΩ)")
+        self.update_live_model_prediction()
 
     def on_analyze_bias_changed(self):
         if not self.analyze_sweep_data or self.combo_analyze_bias_points.count() == 0:
@@ -3662,7 +3901,11 @@ class CZMainWindow(QMainWindow):
     def on_sc_calibrated(self, sc_stats):
         r2 = sc_stats["r_squared"]
         f_roll = sc_stats["f_roll"]
-        self.lbl_sc_health.setText(f"SC 0V Health: PASS (R² = {r2:.4f}, f_roll = {f_roll:.1f} Hz)")
+        pred_lnyq = sc_stats.get("predicted_lnyq_nh", 0.0)
+        if pred_lnyq > 0:
+            self.lbl_sc_health.setText(f"SC 0V Health: PASS (R² = {r2:.4f}, f_roll = {f_roll:.1f} Hz, L_nyq = {pred_lnyq:.1f} nH)")
+        else:
+            self.lbl_sc_health.setText(f"SC 0V Health: PASS (R² = {r2:.4f}, f_roll = {f_roll:.1f} Hz)")
         self.lbl_sc_health.setStyleSheet("padding: 4px; border-radius: 4px; background-color: #1b5e20; color: #b9f6ca; font-weight: bold;")
 
     @pyqtSlot(str, dict)
@@ -3675,12 +3918,15 @@ class CZMainWindow(QMainWindow):
         self.lbl_status.setText("STATE: PAUSED FOR 0V REVIEW")
         self.lbl_status.setStyleSheet("font-weight: bold; color: #ffd600; font-size: 11pt;")
         self.btn_resume.setEnabled(True)
+        pred_lnyq = sc_stats.get("predicted_lnyq_nh", 0.0)
+        lnyq_str = f"  - Predicted L_nyq: {pred_lnyq:.1f} nH\n" if pred_lnyq > 0 else ""
         QMessageBox.information(
             self,
             "0 V Calibration Inspection",
             f"0 V Superconducting Transfer Function fit complete:\n"
             f"  - R² Fit Quality: {sc_stats['r_squared']:.4f}\n"
             f"  - f_roll: {sc_stats['f_roll']:.1f} Hz\n"
+            f"{lnyq_str}"
             f"  - tau_shift: {sc_stats['tau_shift']*1e6:.2f} µs\n\n"
             f"Please inspect the 4 diagnostic subplots.\n"
             f"Click 'Resume / Proceed' to sweep higher voltages, or 'ABORT' to halt."

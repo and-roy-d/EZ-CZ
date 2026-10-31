@@ -182,9 +182,41 @@ def load_cz_sweep_dataset(
     else:
         raise ValueError(f"Neither 'fft_unroll' nor 'raw_data' present in {npz_0v_files[0]}")
 
+    # 1.5. Extract or predict f_roll and L_nyq from 0V SC transfer function
+    f_roll_0v = None
+    if "f_roll" in data_0v:
+        try:
+            f_roll_0v = float(data_0v["f_roll"])
+        except Exception:
+            f_roll_0v = None
+
+    if f_roll_0v is None and u0_fft is not None:
+        try:
+            from scipy.optimize import curve_fit
+            y_mag = np.abs(u0_fft)
+            valid = np.isfinite(fs_sch_ref) & np.isfinite(y_mag) & (fs_sch_ref > 0) & (y_mag > 0)
+            if np.sum(valid) > 4:
+                def _mag_lorentz(f, a0, fr):
+                    return a0 / np.sqrt(1.0 + (f / fr)**2)
+                popt, _ = curve_fit(
+                    _mag_lorentz,
+                    fs_sch_ref[valid],
+                    y_mag[valid],
+                    p0=[float(np.max(y_mag[valid])), 1000.0],
+                    bounds=([0.0, 1.0], [np.inf, 1e6])
+                )
+                f_roll_0v = float(popt[1])
+        except Exception as e:
+            logger.warning(f"Could not fit f_roll from 0V reference data: {e}")
+
+    predicted_lnyq_nh = None
+    if f_roll_0v is not None and f_roll_0v > 0:
+        # L = R_shunt / (2 * pi * f_roll)
+        predicted_lnyq_nh = (rshunt_uohm * 1e3) / (2.0 * np.pi * f_roll_0v)
+
     # 2. Process all non-zero bias points
     R_shunt = rshunt_uohm * 1e-6
-    L_nyq = lnyq_nh * 1e-9
+    L_nyq = (predicted_lnyq_nh * 1e-9) if predicted_lnyq_nh else (lnyq_nh * 1e-9)
 
     bias_points_dict = {}
     bias_voltages = []
@@ -253,6 +285,8 @@ def load_cz_sweep_dataset(
         "ref_0v_folder": ref_0v_folder,
         "fs_sch": fs_sch_ref,
         "u0_fft": u0_fft,
+        "f_roll_0v": f_roll_0v,
+        "predicted_lnyq_nh": predicted_lnyq_nh,
         "bias_points": bias_points_dict,
         "bias_voltages": bias_voltages,
         "num_biases": len(bias_voltages),
