@@ -46,7 +46,7 @@ from PyQt5.QtWidgets import (
     QGridLayout, QGroupBox, QLabel, QLineEdit, QPushButton, QTextEdit,
     QCheckBox, QMessageBox, QComboBox, QDoubleSpinBox, QSpinBox, QSplitter,
     QProgressBar, QTabWidget, QTableWidget, QTableWidgetItem, QHeaderView,
-    QFileDialog, QScrollArea, QFrame, QSizePolicy
+    QFileDialog, QScrollArea, QFrame, QSizePolicy, QInputDialog
 )
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, pyqtSlot
 from PyQt5.QtGui import QFont, QColor, QPalette
@@ -59,8 +59,8 @@ from matplotlib.backends.backend_qt5agg import NavigationToolbar2QT as Navigatio
 from matplotlib.figure import Figure
 import matplotlib.image as mpimg
 
-from ez_cz.models import AVAILABLE_MODELS, get_model, ParameterDef, FitResult
-from ez_cz.data_io import load_iv_curve, load_cz_sweep_dataset
+from ez_cz.models import AVAILABLE_MODELS, get_model, ParameterDef, FitResult, predict_ttes
+from ez_cz.data_io import load_iv_curve, load_cz_sweep_dataset, recompute_dataset_circuit_impedance
 
 # ---------------------------------------------------------------------------
 # Hardware Imports with Mock Fallbacks for Simulation / Offline Use
@@ -1431,13 +1431,16 @@ class AnalyzePlotCanvas(FigureCanvas):
             for s in ax.spines.values():
                 s.set_color(spine_col)
 
-            y_clean = 1.0 / z_clean
+            safe_z = np.where(np.abs(z_clean) > 1e-15, z_clean, np.nan + 1j * np.nan)
+            y_clean = 1.0 / safe_z
             ax.plot(np.real(y_clean), np.imag(y_clean), "o", color=c_data, ms=5, label="Measured Y")
             if z_model is not None:
-                y_mod = 1.0 / z_model
+                safe_m = np.where(np.abs(z_model) > 1e-15, z_model, np.nan + 1j * np.nan)
+                y_mod = 1.0 / safe_m
                 ax.plot(np.real(y_mod), np.imag(y_mod), "--", color=c_model, lw=2.0, label="Model Y")
             if z_fit is not None:
-                y_fit = 1.0 / z_fit
+                safe_f = np.where(np.abs(z_fit) > 1e-15, z_fit, np.nan + 1j * np.nan)
+                y_fit = 1.0 / safe_f
                 ax.plot(np.real(y_fit), np.imag(y_fit), "-", color=c_fit, lw=2.2, label="Fit Y")
 
             ax.set_xlabel("Re(Y) [S]", color=text_col)
@@ -1576,6 +1579,7 @@ class CZMainWindow(QMainWindow):
         self.current_selected_bias = None
         self.param_table_widgets = {}
         self.is_updating_params = False
+        self.saved_limits_memory = {}
 
         self.dark_stylesheet = """
             QMainWindow, QWidget {
@@ -2015,6 +2019,12 @@ class CZMainWindow(QMainWindow):
         self.btn_predict_lnyq.setStyleSheet("background-color: #0277bd; color: #ffffff; font-weight: bold; padding: 4px 10px;")
         self.btn_predict_lnyq.clicked.connect(self.on_predict_lnyq_clicked)
         m_top_h.addWidget(self.btn_predict_lnyq)
+
+        self.btn_predict_ttes = QPushButton("Predict Ttes")
+        self.btn_predict_ttes.setToolTip("Predict T_tes from thermal balance: P_tes = (G/n)*T_tes*(1 - (T_bath/T_tes)^n)")
+        self.btn_predict_ttes.setStyleSheet("background-color: #00897b; color: #ffffff; font-weight: bold; padding: 4px 10px;")
+        self.btn_predict_ttes.clicked.connect(self.on_predict_ttes_clicked)
+        m_top_h.addWidget(self.btn_predict_ttes)
         model_layout.addLayout(m_top_h)
 
         self.lbl_analyze_sc_info = QLabel("SC 0V Transfer Function: Not loaded")
@@ -2043,6 +2053,29 @@ class CZMainWindow(QMainWindow):
         self.table_analyze_params.setMaximumHeight(350)
         model_layout.addWidget(self.table_analyze_params)
 
+        # Limits memory controls
+        limits_h = QHBoxLayout()
+        limits_h.setSpacing(4)
+        self.btn_save_limits = QPushButton("Save Limits to Memory")
+        self.btn_save_limits.setToolTip("Save current Min/Max limits for this model to memory & disk")
+        self.btn_save_limits.setStyleSheet("background-color: #37474f; color: #eceff1; font-size: 8.5pt; padding: 4px 8px;")
+        self.btn_save_limits.clicked.connect(self.on_save_limits_clicked)
+
+        self.btn_load_limits = QPushButton("Load Limits from Memory")
+        self.btn_load_limits.setToolTip("Load saved Min/Max limits for this model from memory")
+        self.btn_load_limits.setStyleSheet("background-color: #37474f; color: #eceff1; font-size: 8.5pt; padding: 4px 8px;")
+        self.btn_load_limits.clicked.connect(self.on_load_limits_clicked)
+
+        self.btn_reset_limits = QPushButton("Reset Defaults")
+        self.btn_reset_limits.setToolTip("Reset Min/Max limits to built-in physical defaults")
+        self.btn_reset_limits.setStyleSheet("background-color: #455a64; color: #eceff1; font-size: 8.5pt; padding: 4px 8px;")
+        self.btn_reset_limits.clicked.connect(self.on_reset_limits_clicked)
+
+        limits_h.addWidget(self.btn_save_limits)
+        limits_h.addWidget(self.btn_load_limits)
+        limits_h.addWidget(self.btn_reset_limits)
+        model_layout.addLayout(limits_h)
+
         # Operating point & derived parameters badges
         self.lbl_analyze_op_info = QLabel("Operating Point: Load sweep and IV to inspect")
         self.lbl_analyze_op_info.setWordWrap(True)
@@ -2060,6 +2093,21 @@ class CZMainWindow(QMainWindow):
         exec_box = QGroupBox("Model Fitting & Save Controls")
         exec_layout = QVBoxLayout(exec_box)
         exec_layout.setSpacing(6)
+
+        target_h = QHBoxLayout()
+        target_h.addWidget(QLabel("Fit Target:"))
+        self.combo_fit_target = QComboBox()
+        self.combo_fit_target.addItem("Z_tes (TES Impedance)")
+        self.combo_fit_target.addItem("Y_tes (TES Admittance: 1/Ztes)")
+        self.combo_fit_target.addItem("Z_total (Ztes + Rshunt + jωL)")
+        self.combo_fit_target.addItem("Y_total (1/Ztotal)")
+        self.combo_fit_target.currentIndexChanged.connect(self.on_fit_target_changed)
+        target_h.addWidget(self.combo_fit_target, stretch=1)
+
+        self.lbl_fit_target_formula = QLabel("Circuit: Z_total = Z_tes + R_shunt + jωL")
+        self.lbl_fit_target_formula.setStyleSheet("color: #82b1ff; font-size: 8.5pt; font-style: italic;")
+        target_h.addWidget(self.lbl_fit_target_formula)
+        exec_layout.addLayout(target_h)
 
         btn_grid = QGridLayout()
         btn_grid.setSpacing(6)
@@ -2136,6 +2184,7 @@ class CZMainWindow(QMainWindow):
             "Nyquist: -Im(Z) vs Re(Z)",
             "Bode: Re(Z) & Im(Z) vs Frequency",
             "Admittance: Im(Y) vs Re(Y)",
+            "Total Loop Z: Ztes + Rshunt + jωL",
             "Residuals: (Data - Model) vs Frequency",
             "IV Curve & Operating Point",
         ])
@@ -3099,6 +3148,13 @@ class CZMainWindow(QMainWindow):
                 self.chk_analyze_save_in_raw.setChecked(bool(a["save_in_raw"]))
             if "model" in a and hasattr(self, "combo_analyze_model"):
                 self.combo_analyze_model.setCurrentText(str(a["model"]))
+            if "param_limits_memory" in a and isinstance(a["param_limits_memory"], dict):
+                self.saved_limits_memory = a["param_limits_memory"]
+            if "fit_target" in a and hasattr(self, "combo_fit_target"):
+                for idx in range(self.combo_fit_target.count()):
+                    if a["fit_target"] in self.combo_fit_target.itemText(idx):
+                        self.combo_fit_target.setCurrentIndex(idx)
+                        break
             self.log("INFO", f"Loaded parameters from {path}")
             if hasattr(self, "edit_analyze_raw_dir") and Path(self.edit_analyze_raw_dir.text().strip()).exists():
                 self.on_load_analyze_sweep()
@@ -3157,6 +3213,10 @@ class CZMainWindow(QMainWindow):
             analyze_cfg["model"] = self.combo_analyze_model.currentText()
         if hasattr(self, "chk_analyze_save_in_raw"):
             analyze_cfg["save_in_raw"] = self.chk_analyze_save_in_raw.isChecked()
+        if hasattr(self, "saved_limits_memory"):
+            analyze_cfg["param_limits_memory"] = self.saved_limits_memory
+        if hasattr(self, "combo_fit_target"):
+            analyze_cfg["fit_target"] = self.combo_fit_target.currentText()
         existing["analyze"] = analyze_cfg
 
         try:
@@ -3192,7 +3252,19 @@ class CZMainWindow(QMainWindow):
             self.on_load_analyze_sweep()
 
     def on_flip_bias_toggled(self):
-        self.on_load_analyze_sweep()
+        if self.analyze_sweep_data:
+            rsh = 250.0
+            if "R_shunt" in self.current_model_params:
+                rsh = self.current_model_params["R_shunt"].value
+            lnyq = 74.8
+            if "L_nyq" in self.current_model_params:
+                lnyq = self.current_model_params["L_nyq"].value
+            flip = self.chk_analyze_flip_bias.isChecked()
+            recompute_dataset_circuit_impedance(self.analyze_sweep_data, rsh, lnyq, flip_bias=flip)
+            self.current_fit_result = None
+            self.update_live_model_prediction()
+        else:
+            self.on_load_analyze_sweep()
 
     def on_load_analyze_iv(self):
         iv_path = Path(self.edit_analyze_iv_file.text().strip())
@@ -3306,7 +3378,150 @@ class CZMainWindow(QMainWindow):
                 f"SC 0V: f_roll = {f_roll:.1f} Hz | Pred Lnyq = {pred_lnyq:.1f} nH (R_sh = {rshunt:.1f} µΩ)"
             )
         self.log_analyze("INFO", f"Predicted L_nyq = {pred_lnyq:.2f} nH from SC f_roll = {f_roll:.1f} Hz (R_shunt = {rshunt:.2f} µΩ)")
+        flip = self.chk_analyze_flip_bias.isChecked() if hasattr(self, "chk_analyze_flip_bias") else True
+        recompute_dataset_circuit_impedance(self.analyze_sweep_data, rshunt, pred_lnyq, flip_bias=flip)
         self.update_live_model_prediction()
+
+    def on_predict_ttes_clicked(self):
+        """
+        Predicts operating temperature T_tes from steady-state power balance:
+            P_tes = (G / n) * T_tes * (1 - (T_bath / T_tes)^n)
+        P_tes is obtained from the IV operating point (P0 = I0^2 * R0) or user input.
+        Conductance G, thermal exponent n, and bath temperature T_bath are taken from the active model table.
+        """
+        g_param = None
+        for g_candidate in ("G_tes_bath", "G_int_bath", "G_tb"):
+            if g_candidate in self.current_model_params:
+                g_param = self.current_model_params[g_candidate]
+                break
+        if g_param is None:
+            self.log_analyze("WARN", "Current model does not include bath thermal conductance (G_tes_bath / G_int_bath).")
+            return
+
+        g_nW_per_K = g_param.value
+        g_W_per_K = g_nW_per_K * 1e-9
+
+        n_val = 3.2
+        if "n_mem" in self.current_model_params:
+            n_val = self.current_model_params["n_mem"].value
+
+        tbath_K = 0.020
+        if "T_bath" in self.current_model_params:
+            tbath_K = self.current_model_params["T_bath"].value
+
+        p_tes_W = None
+        if self.analyze_iv_data and self.current_selected_bias is not None:
+            op = self.analyze_iv_data["lookup_op"](self.current_selected_bias)
+            p_tes_W = float(op.get("p0", 0.0))
+
+        if p_tes_W is None or p_tes_W <= 0:
+            init_val_pW = 15.0
+            val, ok = QInputDialog.getDouble(
+                self,
+                "Predict T_tes",
+                "Enter TES Joule power P_tes (pW):\n(P_tes = G/n * T_tes * [1 - (T_bath/T_tes)^n])",
+                init_val_pW,
+                0.001,
+                100000.0,
+                3,
+            )
+            if not ok:
+                return
+            p_tes_W = val * 1e-12
+
+        t_tes_pred = predict_ttes(p_tes_W, g_W_per_K, n_val, tbath_K)
+
+        if "T_tes" in self.current_model_params:
+            self.current_model_params["T_tes"].value = t_tes_pred
+            self.sync_param_to_table("T_tes", t_tes_pred)
+
+        self.log_analyze(
+            "INFO",
+            f"Predicted T_tes = {t_tes_pred*1e3:.2f} mK from P_tes = {p_tes_W*1e12:.2f} pW, "
+            f"G = {g_nW_per_K:.2f} nW/K, n = {n_val:.2f}, T_bath = {tbath_K*1e3:.2f} mK"
+        )
+        self.update_live_model_prediction()
+
+    def on_save_limits_clicked(self):
+        """Saves current parameter Min/Max limits to in-memory dictionary and persists to settings."""
+        m_name = self.active_model.name
+        limits = {k: (float(p.min_val), float(p.max_val)) for k, p in self.current_model_params.items()}
+        self.saved_limits_memory[m_name] = limits
+        self.save_settings_to_json()
+        self.log_analyze("INFO", f"Saved {len(limits)} parameter limits to memory for '{m_name}'.")
+        QMessageBox.information(self, "Limits Saved", f"Parameter limits for '{m_name}' saved to memory.")
+
+    def on_load_limits_clicked(self):
+        """Loads and applies saved parameter Min/Max limits for active model."""
+        m_name = self.active_model.name
+        if m_name not in self.saved_limits_memory:
+            self.log_analyze("WARN", f"No custom limits saved in memory for '{m_name}'.")
+            QMessageBox.information(self, "No Saved Limits", f"No saved limits in memory for '{m_name}'.")
+            return
+        limits = self.saved_limits_memory[m_name]
+        self.is_updating_params = True
+        for k, (min_v, max_v) in limits.items():
+            if k in self.current_model_params:
+                self.current_model_params[k].min_val = min_v
+                self.current_model_params[k].max_val = max_v
+                if k in self.param_table_widgets:
+                    w = self.param_table_widgets[k]
+                    w["spin_min"].blockSignals(True)
+                    w["spin_max"].blockSignals(True)
+                    w["spin_min"].setValue(min_v)
+                    w["spin_max"].setValue(max_v)
+                    w["spin_min"].blockSignals(False)
+                    w["spin_max"].blockSignals(False)
+                    w["spin_val"].setRange(min_v, max_v)
+        self.is_updating_params = False
+        self.log_analyze("INFO", f"Loaded saved parameter limits from memory for '{m_name}'.")
+
+    def on_reset_limits_clicked(self):
+        """Resets parameter Min/Max limits to default physical bounds for active model."""
+        m_name = self.active_model.name
+        defs = self.active_model.get_parameter_defs()
+        self.is_updating_params = True
+        for k, p_def in defs.items():
+            if k in self.current_model_params:
+                self.current_model_params[k].min_val = p_def.min_val
+                self.current_model_params[k].max_val = p_def.max_val
+                if k in self.param_table_widgets:
+                    w = self.param_table_widgets[k]
+                    w["spin_min"].blockSignals(True)
+                    w["spin_max"].blockSignals(True)
+                    w["spin_min"].setValue(p_def.min_val)
+                    w["spin_max"].setValue(p_def.max_val)
+                    w["spin_min"].blockSignals(False)
+                    w["spin_max"].blockSignals(False)
+                    w["spin_val"].setRange(p_def.min_val, p_def.max_val)
+        self.is_updating_params = False
+        self.log_analyze("INFO", f"Reset parameter limits to default physical bounds for '{m_name}'.")
+
+    def get_selected_fit_target(self) -> str:
+        """Returns the fit target string: 'Z_tes', 'Y_tes', 'Z_total', or 'Y_total'."""
+        if not hasattr(self, "combo_fit_target"):
+            return "Z_tes"
+        txt = self.combo_fit_target.currentText()
+        if "Y_tes" in txt:
+            return "Y_tes"
+        elif "Z_total" in txt:
+            return "Z_total"
+        elif "Y_total" in txt:
+            return "Y_total"
+        return "Z_tes"
+
+    def on_fit_target_changed(self):
+        """Handles change in fit target dropdown and updates descriptive label."""
+        target = self.get_selected_fit_target()
+        if target == "Z_tes":
+            self.lbl_fit_target_formula.setText("Target: Z_tes (TES isolated impedance)")
+        elif target == "Y_tes":
+            self.lbl_fit_target_formula.setText("Target: Y_tes = 1 / Z_tes (admittance)")
+        elif target == "Z_total":
+            self.lbl_fit_target_formula.setText("Target: Z_total = Z_tes + R_shunt + jωL")
+        elif target == "Y_total":
+            self.lbl_fit_target_formula.setText("Target: Y_total = 1 / (Z_tes + R_shunt + jωL)")
+        self.log_analyze("INFO", f"Fit target switched to: {target}")
 
     def on_analyze_bias_changed(self):
         if not self.analyze_sweep_data or self.combo_analyze_bias_points.count() == 0:
@@ -3375,6 +3590,14 @@ class CZMainWindow(QMainWindow):
         self.table_analyze_params.setRowCount(0)
         self.param_table_widgets = {}
 
+        # Restore any saved memory limits for this model
+        if hasattr(self, "saved_limits_memory") and self.active_model.name in self.saved_limits_memory:
+            saved = self.saved_limits_memory[self.active_model.name]
+            for k, (m_low, m_high) in saved.items():
+                if k in self.current_model_params:
+                    self.current_model_params[k].min_val = m_low
+                    self.current_model_params[k].max_val = m_high
+
         params = self.current_model_params
         self.table_analyze_params.setRowCount(len(params))
 
@@ -3440,6 +3663,18 @@ class CZMainWindow(QMainWindow):
             return
         if name in self.current_model_params:
             self.current_model_params[name].value = val
+
+        # If R_shunt or L_nyq changed, recompute dataset circuit impedance
+        if name in ("R_shunt", "L_nyq") and self.analyze_sweep_data:
+            rsh = 250.0
+            if "R_shunt" in self.current_model_params:
+                rsh = self.current_model_params["R_shunt"].value
+            lnyq = 74.8
+            if "L_nyq" in self.current_model_params:
+                lnyq = self.current_model_params["L_nyq"].value
+            flip = self.chk_analyze_flip_bias.isChecked() if hasattr(self, "chk_analyze_flip_bias") else True
+            recompute_dataset_circuit_impedance(self.analyze_sweep_data, rsh, lnyq, flip_bias=flip)
+
         self.update_live_model_prediction()
 
     def on_table_param_freeze_changed(self, name: str, is_frozen: bool):
@@ -3452,6 +3687,10 @@ class CZMainWindow(QMainWindow):
                 self.current_model_params[name].min_val = min_v
             if max_v is not None:
                 self.current_model_params[name].max_val = max_v
+            if name in self.param_table_widgets:
+                p = self.current_model_params[name]
+                spin = self.param_table_widgets[name]["spin_val"]
+                spin.setRange(p.min_val, p.max_val)
 
     def update_live_model_prediction(self):
         """Instantaneously re-evaluates the theoretical model and updates plot."""
@@ -3520,6 +3759,23 @@ class CZMainWindow(QMainWindow):
                 plot_mode="admittance",
                 title=f"Admittance Y(f): Vbias = {vb:.3f} V",
             )
+        elif mode_text.startswith("Total Loop Z"):
+            b_info = self.analyze_sweep_data["bias_points"].get(vb, {}) if self.analyze_sweep_data else {}
+            ztot_data = b_info.get("z_total", z_data)
+            p_vals = {k: p.value for k, p in self.current_model_params.items()}
+            f_m = f_model if f_model is not None else f_data
+            ztot_model = self.active_model.calc_z_total(f_m, p_vals)
+            ztot_fit = None
+            f_fit = None
+            if self.current_fit_result:
+                f_fit = self.current_fit_result.f_dense
+                ztot_fit = self.current_fit_result.z_total_dense
+            self.analyze_canvas.plot_complex_z(
+                f_data, ztot_data, f_model=f_m, z_model=ztot_model,
+                f_fit=f_fit, z_fit=ztot_fit,
+                plot_mode="nyquist",
+                title=f"Total Loop Nyquist Z_total: Vbias = {vb:.3f} V (Ztes + Rshunt + jωL)",
+            )
         elif mode_text.startswith("Residuals"):
             z_fit = self.current_fit_result.z_dense if self.current_fit_result else z_model
             self.analyze_canvas.plot_complex_z(
@@ -3571,7 +3827,18 @@ class CZMainWindow(QMainWindow):
         self.lbl_analyze_status.setStyleSheet("font-weight: bold; color: #ffb74d; font-size: 10pt;")
         QApplication.processEvents()
 
-        res = self.active_model.fit(f_data, z_data, self.current_model_params)
+        fit_target = self.get_selected_fit_target()
+        y_data = b_info.get("y_tes")
+        ztot_data = b_info.get("z_total")
+
+        res = self.active_model.fit(
+            f_data,
+            z_data,
+            self.current_model_params,
+            fit_target=fit_target,
+            y_data=y_data,
+            z_total_data=ztot_data,
+        )
         elapsed_ms = (time.time() - t0) * 1000.0
 
         if res.success:
@@ -3596,7 +3863,7 @@ class CZMainWindow(QMainWindow):
             self.is_updating_params = False
 
             vb = self.current_selected_bias
-            self.log_analyze("INFO", f"=== Fit OK: Vbias={vb:.3f}V ({self.active_model.name}) ===")
+            self.log_analyze("INFO", f"=== Fit OK ({fit_target}): Vbias={vb:.3f}V ({self.active_model.name}) ===")
             for k, p in res.params.items():
                 err = res.errors.get(k, 0.0)
                 status = f"± {err:.3f}" if p.vary else "[FROZEN]"
@@ -3628,7 +3895,8 @@ class CZMainWindow(QMainWindow):
         self.btn_fit_model.setEnabled(False)
         self.prog_analyze.setValue(0)
 
-        self.log_analyze("INFO", f"Starting batch fit across {len(voltages)} bias points using {self.active_model.name}...")
+        fit_target = self.get_selected_fit_target()
+        self.log_analyze("INFO", f"Starting batch fit across {len(voltages)} bias points using {self.active_model.name} (target: {fit_target})...")
         results_rows = []
 
         try:
@@ -3640,15 +3908,24 @@ class CZMainWindow(QMainWindow):
 
                 f_d = b_info["f"]
                 z_d = b_info["z_tes"]
+                y_d = b_info.get("y_tes")
+                ztot_d = b_info.get("z_total")
 
                 if self.analyze_iv_data:
                     op = self.analyze_iv_data["lookup_op"](vb)
                     if "R_0" in self.current_model_params:
                         self.current_model_params["R_0"].value = op["rtes"] * 1e3
 
-                res = self.active_model.fit(f_d, z_d, self.current_model_params)
+                res = self.active_model.fit(
+                    f_d,
+                    z_d,
+                    self.current_model_params,
+                    fit_target=fit_target,
+                    y_data=y_d,
+                    z_total_data=ztot_d,
+                )
                 if res.success:
-                    row = {"Vbias_V": vb, "success": True, "chi2": res.chi2, "redchi": res.redchi}
+                    row = {"Vbias_V": vb, "fit_target": fit_target, "success": True, "chi2": res.chi2, "redchi": res.redchi}
                     for k, p in res.params.items():
                         row[k] = p.value
                         row[f"{k}_err"] = res.errors.get(k, 0.0)
@@ -3695,6 +3972,7 @@ class CZMainWindow(QMainWindow):
             "vbias": vb,
             "channel": ch,
             "model": self.active_model.name,
+            "fit_target": self.get_selected_fit_target(),
             "params": {k: {"value": p.value, "vary": p.vary, "unit": p.unit, "error": self.current_fit_result.errors.get(k, 0.0) if self.current_fit_result else 0.0}
                        for k, p in self.current_model_params.items()},
         }

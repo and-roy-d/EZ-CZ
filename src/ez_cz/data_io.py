@@ -253,11 +253,15 @@ def load_cz_sweep_dataset(
             if u_bias is None or len(u_bias) != len(fs_bias):
                 continue
 
-            # Calculate complex impedance
+            # Calculate complex impedance:
+            # Transfer function ratio: I_bias / I_0 = Z_circuit / Z_total
+            # where Z_circuit = R_shunt + 1j * omega * L_nyq
+            # and Z_total = Z_tes + R_shunt + 1j * omega * L_nyq = Z_tes + Z_circuit
             Z_circuit = 1j * 2.0 * np.pi * fs_bias * L_nyq + R_shunt
             ratio_I = u_bias / u0_fft
             safe_ratio = np.where(np.abs(ratio_I) > 1e-12, ratio_I, np.nan + 1j * np.nan)
-            Z_tes = Z_circuit * (1.0 / safe_ratio - 1.0)
+            Z_total = Z_circuit / safe_ratio
+            Z_tes = Z_total - Z_circuit
 
             valid_mask = np.isfinite(Z_tes)
 
@@ -265,6 +269,10 @@ def load_cz_sweep_dataset(
             is_flip = flip_bias or bool(data_bias.get("flip_bias", False))
             if is_flip or (np.sum(valid_mask) > 0 and np.real(Z_tes[valid_mask][0]) < 0):
                 Z_tes = -Z_tes
+                Z_total = Z_tes + Z_circuit
+
+            Y_tes = 1.0 / np.where(np.abs(Z_tes) > 1e-15, Z_tes, np.nan + 1j * np.nan)
+            Y_total = 1.0 / np.where(np.abs(Z_total) > 1e-15, Z_total, np.nan + 1j * np.nan)
 
             bias_points_dict[vb_val] = {
                 "vbias": vb_val,
@@ -272,6 +280,12 @@ def load_cz_sweep_dataset(
                 "file": npz_files[0],
                 "f": fs_bias,
                 "z_tes": Z_tes,
+                "z_total": Z_total,
+                "y_tes": Y_tes,
+                "y_total": Y_total,
+                "u_bias": u_bias,
+                "u0_fft": u0_fft,
+                "safe_ratio": safe_ratio,
                 "valid_mask": np.isfinite(Z_tes),
             }
             bias_voltages.append(vb_val)
@@ -287,7 +301,49 @@ def load_cz_sweep_dataset(
         "u0_fft": u0_fft,
         "f_roll_0v": f_roll_0v,
         "predicted_lnyq_nh": predicted_lnyq_nh,
+        "rshunt_uohm": rshunt_uohm,
+        "lnyq_nh": (predicted_lnyq_nh if predicted_lnyq_nh else lnyq_nh),
         "bias_points": bias_points_dict,
         "bias_voltages": bias_voltages,
         "num_biases": len(bias_voltages),
     }
+
+
+def recompute_dataset_circuit_impedance(
+    dataset: dict,
+    rshunt_uohm: float,
+    lnyq_nh: float,
+    flip_bias: bool = True
+):
+    """
+    Dynamically recomputes Z_circuit, Z_total, Z_tes, Y_tes, Y_total across all bias points
+    using updated R_shunt and L_nyq values:
+        Z_circuit = R_shunt + 1j * 2*pi*f * L_nyq
+        Z_total = Z_circuit / (u_bias / u0_fft)
+        Z_tes = Z_total - Z_circuit
+        Y_tes = 1 / Z_tes
+        Y_total = 1 / Z_total
+    """
+    R_sh = rshunt_uohm * 1e-6
+    L_val = lnyq_nh * 1e-9
+    dataset["rshunt_uohm"] = rshunt_uohm
+    dataset["lnyq_nh"] = lnyq_nh
+
+    for vb, b_info in dataset.get("bias_points", {}).items():
+        fs = b_info["f"]
+        safe_ratio = b_info.get("safe_ratio")
+        if safe_ratio is None:
+            continue
+        Z_circ = 1j * 2.0 * np.pi * fs * L_val + R_sh
+        Z_tot = Z_circ / safe_ratio
+        Z_t = Z_tot - Z_circ
+        valid = np.isfinite(Z_t)
+        if flip_bias or (np.sum(valid) > 0 and np.real(Z_t[valid][0]) < 0):
+            Z_t = -Z_t
+            Z_tot = Z_t + Z_circ
+
+        b_info["z_tes"] = Z_t
+        b_info["z_total"] = Z_tot
+        b_info["y_tes"] = 1.0 / np.where(np.abs(Z_t) > 1e-15, Z_t, np.nan + 1j * np.nan)
+        b_info["y_total"] = 1.0 / np.where(np.abs(Z_tot) > 1e-15, Z_tot, np.nan + 1j * np.nan)
+        b_info["valid_mask"] = np.isfinite(Z_t)

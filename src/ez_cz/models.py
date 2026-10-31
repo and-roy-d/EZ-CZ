@@ -54,6 +54,48 @@ class FitResult:
     cost: float = 0.0
     nfev: int = 0
     derived: Dict[str, float] = field(default_factory=dict)
+    fit_target: str = "Z_tes"
+    y_data: Optional[np.ndarray] = None
+    y_fit: Optional[np.ndarray] = None
+    y_dense: Optional[np.ndarray] = None
+    z_total_data: Optional[np.ndarray] = None
+    z_total_fit: Optional[np.ndarray] = None
+    z_total_dense: Optional[np.ndarray] = None
+
+
+def predict_ttes(P_tes_W: float, G_W_per_K: float, n: float, T_bath_K: float) -> float:
+    """
+    Predicts TES temperature T_tes (in Kelvin) from steady-state power balance:
+        P_tes = (G / n) * T_tes * (1 - (T_bath / T_tes)^n)
+    where:
+        P_tes_W: TES Joule power in Watts (from IV curve P0 = I0^2 * R0)
+        G_W_per_K: Thermal conductance dP/dT at T_tes in W/K (e.g. G_tes_bath * 1e-9)
+        n: Thermal conductance exponent n_mem (dimensionless, typically 3-4)
+        T_bath_K: Bath temperature in Kelvin (T_bath)
+    """
+    T_bath_K = max(T_bath_K, 1e-4)
+    if P_tes_W <= 0 or G_W_per_K <= 0 or n <= 0:
+        return float(T_bath_K)
+    t_guess = (n * P_tes_W) / G_W_per_K
+    low = max(T_bath_K * 1.000001, 1e-4)
+    high = max(T_bath_K + t_guess * 5.0, 2.0)
+
+    def func(T):
+        return (G_W_per_K / n) * T * (1.0 - (T_bath_K / max(T, 1e-6))**n) - P_tes_W
+
+    try:
+        from scipy.optimize import brentq
+        return float(brentq(func, low, high, xtol=1e-7, maxiter=100))
+    except Exception:
+        # Fallback fixed-point iteration
+        T = max(t_guess, T_bath_K * 1.2)
+        for _ in range(50):
+            k = G_W_per_K / (n * max(T, 1e-5)**(n - 1.0))
+            T_next = (T_bath_K**n + P_tes_W / max(k, 1e-15))**(1.0 / n)
+            if abs(T_next - T) < 1e-7:
+                return float(T_next)
+            T = 0.5 * (T + T_next)
+        return float(T)
 
 
 class ThermalModelBase:
@@ -74,6 +116,29 @@ class ThermalModelBase:
         """
         raise NotImplementedError
 
+    def calc_z_total(self, f: np.ndarray, params: Dict[str, float]) -> np.ndarray:
+        """
+        Calculates total complex loop impedance:
+            Z_total(f) = Z_tes(f) + R_shunt + 1j * 2*pi*f * L_nyq
+        """
+        z_tes = self.calc_z_tes(f, params)
+        rshunt = params.get("R_shunt", 250.0) * 1e-6
+        lnyq = params.get("L_nyq", 74.8) * 1e-9
+        omega = 2.0 * np.pi * f
+        return z_tes + rshunt + 1j * omega * lnyq
+
+    def calc_y_tes(self, f: np.ndarray, params: Dict[str, float]) -> np.ndarray:
+        """Calculates TES complex admittance: Y_tes(f) = 1 / Z_tes(f)."""
+        z_tes = self.calc_z_tes(f, params)
+        safe = np.where(np.abs(z_tes) > 1e-15, z_tes, np.nan + 1j * np.nan)
+        return 1.0 / safe
+
+    def calc_y_total(self, f: np.ndarray, params: Dict[str, float]) -> np.ndarray:
+        """Calculates total loop complex admittance: Y_total(f) = 1 / Z_total(f)."""
+        z_tot = self.calc_z_total(f, params)
+        safe = np.where(np.abs(z_tot) > 1e-15, z_tot, np.nan + 1j * np.nan)
+        return 1.0 / safe
+
     def calc_derived(self, params: Dict[str, float]) -> Dict[str, float]:
         """Calculates derived parameters (P0, L_I, tau, tau_I, etc.)."""
         return {}
@@ -87,16 +152,20 @@ class ThermalModelBase:
         max_nfev: int = 2000,
         ftol: float = 1e-8,
         xtol: float = 1e-8,
+        fit_target: str = "Z_tes",
+        y_data: Optional[np.ndarray] = None,
+        z_total_data: Optional[np.ndarray] = None,
     ) -> FitResult:
         """
-        Fits floating (vary=True) parameters to complex impedance data.
-        f: frequencies (Hz)
-        z_data: complex impedance data (Ohms)
-        params: dictionary of ParameterDef
+        Fits floating (vary=True) parameters to complex impedance or admittance data.
+        fit_target: 'Z_tes' (default), 'Y_tes', 'Z_total', or 'Y_total'
+        where Z_total = Z_tes + R_shunt + 1j * 2*pi*f * L_nyq
         """
         valid_mask = np.isfinite(z_data) & np.isfinite(f) & (f > 0)
         f_clean = np.asarray(f[valid_mask], dtype=float)
         z_clean = np.asarray(z_data[valid_mask], dtype=complex)
+        y_clean = np.asarray(y_data[valid_mask], dtype=complex) if (y_data is not None and len(y_data) == len(z_data)) else 1.0 / np.where(np.abs(z_clean) > 1e-15, z_clean, np.nan + 1j * np.nan)
+        ztot_clean = np.asarray(z_total_data[valid_mask], dtype=complex) if (z_total_data is not None and len(z_total_data) == len(z_data)) else None
 
         if len(f_clean) < 4:
             return FitResult(
@@ -111,6 +180,7 @@ class ThermalModelBase:
                 z_fit=np.full_like(z_clean, np.nan + 1j * np.nan),
                 f_dense=np.array([]),
                 z_dense=np.array([]),
+                fit_target=fit_target,
             )
 
         # Identify varying parameters
@@ -121,9 +191,26 @@ class ThermalModelBase:
             # All parameters frozen: just evaluate
             current_vals = {k: p.value for k, p in params.items()}
             z_pred = self.calc_z_tes(f_clean, current_vals)
+            y_pred = self.calc_y_tes(f_clean, current_vals)
+            ztot_pred = self.calc_z_total(f_clean, current_vals)
             f_dense = np.geomspace(min(f_clean[0], 1.0), max(f_clean[-1], 1e5), 300)
             z_dense = self.calc_z_tes(f_dense, current_vals)
-            res_vec = np.concatenate([np.real(z_clean - z_pred), np.imag(z_clean - z_pred)])
+            y_dense = self.calc_y_tes(f_dense, current_vals)
+            ztot_dense = self.calc_z_total(f_dense, current_vals)
+
+            if fit_target == "Y_tes":
+                diff = y_clean - y_pred
+            elif fit_target == "Z_total":
+                target_ztot = ztot_clean if ztot_clean is not None else (z_clean + (current_vals.get("R_shunt", 250.0)*1e-6 + 1j*2*np.pi*f_clean*current_vals.get("L_nyq", 74.8)*1e-9))
+                diff = target_ztot - ztot_pred
+            elif fit_target == "Y_total":
+                target_ztot = ztot_clean if ztot_clean is not None else (z_clean + (current_vals.get("R_shunt", 250.0)*1e-6 + 1j*2*np.pi*f_clean*current_vals.get("L_nyq", 74.8)*1e-9))
+                target_ytot = 1.0 / np.where(np.abs(target_ztot) > 1e-15, target_ztot, np.nan + 1j * np.nan)
+                diff = target_ytot - (1.0 / ztot_pred)
+            else:
+                diff = z_clean - z_pred
+
+            res_vec = np.concatenate([np.real(diff), np.imag(diff)])
             chi2 = float(np.sum(res_vec**2))
             return FitResult(
                 success=True,
@@ -138,6 +225,13 @@ class ThermalModelBase:
                 f_dense=f_dense,
                 z_dense=z_dense,
                 derived=self.calc_derived(current_vals),
+                fit_target=fit_target,
+                y_data=y_clean,
+                y_fit=y_pred,
+                y_dense=y_dense,
+                z_total_data=ztot_clean,
+                z_total_fit=ztot_pred,
+                z_total_dense=ztot_dense,
             )
 
         x0 = [params[k].value for k in vary_keys]
@@ -152,10 +246,33 @@ class ThermalModelBase:
             cand = dict(frozen_vals)
             for k, val in zip(vary_keys, x):
                 cand[k] = val
+
             z_mod = self.calc_z_tes(f_clean, cand)
             if not np.all(np.isfinite(z_mod)):
                 return np.full(2 * len(f_clean), 1e6)
-            diff = z_clean - z_mod
+
+            if fit_target == "Y_tes":
+                y_mod = 1.0 / np.where(np.abs(z_mod) > 1e-15, z_mod, 1e-15)
+                diff = y_clean - y_mod
+            elif fit_target == "Z_total":
+                rsh = cand.get("R_shunt", 250.0) * 1e-6
+                lnyq = cand.get("L_nyq", 74.8) * 1e-9
+                z_circ = rsh + 1j * 2.0 * np.pi * f_clean * lnyq
+                z_tot_mod = z_mod + z_circ
+                target_ztot = ztot_clean if ztot_clean is not None else (z_clean + z_circ)
+                diff = target_ztot - z_tot_mod
+            elif fit_target == "Y_total":
+                rsh = cand.get("R_shunt", 250.0) * 1e-6
+                lnyq = cand.get("L_nyq", 74.8) * 1e-9
+                z_circ = rsh + 1j * 2.0 * np.pi * f_clean * lnyq
+                z_tot_mod = z_mod + z_circ
+                y_tot_mod = 1.0 / np.where(np.abs(z_tot_mod) > 1e-15, z_tot_mod, 1e-15)
+                target_ztot = ztot_clean if ztot_clean is not None else (z_clean + z_circ)
+                target_ytot = 1.0 / np.where(np.abs(target_ztot) > 1e-15, target_ztot, 1e-15)
+                diff = target_ytot - y_tot_mod
+            else:
+                diff = z_clean - z_mod
+
             if weights is not None:
                 diff = diff * weights
             return np.concatenate([np.real(diff), np.imag(diff)])
@@ -192,8 +309,13 @@ class ThermalModelBase:
 
             final_vals = {k: p.value for k, p in result_params.items()}
             z_pred = self.calc_z_tes(f_clean, final_vals)
+            y_pred = self.calc_y_tes(f_clean, final_vals)
+            ztot_pred = self.calc_z_total(f_clean, final_vals)
             f_dense = np.geomspace(min(f_clean[0], 1.0), max(f_clean[-1], 1e5), 300)
             z_dense = self.calc_z_tes(f_dense, final_vals)
+            y_dense = self.calc_y_tes(f_dense, final_vals)
+            ztot_dense = self.calc_z_total(f_dense, final_vals)
+
             chi2 = float(np.sum(opt.fun**2))
             dof = max(len(opt.fun) - len(opt.x), 1)
             redchi = chi2 / dof
@@ -213,6 +335,13 @@ class ThermalModelBase:
                 cost=float(opt.cost),
                 nfev=int(opt.nfev),
                 derived=self.calc_derived(final_vals),
+                fit_target=fit_target,
+                y_data=y_clean,
+                y_fit=y_pred,
+                y_dense=y_dense,
+                z_total_data=ztot_clean,
+                z_total_fit=ztot_pred,
+                z_total_dense=ztot_dense,
             )
         except Exception as e:
             return FitResult(
@@ -227,6 +356,7 @@ class ThermalModelBase:
                 z_fit=np.full_like(z_clean, np.nan + 1j * np.nan),
                 f_dense=np.array([]),
                 z_dense=np.array([]),
+                fit_target=fit_target,
             )
 
 
@@ -251,25 +381,25 @@ class SimpleModel(ThermalModelBase):
         Lnyq = kwargs.get("Lnyq", 74.8)  # nH
 
         defs = [
-            ParameterDef("C_tes", "C_tes (pJ/K)", C_tes, 1e-4, 1000.0, vary=True, unit="pJ/K", unit_scale=1e-12,
+            ParameterDef("C_tes", "C_tes (pJ/K)", C_tes, 0.001, 50.0, vary=True, unit="pJ/K", unit_scale=1e-12,
                          category="thermal", description="Heat capacity of the TES"),
-            ParameterDef("G_tes_bath", "G_tes_bath (nW/K)", G_tb, 1e-4, 1000.0, vary=True, unit="nW/K", unit_scale=1e-9,
+            ParameterDef("G_tes_bath", "G_tes_bath (nW/K)", G_tb, 0.0001, 50.0, vary=True, unit="nW/K", unit_scale=1e-9,
                          category="thermal", description="Thermal conductance from TES to cold bath"),
-            ParameterDef("alpha", "alpha (dlnR/dlnT)", alpha, 0.0, 5000.0, vary=True, unit="", unit_scale=1.0,
+            ParameterDef("alpha", "alpha (dlnR/dlnT)", alpha, 0.0, 1500.0, vary=True, unit="", unit_scale=1.0,
                          category="sensitivity", description="Logarithmic temperature sensitivity"),
-            ParameterDef("beta", "beta (dlnR/dlnI)", beta, 0.0, 100.0, vary=True, unit="", unit_scale=1.0,
+            ParameterDef("beta", "beta (dlnR/dlnI)", beta, 0.0, 30.0, vary=True, unit="", unit_scale=1.0,
                          category="sensitivity", description="Logarithmic current sensitivity"),
-            ParameterDef("R_0", "R0 (mOhm)", R0, 1e-4, 1000.0, vary=False, unit="mOhm", unit_scale=1e-3,
+            ParameterDef("R_0", "R0 (mOhm)", R0, 0.001, 500.0, vary=False, unit="mOhm", unit_scale=1e-3,
                          category="circuit", description="TES DC bias operating resistance"),
-            ParameterDef("R_shunt", "Rshunt (uOhm)", Rshunt, 0.1, 50000.0, vary=False, unit="uOhm", unit_scale=1e-6,
+            ParameterDef("R_shunt", "Rshunt (uOhm)", Rshunt, 1.0, 5000.0, vary=False, unit="uOhm", unit_scale=1e-6,
                          category="circuit", description="Thevenin shunt resistance"),
-            ParameterDef("L_nyq", "Lnyq (nH)", Lnyq, 0.1, 10000.0, vary=False, unit="nH", unit_scale=1e-9,
+            ParameterDef("L_nyq", "Lnyq (nH)", Lnyq, 1.0, 2000.0, vary=False, unit="nH", unit_scale=1e-9,
                          category="circuit", description="Total Nyquist loop inductance"),
-            ParameterDef("T_tes", "Tc / T_tes (K)", Tc, 0.001, 2.0, vary=False, unit="K", unit_scale=1.0,
+            ParameterDef("T_tes", "Tc / T_tes (K)", Tc, 0.005, 1.0, vary=False, unit="K", unit_scale=1.0,
                          category="operating", description="Operating temperature of the TES"),
-            ParameterDef("T_bath", "Tbath (K)", Tbath, 0.001, 1.0, vary=False, unit="K", unit_scale=1.0,
+            ParameterDef("T_bath", "Tbath (K)", Tbath, 0.001, 0.5, vary=False, unit="K", unit_scale=1.0,
                          category="operating", description="Bath temperature"),
-            ParameterDef("n_mem", "Thermal n", n, 1.0, 10.0, vary=False, unit="", unit_scale=1.0,
+            ParameterDef("n_mem", "Thermal n", n, 1.5, 6.0, vary=False, unit="", unit_scale=1.0,
                          category="operating", description="Thermal conductance power law exponent"),
         ]
         return {p.name: p for p in defs}
@@ -337,10 +467,10 @@ class DanglingModel(ThermalModelBase):
 
         defs = [
             simple["C_tes"],
-            ParameterDef("C_abs", "C_abs (pJ/K)", C_abs, 1e-4, 5000.0, vary=True, unit="pJ/K", unit_scale=1e-12,
+            ParameterDef("C_abs", "C_abs (pJ/K)", C_abs, 0.001, 200.0, vary=True, unit="pJ/K", unit_scale=1e-12,
                          category="thermal", description="Dangling absorber heat capacity"),
             simple["G_tes_bath"],
-            ParameterDef("G_abs_tes", "G_abs_tes (nW/K)", G_at, 1e-4, 5000.0, vary=True, unit="nW/K", unit_scale=1e-9,
+            ParameterDef("G_abs_tes", "G_abs_tes (nW/K)", G_at, 0.001, 100.0, vary=True, unit="nW/K", unit_scale=1e-9,
                          category="thermal", description="Thermal conductance between absorber and TES"),
             simple["alpha"],
             simple["beta"],
@@ -407,11 +537,11 @@ class InterveningModel(ThermalModelBase):
 
         defs = [
             simple["C_tes"],
-            ParameterDef("C_int", "C_int (pJ/K)", C_int, 1e-4, 5000.0, vary=True, unit="pJ/K", unit_scale=1e-12,
+            ParameterDef("C_int", "C_int (pJ/K)", C_int, 0.001, 50.0, vary=True, unit="pJ/K", unit_scale=1e-12,
                          category="thermal", description="Intervening stage heat capacity"),
-            ParameterDef("G_tes_int", "G_tes_int (nW/K)", G_ti, 1e-4, 5000.0, vary=True, unit="nW/K", unit_scale=1e-9,
+            ParameterDef("G_tes_int", "G_tes_int (nW/K)", G_ti, 0.001, 100.0, vary=True, unit="nW/K", unit_scale=1e-9,
                          category="thermal", description="Thermal conductance between TES and intervening stage"),
-            ParameterDef("G_int_bath", "G_int_bath (nW/K)", G_ib, 1e-4, 5000.0, vary=True, unit="nW/K", unit_scale=1e-9,
+            ParameterDef("G_int_bath", "G_int_bath (nW/K)", G_ib, 0.0001, 50.0, vary=True, unit="nW/K", unit_scale=1e-9,
                          category="thermal", description="Thermal conductance between intervening stage and bath"),
             simple["alpha"],
             simple["beta"],
@@ -498,10 +628,10 @@ class IntermediateDanglingModel(ThermalModelBase):
         defs = [
             inter["C_tes"],
             inter["C_int"],
-            ParameterDef("C_dang", "C_dang (pJ/K)", C_dang, 1e-4, 10000.0, vary=True, unit="pJ/K", unit_scale=1e-12,
+            ParameterDef("C_dang", "C_dang (pJ/K)", C_dang, 0.001, 200.0, vary=True, unit="pJ/K", unit_scale=1e-12,
                          category="thermal", description="Dangling absorber heat capacity"),
             inter["G_tes_int"],
-            ParameterDef("G_int_dang", "G_int_dang (nW/K)", G_id, 1e-4, 10000.0, vary=True, unit="nW/K", unit_scale=1e-9,
+            ParameterDef("G_int_dang", "G_int_dang (nW/K)", G_id, 0.001, 100.0, vary=True, unit="nW/K", unit_scale=1e-9,
                          category="thermal", description="Conductance between intervening stage and dangling body"),
             inter["G_int_bath"],
             inter["alpha"],
