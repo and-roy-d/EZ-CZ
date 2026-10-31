@@ -33,6 +33,7 @@ import logging
 import subprocess
 from datetime import datetime
 from pathlib import Path
+from typing import Optional, Dict, List, Tuple, Any
 import numpy as np
 import scipy.fft
 from lmfit import Model, Parameters
@@ -1075,7 +1076,7 @@ class CZPlotCanvas(FigureCanvas):
         super().__init__(self.fig)
         self.setParent(parent)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        self.setMinimumSize(300, 200)
+        self.setMinimumSize(250, 180)
         self.init_plots()
 
     def init_plots(self):
@@ -1275,7 +1276,7 @@ class AnalyzePlotCanvas(FigureCanvas):
         super().__init__(self.fig)
         self.setParent(parent)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        self.setMinimumSize(300, 200)
+        self.setMinimumSize(250, 180)
         self.show_placeholder("No Complex Z data loaded.\nSelect a raw directory and load data to begin analysis.")
 
     def show_placeholder(self, text: str):
@@ -1473,8 +1474,15 @@ class CZMainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("EZ-CZ Dashboard - Complex Impedance")
-        self.setMinimumSize(850, 550)
-        self.resize(1350, 850)
+        self.setMinimumSize(700, 450)
+        screen = QApplication.primaryScreen()
+        if screen:
+            avail = screen.availableGeometry()
+            w = min(1200, max(750, avail.width() - 40))
+            h = min(720, max(480, avail.height() - 40))
+            self.resize(w, h)
+        else:
+            self.resize(1100, 640)
         self.worker = None
         self.analyze_worker = None
         self.analyze_plot_files = {}
@@ -1606,13 +1614,13 @@ class CZMainWindow(QMainWindow):
                 color: #b0bec5;
                 font-size: 11pt;
                 font-weight: bold;
-                padding: 10px 24px;
+                padding: 8px 18px;
                 margin-right: 4px;
                 border-top-left-radius: 6px;
                 border-top-right-radius: 6px;
                 border: 1px solid #2d3748;
                 border-bottom: none;
-                min-width: 110px;
+                min-width: 90px;
             }
             QTabWidget#main_tabs > QTabBar::tab:selected {
                 background-color: #151922;
@@ -1666,10 +1674,11 @@ class CZMainWindow(QMainWindow):
 
         # Tab Widget for Parameter Sections
         tabs = QTabWidget()
-        tabs.addTab(self._create_bias_tab(), "Bias & DC Source")
-        tabs.addTab(self._create_awg_tab(), "AWG Stimulus")
-        tabs.addTab(self._create_timing_tab(), "Timing / Flux Ramp")
-        tabs.addTab(self._create_sc_health_tab(), "SC Health Check")
+        tabs.setObjectName("measure_subtabs")
+        tabs.addTab(self._create_bias_tab(), "Bias / DC")
+        tabs.addTab(self._create_awg_tab(), "AWG Comb")
+        tabs.addTab(self._create_timing_tab(), "Timing")
+        tabs.addTab(self._create_sc_health_tab(), "SC Health")
         left_layout.addWidget(tabs, stretch=0)
 
         # Safety & Status Group
@@ -1689,6 +1698,7 @@ class CZMainWindow(QMainWindow):
 
         # Health Indicator Badge
         self.lbl_sc_health = QLabel("SC 0V Health: Not Tested")
+        self.lbl_sc_health.setWordWrap(True)
         self.lbl_sc_health.setStyleSheet("padding: 4px; border-radius: 4px; background-color: #263238; color: #eceff1; font-weight: bold;")
         status_layout.addWidget(self.lbl_sc_health)
 
@@ -1734,14 +1744,14 @@ class CZMainWindow(QMainWindow):
             self.btn_abort,
             self.btn_resume,
         ):
-            button.setMinimumHeight(38)
+            button.setMinimumHeight(36)
             button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
 
         btn_layout.addWidget(self.btn_check_limits, 0, 0)
         btn_layout.addWidget(self.btn_test_0v, 0, 1)
         btn_layout.addWidget(self.btn_start, 1, 0)
         btn_layout.addWidget(self.btn_abort, 1, 1)
-        btn_layout.addWidget(self.btn_resume, 2, 0)
+        btn_layout.addWidget(self.btn_resume, 2, 0, 1, 2)
         left_layout.addWidget(btn_box)
 
         # Save settings button
@@ -1765,7 +1775,7 @@ class CZMainWindow(QMainWindow):
         left_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         left_scroll.setFrameShape(QFrame.NoFrame)
         left_scroll.setStyleSheet("QScrollArea { border: none; background: transparent; }")
-        left_scroll.setMinimumWidth(360)
+        left_scroll.setMinimumWidth(320)
         splitter.addWidget(left_scroll)
 
         # Right Pane: 4-Panel Live Canvas & Toolbar
@@ -1781,13 +1791,13 @@ class CZMainWindow(QMainWindow):
         right_layout.addWidget(self.toolbar)
         right_layout.addWidget(self.canvas, stretch=1)
 
-        right_widget.setMinimumSize(350, 250)
+        right_widget.setMinimumSize(320, 220)
         splitter.addWidget(right_widget)
         splitter.setCollapsible(0, False)
         splitter.setCollapsible(1, False)
         splitter.setStretchFactor(0, 4)
         splitter.setStretchFactor(1, 6)
-        splitter.setSizes([520, 780])
+        splitter.setSizes([450, 750])
         return splitter
 
     def _create_analyze_tab(self):
@@ -1874,23 +1884,29 @@ class CZMainWindow(QMainWindow):
         self.table_analyze_params = QTableWidget()
         self.table_analyze_params.setColumnCount(6)
         self.table_analyze_params.setHorizontalHeaderLabels(["Parameter", "Value", "Freeze", "Min", "Max", "± Error"])
-        self.table_analyze_params.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
-        self.table_analyze_params.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
-        self.table_analyze_params.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
-        self.table_analyze_params.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeToContents)
-        self.table_analyze_params.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeToContents)
-        self.table_analyze_params.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeToContents)
+        self.table_analyze_params.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        self.table_analyze_params.horizontalHeader().setSectionResizeMode(1, QHeaderView.Interactive)
+        self.table_analyze_params.horizontalHeader().setSectionResizeMode(2, QHeaderView.Interactive)
+        self.table_analyze_params.horizontalHeader().setSectionResizeMode(3, QHeaderView.Interactive)
+        self.table_analyze_params.horizontalHeader().setSectionResizeMode(4, QHeaderView.Interactive)
+        self.table_analyze_params.horizontalHeader().setSectionResizeMode(5, QHeaderView.Stretch)
+        self.table_analyze_params.setColumnWidth(1, 80)
+        self.table_analyze_params.setColumnWidth(2, 55)
+        self.table_analyze_params.setColumnWidth(3, 75)
+        self.table_analyze_params.setColumnWidth(4, 75)
         self.table_analyze_params.verticalHeader().setVisible(False)
-        self.table_analyze_params.setMinimumHeight(160)
+        self.table_analyze_params.setMinimumHeight(170)
         self.table_analyze_params.setMaximumHeight(280)
         model_layout.addWidget(self.table_analyze_params)
 
         # Operating point & derived parameters badges
         self.lbl_analyze_op_info = QLabel("Operating Point: Load sweep and IV to inspect")
+        self.lbl_analyze_op_info.setWordWrap(True)
         self.lbl_analyze_op_info.setStyleSheet("color: #82b1ff; font-weight: bold; font-size: 9pt;")
         model_layout.addWidget(self.lbl_analyze_op_info)
 
         self.lbl_analyze_derived = QLabel("Derived Parameters: --")
+        self.lbl_analyze_derived.setWordWrap(True)
         self.lbl_analyze_derived.setStyleSheet("color: #b0bec5; font-size: 9pt;")
         model_layout.addWidget(self.lbl_analyze_derived)
 
@@ -1958,7 +1974,7 @@ class CZMainWindow(QMainWindow):
         left_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         left_scroll.setFrameShape(QFrame.NoFrame)
         left_scroll.setStyleSheet("QScrollArea { border: none; background: transparent; }")
-        left_scroll.setMinimumWidth(360)
+        left_scroll.setMinimumWidth(320)
         splitter.addWidget(left_scroll)
 
         # Right Pane: Interactive Live Plot Viewer
@@ -1992,6 +2008,7 @@ class CZMainWindow(QMainWindow):
         plot_ctl_layout.addWidget(self.btn_next_bias, 1, 1)
 
         self.lbl_analyze_view_info = QLabel("No data loaded")
+        self.lbl_analyze_view_info.setWordWrap(True)
         self.lbl_analyze_view_info.setStyleSheet("color: #82b1ff; font-weight: bold; padding: 2px;")
         plot_ctl_layout.addWidget(self.lbl_analyze_view_info, 1, 2, 1, 2)
 
@@ -2004,13 +2021,13 @@ class CZMainWindow(QMainWindow):
         right_layout.addWidget(self.analyze_toolbar)
         right_layout.addWidget(self.analyze_canvas, stretch=1)
 
-        right_widget.setMinimumSize(350, 250)
+        right_widget.setMinimumSize(320, 220)
         splitter.addWidget(right_widget)
         splitter.setCollapsible(0, False)
         splitter.setCollapsible(1, False)
         splitter.setStretchFactor(0, 4)
         splitter.setStretchFactor(1, 6)
-        splitter.setSizes([520, 780])
+        splitter.setSizes([450, 750])
 
         # Initial parameter table construction
         self.build_parameter_table()
@@ -2040,13 +2057,14 @@ class CZMainWindow(QMainWindow):
         self.spin_channel.setValue(13)
         source_layout.addWidget(self.spin_channel, 0, 3)
 
-        self.chk_flip_bias = QCheckBox("Flip bias? (opposite model sign, Re(Z) > 0 at DC)")
+        self.chk_flip_bias = QCheckBox("Flip bias? (Re(Z) > 0 at DC)")
         self.chk_flip_bias.setChecked(False)
         self.chk_flip_bias.setStyleSheet("font-weight: bold; color: #0288d1;")
         self.chk_flip_bias.setToolTip("If enabled, the 0V SC transfer function model is generated with opposite sign so the delay fitter does not crash and Re(Z) is positive at DC.")
         source_layout.addWidget(self.chk_flip_bias, 1, 0, 1, 4)
 
-        self.lbl_dc_source_note = QLabel("AWG Direct Mode: DC offset is generated directly on AWG Channel 2 (no external DC box required).")
+        self.lbl_dc_source_note = QLabel("AWG Direct Mode: DC offset generated on AWG Ch2 (no external DC box required).")
+        self.lbl_dc_source_note.setWordWrap(True)
         self.lbl_dc_source_note.setStyleSheet("color: #00897b; font-size: 8.5pt; font-style: italic;")
         source_layout.addWidget(self.lbl_dc_source_note, 2, 0, 1, 4)
 
@@ -2099,7 +2117,8 @@ class CZMainWindow(QMainWindow):
         cond_grid.addWidget(self.spin_base_bias, 0, 1)
         cond_grid.addWidget(QLabel("(Fixed 0.0 V for SC calibration)"), 0, 2)
 
-        self.chk_normal_first = QCheckBox("SC check, then normalize TES for 1 s before sweep")
+        self.chk_normal_first = QCheckBox("Pre-normalize TES for 1 s before sweep")
+        self.chk_normal_first.setToolTip("SC check, then pulse normal for 1 s and settle before sweep")
         self.chk_normal_first.setChecked(False)
         self.chk_normal_first.toggled.connect(self.update_bias_preview)
         cond_grid.addWidget(self.chk_normal_first, 0, 3)
@@ -2283,14 +2302,15 @@ class CZMainWindow(QMainWindow):
         self.spin_high_f_cutoff.valueChanged.connect(self.update_comb_info)
         grid.addWidget(self.spin_high_f_cutoff, 6, 1)
 
-        self.chk_schroeder = QCheckBox("Schroeder Phase Comb (Prevents AWG clipping for 20-100+ tones)")
+        self.chk_schroeder = QCheckBox("Schroeder Phase Comb (Prevents AWG clipping)")
+        self.chk_schroeder.setToolTip("Disperses tone phases quadratically to minimize crest factor and prevent AWG clipping.")
         self.chk_schroeder.setChecked(True)
         self.chk_schroeder.setStyleSheet("color: #0288d1; font-weight: bold;")
         self.chk_schroeder.toggled.connect(self.update_comb_info)
         grid.addWidget(self.chk_schroeder, 7, 0, 1, 2)
 
         line_layout = QHBoxLayout()
-        self.chk_skip_line = QCheckBox("Skip Line Noise Harmonics")
+        self.chk_skip_line = QCheckBox("Skip Line Harmonics")
         self.chk_skip_line.setChecked(True)
         self.chk_skip_line.setStyleSheet("color: #7b1fa2; font-weight: bold;")
         self.chk_skip_line.toggled.connect(self.update_comb_info)
@@ -2306,6 +2326,7 @@ class CZMainWindow(QMainWindow):
         grid.addLayout(line_layout, 8, 0, 1, 2)
 
         self.lbl_comb_info = QLabel("Comb Status: Initializing...")
+        self.lbl_comb_info.setWordWrap(True)
         self.lbl_comb_info.setStyleSheet("color: #00897b; font-style: italic;")
         grid.addWidget(self.lbl_comb_info, 9, 0, 1, 2)
 
@@ -2329,7 +2350,7 @@ class CZMainWindow(QMainWindow):
         grid = QGridLayout()
         grid.setSpacing(8)
 
-        self.chk_auto_abort = QCheckBox("Automatically ABORT sweep if 0V transfer function looks bad")
+        self.chk_auto_abort = QCheckBox("Auto-abort sweep if 0V transfer function fails")
         self.chk_auto_abort.setChecked(True)
         self.chk_auto_abort.setStyleSheet("font-weight: bold; color: #d32f2f;")
         grid.addWidget(self.chk_auto_abort, 0, 0, 1, 2)
@@ -2339,7 +2360,7 @@ class CZMainWindow(QMainWindow):
         self.chk_pause_0v.setStyleSheet("color: #f57f17;")
         grid.addWidget(self.chk_pause_0v, 1, 0, 1, 2)
 
-        self.chk_flip_bias_sc = QCheckBox("Flip bias? (opposite model sign so fitter doesn't crash, Re(Z) > 0 at DC)")
+        self.chk_flip_bias_sc = QCheckBox("Flip bias? (Re(Z) > 0 at DC)")
         self.chk_flip_bias_sc.setChecked(self.chk_flip_bias.isChecked())
         self.chk_flip_bias_sc.setStyleSheet("font-weight: bold; color: #0288d1;")
         self.chk_flip_bias.toggled.connect(self.chk_flip_bias_sc.setChecked)
@@ -2375,7 +2396,7 @@ class CZMainWindow(QMainWindow):
         f_h.addWidget(self.spin_max_froll)
         grid.addLayout(f_h, 5, 1)
 
-        self.chk_dry_run = QCheckBox("Simulation / Dry Run Mode (No physical instruments required)")
+        self.chk_dry_run = QCheckBox("Simulation / Dry Run Mode (No hardware)")
         self.chk_dry_run.setChecked(not (HAS_HARDWARE_LIBS and HAS_DASTARD_LIB))
         grid.addWidget(self.chk_dry_run, 6, 0, 1, 2)
 
@@ -2549,6 +2570,20 @@ class CZMainWindow(QMainWindow):
                     color: #245ea8;
                     border-bottom: 2px solid #245ea8;
                 }
+                QTableWidget {
+                    background-color: #ffffff;
+                    border: 1px solid #c7cbd1;
+                    gridline-color: #e0e4ed;
+                    color: #202124;
+                    font-size: 9pt;
+                }
+                QHeaderView::section {
+                    background-color: #e4e8ed;
+                    color: #245ea8;
+                    font-weight: bold;
+                    padding: 4px;
+                    border: 1px solid #c7cbd1;
+                }
                 QTabWidget#main_tabs::pane {
                     border: 1px solid #c7cbd1;
                     border-radius: 6px;
@@ -2559,12 +2594,13 @@ class CZMainWindow(QMainWindow):
                     color: #37474f;
                     font-size: 11pt;
                     font-weight: bold;
-                    padding: 10px 24px;
+                    padding: 8px 18px;
                     margin-right: 4px;
                     border-top-left-radius: 6px;
                     border-top-right-radius: 6px;
                     border: 1px solid #c7cbd1;
                     border-bottom: none;
+                    min-width: 90px;
                 }
                 QTabWidget#main_tabs > QTabBar::tab:selected {
                     background-color: #ffffff;
@@ -2710,18 +2746,30 @@ class CZMainWindow(QMainWindow):
             if use_sch:
                 approx_peak = 1.6 * np.sqrt(num_tones) * mult
                 if approx_peak > 1.0:
-                    status_text = f"Comb: {num_tones} tones (cutoff {cutoff*1e-3:.1f} kHz < Nyquist){line_str} | Peak ~{approx_peak:.2f} V (Schroeder active; auto-scaled to ±1.0 V limit, NO clipping)"
+                    status_text = (
+                        f"Comb: {num_tones} tones (cutoff {cutoff*1e-3:.1f} kHz < Nyquist){line_str}\n"
+                        f"Peak ~{approx_peak:.2f} V (Schroeder active; auto-scaled to ±1.0 V limit, NO clipping)"
+                    )
                     self.lbl_comb_info.setStyleSheet("color: #f57f17; font-weight: bold;")
                 else:
-                    status_text = f"Comb: {num_tones} tones (cutoff {cutoff*1e-3:.1f} kHz < Nyquist){line_str} | Peak ~{approx_peak:.2f} V (Schroeder active, below ±1.0 V limit, NO clipping)"
+                    status_text = (
+                        f"Comb: {num_tones} tones (cutoff {cutoff*1e-3:.1f} kHz < Nyquist){line_str}\n"
+                        f"Peak ~{approx_peak:.2f} V (Schroeder active, below ±1.0 V limit, NO clipping)"
+                    )
                     self.lbl_comb_info.setStyleSheet("color: #2e7d32; font-weight: bold;")
             else:
                 peak = (num_tones + 1) * mult
                 if peak > 1.0:
-                    status_text = f"Comb: {num_tones} tones (cutoff {cutoff*1e-3:.1f} kHz < Nyquist){line_str} | In-phase peak = {peak:.2f} V (Exceeds AWG ±1.0 V! Auto-scaled, reduced SNR)"
+                    status_text = (
+                        f"Comb: {num_tones} tones (cutoff {cutoff*1e-3:.1f} kHz < Nyquist){line_str}\n"
+                        f"In-phase peak = {peak:.2f} V (Exceeds AWG ±1.0 V! Auto-scaled, reduced SNR)"
+                    )
                     self.lbl_comb_info.setStyleSheet("color: #d32f2f; font-weight: bold;")
                 else:
-                    status_text = f"Comb: {num_tones} tones (cutoff {cutoff*1e-3:.1f} kHz < Nyquist){line_str} | In-phase peak = {peak:.2f} V"
+                    status_text = (
+                        f"Comb: {num_tones} tones (cutoff {cutoff*1e-3:.1f} kHz < Nyquist){line_str}\n"
+                        f"In-phase peak = {peak:.2f} V"
+                    )
                     self.lbl_comb_info.setStyleSheet("color: #00897b;")
             self.lbl_comb_info.setText(status_text)
         except Exception as e:
@@ -3102,6 +3150,7 @@ class CZMainWindow(QMainWindow):
             spin_val.setRange(p.min_val, p.max_val)
             spin_val.setSingleStep(max(p.value * 0.05, 0.001))
             spin_val.setValue(p.value)
+            spin_val.setMaximumWidth(85)
             spin_val.valueChanged.connect(lambda v, name=k: self.on_table_param_value_changed(name, v))
             self.table_analyze_params.setCellWidget(r, 1, spin_val)
 
@@ -3114,6 +3163,7 @@ class CZMainWindow(QMainWindow):
             spin_min.setDecimals(4 if p.min_val < 10 else 2)
             spin_min.setRange(0.0, 1e7)
             spin_min.setValue(p.min_val)
+            spin_min.setMaximumWidth(75)
             spin_min.valueChanged.connect(lambda v, name=k: self.on_table_param_limit_changed(name, min_v=v))
             self.table_analyze_params.setCellWidget(r, 3, spin_min)
 
@@ -3121,6 +3171,7 @@ class CZMainWindow(QMainWindow):
             spin_max.setDecimals(4 if p.max_val < 10 else 2)
             spin_max.setRange(0.0, 1e7)
             spin_max.setValue(p.max_val)
+            spin_max.setMaximumWidth(75)
             spin_max.valueChanged.connect(lambda v, name=k: self.on_table_param_limit_changed(name, max_v=v))
             self.table_analyze_params.setCellWidget(r, 4, spin_max)
 
