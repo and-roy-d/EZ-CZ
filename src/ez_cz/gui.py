@@ -3543,51 +3543,60 @@ class CZMainWindow(QMainWindow):
         # Update operating point from IV curve if available
         if self.analyze_iv_data:
             op = self.analyze_iv_data["lookup_op"](selected_vb)
+            r0_mohm = op["rtes"] * 1e3
+            p0_pw = op["p0"] * 1e12
+            rn_pct = op["rn_pct"]
             self.lbl_analyze_op_info.setText(
-                f"Operating Point: Vbias = {selected_vb:.3f}V ({op['rn_pct']:.1f}% Rn) | "
-                f"R0 = {op['rtes']*1e3:.3f} mΩ | I0 = {op['ites']*1e6:.1f} µA | P0 = {op['p0']*1e12:.2f} pW"
+                f"Operating Point: Vbias = {selected_vb:.3f}V ({rn_pct:.1f}% Rn) | "
+                f"R0 = {r0_mohm:.3f} mΩ | I0 = {op['ites']*1e6:.1f} µA | P0 = {p0_pw:.2f} pW"
             )
-            # Update R0 in parameter table if frozen
-            if "R_0" in self.current_model_params and not self.current_model_params["R_0"].vary:
-                self.current_model_params["R_0"].value = op["rtes"] * 1e3
-                self.sync_param_to_table("R_0", op["rtes"] * 1e3)
+            # Update R0 in parameter table
+            if "R_0" in self.current_model_params:
+                self.current_model_params["R_0"].value = r0_mohm
+                self.sync_param_to_table("R_0", r0_mohm)
 
-            # Auto-update T_tes from power balance if frozen
-            if "T_tes" in self.current_model_params and not self.current_model_params["T_tes"].vary:
-                p0_w = float(op.get("p0", 0.0))
-                g_param = None
-                for gc in ("G_tes_bath", "G_int_bath", "G_tb"):
-                    if gc in self.current_model_params:
-                        g_param = self.current_model_params[gc]
-                        break
-                if p0_w > 0 and g_param is not None:
-                    g_val = g_param.value * 1e-9
-                    n_val = self.current_model_params["n_mem"].value if "n_mem" in self.current_model_params else 3.5
-                    tb_val = self.current_model_params["T_bath"].value if "T_bath" in self.current_model_params else 0.020
-                    def _p_err(T):
-                        return (g_val / n_val) * T * (1.0 - (tb_val / T)**n_val) - p0_w
-                    try:
-                        from scipy.optimize import root_scalar
-                        sol = root_scalar(_p_err, bracket=[tb_val * 1.0001, 1.0])
-                        self.current_model_params["T_tes"].value = sol.root
-                        self.sync_param_to_table("T_tes", sol.root)
-                    except Exception:
-                        pass
+            # Update P0 in parameter table
+            if "P_0" in self.current_model_params:
+                self.current_model_params["P_0"].value = p0_pw
+                self.sync_param_to_table("P_0", p0_pw)
+
+            # Auto-update T_tes from power balance
+            p0_w = float(op.get("p0", 0.0))
+            g_param = None
+            for gc in ("G_tes_bath", "G_int_bath", "G_tb", "G_tes_int"):
+                if gc in self.current_model_params:
+                    g_param = self.current_model_params[gc]
+                    break
+            if p0_w > 0 and g_param is not None:
+                g_val = g_param.value * 1e-9
+                n_val = self.current_model_params["n_mem"].value if "n_mem" in self.current_model_params else 3.5
+                tb_val = self.current_model_params["T_bath"].value if "T_bath" in self.current_model_params else 0.020
+                try:
+                    ttes_k = predict_ttes(p0_w, g_val, n_val, tb_val)
+                    if "T_tes" in self.current_model_params:
+                        self.current_model_params["T_tes"].value = ttes_k
+                        self.sync_param_to_table("T_tes", ttes_k)
+                except Exception:
+                    pass
 
             # Update alpha and beta initial guess with exponential falloff from 10% Rn
-            rn_p = op.get("rn_pct", 0.0)
-            if rn_p >= 8.0:
+            if rn_pct >= 8.0:
                 k_decay = 0.06
-                a_guess = max(1200.0 * np.exp(-k_decay * max(rn_p - 10.0, 0.0)), 1.0)
-                b_guess = max(60.0 * np.exp(-k_decay * max(rn_p - 10.0, 0.0)), 0.01)
+                a_guess = max(1200.0 * np.exp(-k_decay * max(rn_pct - 10.0, 0.0)), 1.0)
+                b_guess = max(60.0 * np.exp(-k_decay * max(rn_pct - 10.0, 0.0)), 0.01)
                 if "alpha" in self.current_model_params and self.current_model_params["alpha"].vary:
                     self.current_model_params["alpha"].value = a_guess
                     self.sync_param_to_table("alpha", a_guess)
                 if "beta" in self.current_model_params and self.current_model_params["beta"].vary:
                     self.current_model_params["beta"].value = b_guess
                     self.sync_param_to_table("beta", b_guess)
-        else:
-            self.lbl_analyze_op_info.setText(f"Operating Point: Vbias = {selected_vb:.3f}V (No IV file loaded)")
+        elif self.analyze_sweep_data:
+            b_info = self.analyze_sweep_data["bias_points"].get(selected_vb, {})
+            r0_est = b_info.get("r0_dc", 0.001) * 1e3
+            if "R_0" in self.current_model_params:
+                self.current_model_params["R_0"].value = r0_est
+                self.sync_param_to_table("R_0", r0_est)
+            self.lbl_analyze_op_info.setText(f"Operating Point: Vbias = {selected_vb:.3f}V (No IV file loaded | DC R0 = {r0_est:.3f} mΩ)")
 
         self.current_fit_result = None
         self.update_live_model_prediction()
@@ -3871,6 +3880,17 @@ class CZMainWindow(QMainWindow):
         ztot_data = b_info.get("z_total")
         flip = self.chk_analyze_flip_bias.isChecked() if hasattr(self, "chk_analyze_flip_bias") else False
 
+        # Ensure R_0 and P_0 reflect current bias point before fitting
+        if self.analyze_iv_data and self.current_selected_bias is not None:
+            op = self.analyze_iv_data["lookup_op"](self.current_selected_bias)
+            if "R_0" in self.current_model_params and not self.current_model_params["R_0"].vary:
+                self.current_model_params["R_0"].value = op["rtes"] * 1e3
+            if "P_0" in self.current_model_params and not self.current_model_params["P_0"].vary:
+                self.current_model_params["P_0"].value = op["p0"] * 1e12
+        elif b_info and "r0_dc" in b_info:
+            if "R_0" in self.current_model_params and not self.current_model_params["R_0"].vary:
+                self.current_model_params["R_0"].value = b_info["r0_dc"] * 1e3
+
         res = self.active_model.fit(
             f_data,
             z_data,
@@ -3956,33 +3976,40 @@ class CZMainWindow(QMainWindow):
 
                 if self.analyze_iv_data:
                     op = self.analyze_iv_data["lookup_op"](vb)
-                    if "R_0" in self.current_model_params:
-                        self.current_model_params["R_0"].value = op["rtes"] * 1e3
-                    p0_w = float(op.get("p0", 0.0))
-                    g_param = None
-                    for gc in ("G_tes_bath", "G_int_bath", "G_tb"):
-                        if gc in self.current_model_params:
-                            g_param = self.current_model_params[gc]
-                            break
-                    if p0_w > 0 and g_param is not None and "T_tes" in self.current_model_params and not self.current_model_params["T_tes"].vary:
-                        g_val = g_param.value * 1e-9
-                        n_val = self.current_model_params["n_mem"].value if "n_mem" in self.current_model_params else 3.5
-                        tb_val = self.current_model_params["T_bath"].value if "T_bath" in self.current_model_params else 0.020
-                        def _p_err(T):
-                            return (g_val / n_val) * T * (1.0 - (tb_val / T)**n_val) - p0_w
-                        try:
-                            from scipy.optimize import root_scalar
-                            sol = root_scalar(_p_err, bracket=[tb_val * 1.0001, 1.0])
-                            self.current_model_params["T_tes"].value = sol.root
-                        except Exception:
-                            pass
-                    rn_p = op.get("rn_pct", 0.0)
-                    if rn_p >= 8.0:
-                        k_decay = 0.06
-                        if "alpha" in self.current_model_params and self.current_model_params["alpha"].vary:
-                            self.current_model_params["alpha"].value = max(1200.0 * np.exp(-k_decay * max(rn_p - 10.0, 0.0)), 1.0)
-                        if "beta" in self.current_model_params and self.current_model_params["beta"].vary:
-                            self.current_model_params["beta"].value = max(60.0 * np.exp(-k_decay * max(rn_p - 10.0, 0.0)), 0.01)
+                    r0_mohm = op["rtes"] * 1e3
+                    p0_pw = op["p0"] * 1e12
+                    rn_p = op["rn_pct"]
+                else:
+                    r0_mohm = b_info.get("r0_dc", 0.001) * 1e3
+                    p0_pw = 1.0
+                    rn_p = 50.0
+
+                if "R_0" in self.current_model_params:
+                    self.current_model_params["R_0"].value = r0_mohm
+                if "P_0" in self.current_model_params:
+                    self.current_model_params["P_0"].value = p0_pw
+
+                p0_w = p0_pw * 1e-12
+                g_param = None
+                for gc in ("G_tes_bath", "G_int_bath", "G_tb", "G_tes_int"):
+                    if gc in self.current_model_params:
+                        g_param = self.current_model_params[gc]
+                        break
+                if p0_w > 0 and g_param is not None and "T_tes" in self.current_model_params:
+                    g_val = g_param.value * 1e-9
+                    n_val = self.current_model_params["n_mem"].value if "n_mem" in self.current_model_params else 3.5
+                    tb_val = self.current_model_params["T_bath"].value if "T_bath" in self.current_model_params else 0.020
+                    try:
+                        ttes_k = predict_ttes(p0_w, g_val, n_val, tb_val)
+                        self.current_model_params["T_tes"].value = ttes_k
+                    except Exception:
+                        pass
+                if rn_p >= 8.0:
+                    k_decay = 0.06
+                    if "alpha" in self.current_model_params and self.current_model_params["alpha"].vary:
+                        self.current_model_params["alpha"].value = max(1200.0 * np.exp(-k_decay * max(rn_p - 10.0, 0.0)), 1.0)
+                    if "beta" in self.current_model_params and self.current_model_params["beta"].vary:
+                        self.current_model_params["beta"].value = max(60.0 * np.exp(-k_decay * max(rn_p - 10.0, 0.0)), 0.01)
 
                 flip = self.chk_analyze_flip_bias.isChecked() if hasattr(self, "chk_analyze_flip_bias") else False
                 res = self.active_model.fit(
@@ -3995,7 +4022,16 @@ class CZMainWindow(QMainWindow):
                     flip_bias=flip,
                 )
                 if res.success:
-                    row = {"Vbias_V": vb, "fit_target": fit_target, "success": True, "chi2": res.chi2, "redchi": res.redchi}
+                    row = {
+                        "Vbias_V": vb,
+                        "Rn_pct": rn_p,
+                        "R0_mOhm": r0_mohm,
+                        "P0_pW": p0_pw,
+                        "fit_target": fit_target,
+                        "success": True,
+                        "chi2": res.chi2,
+                        "redchi": res.redchi
+                    }
                     for k, p in res.params.items():
                         row[k] = p.value
                         row[f"{k}_err"] = res.errors.get(k, 0.0)

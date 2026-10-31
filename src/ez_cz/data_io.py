@@ -274,6 +274,8 @@ def load_cz_sweep_dataset(
             Y_tes = 1.0 / np.where(np.abs(Z_tes) > 1e-15, Z_tes, np.nan + 1j * np.nan)
             Y_total = 1.0 / np.where(np.abs(Z_total) > 1e-15, Z_total, np.nan + 1j * np.nan)
 
+            r0_dc = float(np.abs(np.real(Z_tes[valid_mask][0]))) if np.sum(valid_mask) > 0 else 0.001
+
             bias_points_dict[vb_val] = {
                 "vbias": vb_val,
                 "folder": bf,
@@ -283,6 +285,7 @@ def load_cz_sweep_dataset(
                 "z_total": Z_total,
                 "y_tes": Y_tes,
                 "y_total": Y_total,
+                "r0_dc": r0_dc,
                 "u_bias": u_bias,
                 "u0_fft": u0_fft,
                 "safe_ratio": safe_ratio,

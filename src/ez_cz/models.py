@@ -98,6 +98,35 @@ def predict_ttes(P_tes_W: float, G_W_per_K: float, n: float, T_bath_K: float) ->
         return float(T)
 
 
+def get_p0_and_ttes(params: Dict[str, float], g_w_per_k: float) -> Tuple[float, float]:
+    """
+    Returns (P0_Watts, T_tes_Kelvin) ensuring both reflect the current operating point.
+    If P_0 (in pW) is present in params and > 0, calculates T_tes from power balance:
+        P0 = (g / n) * T_tes * (1 - (T_bath / T_tes)^n)
+    Otherwise computes P0 from T_tes.
+    """
+    n = params.get("n_mem", 3.5)
+    tbath = max(params.get("T_bath", 0.020), 1e-4)
+
+    p0_val = None
+    if "P_0" in params and params["P_0"] > 0:
+        p0_val = params["P_0"] * 1e-12
+    elif "P0_pW" in params and params["P0_pW"] > 0:
+        p0_val = params["P0_pW"] * 1e-12
+    elif "P0" in params and params["P0"] > 0:
+        p0_val = params["P0"]
+
+    if p0_val is not None:
+        p0_w = float(p0_val)
+        ttes_k = predict_ttes(p0_w, g_w_per_k, n, tbath)
+    else:
+        ttes_k = max(params.get("T_tes", 0.048), 1e-4)
+        k = g_w_per_k / (n * ttes_k**(n - 1.0))
+        p0_w = k * (ttes_k**n - tbath**n)
+
+    return float(p0_w), float(ttes_k)
+
+
 class ThermalModelBase:
     """Abstract base class for TES thermal impedance models."""
     name: str = "Base"
@@ -372,16 +401,17 @@ class SimpleModel(ThermalModelBase):
     description = "1-body model: TES heat capacity coupled directly to the thermal bath."
 
     def get_parameter_defs(self, **kwargs) -> Dict[str, ParameterDef]:
-        R0 = kwargs.get("R0", 1.5)  # in mOhm
+        R0 = kwargs.get("R0", kwargs.get("R_0", 1.5))  # in mOhm
         alpha = kwargs.get("alpha", 1200.0)
         beta = kwargs.get("beta", 60.0)
         C_tes = kwargs.get("C_tes", 0.040)  # pJ/K (40 fJ/K)
         G_tb = kwargs.get("G_tes_bath", 0.220)  # nW/K (220 pW/K)
-        Tc = kwargs.get("Tc", 0.048)  # K
-        Tbath = kwargs.get("Tbath", 0.020)  # K
-        n = kwargs.get("n", 3.5)
-        Rshunt = kwargs.get("Rshunt", 250.0)  # uOhm
-        Lnyq = kwargs.get("Lnyq", 119.13)  # nH (from SC fit)
+        Tc = kwargs.get("Tc", kwargs.get("T_tes", 0.048))  # K
+        Tbath = kwargs.get("Tbath", kwargs.get("T_bath", 0.020))  # K
+        P0 = kwargs.get("P0", kwargs.get("P_0", 2.85))  # pW
+        n = kwargs.get("n", kwargs.get("n_mem", 3.5))
+        Rshunt = kwargs.get("Rshunt", kwargs.get("R_shunt", 250.0))  # uOhm
+        Lnyq = kwargs.get("Lnyq", kwargs.get("L_nyq", 119.13))  # nH (from SC fit)
 
         defs = [
             ParameterDef("C_tes", "C_tes (pJ/K)", C_tes, 0.0001, 50.0, vary=True, unit="pJ/K", unit_scale=1e-12,
@@ -394,6 +424,8 @@ class SimpleModel(ThermalModelBase):
                          category="sensitivity", description="Logarithmic current sensitivity"),
             ParameterDef("R_0", "R0 (mOhm)", R0, 0.001, 500.0, vary=False, unit="mOhm", unit_scale=1e-3,
                          category="circuit", description="TES DC bias operating resistance"),
+            ParameterDef("P_0", "P0 (pW)", P0, 0.001, 100000.0, vary=False, unit="pW", unit_scale=1e-12,
+                         category="operating", description="TES operating Joule power (I0^2 * R0) at this bias point"),
             ParameterDef("R_shunt", "Rshunt (uOhm)", Rshunt, 1.0, 5000.0, vary=False, unit="uOhm", unit_scale=1e-6,
                          category="circuit", description="Thevenin shunt resistance"),
             ParameterDef("L_nyq", "Lnyq (nH)", Lnyq, 1.0, 2000.0, vary=False, unit="nH", unit_scale=1e-9,
@@ -413,12 +445,8 @@ class SimpleModel(ThermalModelBase):
         beta = params["beta"]
         C_tes = params["C_tes"] * 1e-12
         G_tb = params["G_tes_bath"] * 1e-9
-        T_tes = max(params["T_tes"], 1e-6)
-        T_bath = max(params["T_bath"], 1e-6)
-        n = params["n_mem"]
 
-        k = G_tb / (n * T_tes**(n - 1.0))
-        P0 = k * (T_tes**n - T_bath**n)
+        P0, T_tes = get_p0_and_ttes(params, G_tb)
         L_I = (P0 * alpha) / (G_tb * T_tes)
         tau = C_tes / G_tb
         tau_I = tau / (1.0 - L_I) if abs(1.0 - L_I) > 1e-9 else tau / 1e-9
@@ -435,12 +463,8 @@ class SimpleModel(ThermalModelBase):
         alpha = params["alpha"]
         C_tes = params["C_tes"] * 1e-12
         G_tb = params["G_tes_bath"] * 1e-9
-        T_tes = max(params["T_tes"], 1e-6)
-        T_bath = max(params["T_bath"], 1e-6)
-        n = params["n_mem"]
 
-        k = G_tb / (n * T_tes**(n - 1.0))
-        P0 = k * (T_tes**n - T_bath**n)
+        P0, T_tes = get_p0_and_ttes(params, G_tb)
         L_I = (P0 * alpha) / (G_tb * T_tes)
         tau = C_tes / G_tb
         tau_I = tau / (1.0 - L_I) if abs(1.0 - L_I) > 1e-9 else np.nan
@@ -449,6 +473,8 @@ class SimpleModel(ThermalModelBase):
         return {
             "P0_pW": float(P0 * 1e12),
             "I0_uA": float(I0 * 1e6),
+            "R0_mOhm": float(R0 * 1e3),
+            "T_tes_mK": float(T_tes * 1e3),
             "L_I": float(L_I),
             "tau_ms": float(tau * 1e3),
             "tau_I_ms": float(tau_I * 1e3) if np.isfinite(tau_I) else np.nan,
@@ -480,6 +506,7 @@ class DanglingModel(ThermalModelBase):
             simple["alpha"],
             simple["beta"],
             simple["R_0"],
+            simple["P_0"],
             simple["R_shunt"],
             simple["L_nyq"],
             simple["T_tes"],
@@ -496,12 +523,8 @@ class DanglingModel(ThermalModelBase):
         G_tb = params["G_tes_bath"] * 1e-9
         C_abs = params["C_abs"] * 1e-12
         G_at = params["G_abs_tes"] * 1e-9
-        T_tes = max(params["T_tes"], 1e-6)
-        T_bath = max(params["T_bath"], 1e-6)
-        n = params["n_mem"]
 
-        k = G_tb / (n * T_tes**(n - 1.0))
-        P0 = k * (T_tes**n - T_bath**n)
+        P0, T_tes = get_p0_and_ttes(params, G_tb)
         L_I = (P0 * alpha) / (G_tb * T_tes)
         tau = C_tes / G_tb
         tau_I = tau / (1.0 - L_I) if abs(1.0 - L_I) > 1e-9 else tau / 1e-9
@@ -553,6 +576,7 @@ class InterveningModel(ThermalModelBase):
             simple["alpha"],
             simple["beta"],
             simple["R_0"],
+            simple["P_0"],
             simple["R_shunt"],
             simple["L_nyq"],
             simple["T_tes"],
@@ -569,14 +593,8 @@ class InterveningModel(ThermalModelBase):
         C_int = params["C_int"] * 1e-12
         G_ti = params["G_tes_int"] * 1e-9
         G_ib = params["G_int_bath"] * 1e-9
-        T_tes = max(params["T_tes"], 1e-6)
-        T_bath = max(params["T_bath"], 1e-6)
-        n = params["n_mem"]
 
-        # Approximate intermediate stage temperature T_int
-        T_int = (T_tes + T_bath) / 2.0
-        k_ti = G_ti / (n * T_tes**(n - 1.0))
-        P0 = k_ti * (T_tes**n - T_int**n)
+        P0, T_tes = get_p0_and_ttes(params, G_ti)
         L_I = (P0 * alpha) / (G_ti * T_tes)
         G_etf = L_I * G_ti
 
@@ -601,21 +619,19 @@ class InterveningModel(ThermalModelBase):
         C_int = params["C_int"] * 1e-12
         G_ti = params["G_tes_int"] * 1e-9
         G_ib = params["G_int_bath"] * 1e-9
-        T_tes = max(params["T_tes"], 1e-6)
-        T_bath = max(params["T_bath"], 1e-6)
-        n = params["n_mem"]
 
-        T_int = (T_tes + T_bath) / 2.0
-        k_ti = G_ti / (n * T_tes**(n - 1.0))
-        P0 = k_ti * (T_tes**n - T_int**n)
+        P0, T_tes = get_p0_and_ttes(params, G_ti)
         L_I = (P0 * alpha) / (G_ti * T_tes)
         tau_tes = C_tes / G_ti if G_ti > 0 else np.nan
         tau_int = C_int / (G_ti + G_ib) if (G_ti + G_ib) > 0 else np.nan
+        I0 = np.sqrt(max(P0 / R0, 0.0)) if R0 > 0 else 0.0
 
         return {
             "P0_pW": float(P0 * 1e12),
+            "I0_uA": float(I0 * 1e6),
+            "R0_mOhm": float(R0 * 1e3),
+            "T_tes_mK": float(T_tes * 1e3),
             "L_I": float(L_I),
-            "T_int_K": float(T_int),
             "tau_tes_ms": float(tau_tes * 1e3) if np.isfinite(tau_tes) else np.nan,
             "tau_int_ms": float(tau_int * 1e3) if np.isfinite(tau_int) else np.nan,
         }
@@ -646,6 +662,7 @@ class IntermediateDanglingModel(ThermalModelBase):
             inter["alpha"],
             inter["beta"],
             inter["R_0"],
+            inter["P_0"],
             inter["R_shunt"],
             inter["L_nyq"],
             inter["T_tes"],
@@ -664,13 +681,8 @@ class IntermediateDanglingModel(ThermalModelBase):
         G_ti = params["G_tes_int"] * 1e-9
         G_id = params["G_int_dang"] * 1e-9
         G_ib = params["G_int_bath"] * 1e-9
-        T_tes = max(params["T_tes"], 1e-6)
-        T_bath = max(params["T_bath"], 1e-6)
-        n = params["n_mem"]
 
-        T_int = (T_tes + T_bath) / 2.0
-        k_ti = G_ti / (n * T_tes**(n - 1.0))
-        P0 = k_ti * (T_tes**n - T_int**n)
+        P0, T_tes = get_p0_and_ttes(params, G_ti)
         L_I = (P0 * alpha) / (G_ti * T_tes)
         G_etf = L_I * G_ti
 
@@ -721,6 +733,7 @@ class TwoFluidModel(ThermalModelBase):
             simple["alpha"],
             simple["beta"],
             simple["R_0"],
+            simple["P_0"],
             simple["R_shunt"],
             simple["L_nyq"],
             simple["T_tes"],
@@ -737,12 +750,8 @@ class TwoFluidModel(ThermalModelBase):
         w_L = params["w_L"]
         C_tes = params["C_tes"] * 1e-12
         G_tb = params["G_tes_bath"] * 1e-9
-        T_tes = max(params["T_tes"], 1e-6)
-        T_bath = max(params["T_bath"], 1e-6)
-        n = params["n_mem"]
 
-        k = G_tb / (n * T_tes**(n - 1.0))
-        P0 = k * (T_tes**n - T_bath**n)
+        P0, T_tes = get_p0_and_ttes(params, G_tb)
         L_I = (P0 * alpha) / (G_tb * T_tes)
         tau = C_tes / G_tb
         tau_I = tau / (1.0 - L_I) if abs(1.0 - L_I) > 1e-9 else tau / 1e-9
