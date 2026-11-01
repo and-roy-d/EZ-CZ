@@ -169,11 +169,94 @@ def load_iv_curve(
     return out_dict
 
 
+def _extract_channel_fft(
+    data_dict: Any,
+    channel_id: int,
+    fs_sch: np.ndarray,
+    tau_shift: float = 0.0,
+    fs_global: float = 250000.0,
+) -> Tuple[Optional[np.ndarray], bool, Optional[int]]:
+    """
+    Extracts complex tone FFT array for the requested channel from a CZ dataset npz.
+    Returns: (u_fft, is_multichannel, detected_channel_id)
+    """
+    ch_key = f"chan{channel_id}"
+
+    # 1. Multi-channel dictionary: fft_real and fft_imag
+    if "fft_real" in data_dict and "fft_imag" in data_dict:
+        re_obj = data_dict["fft_real"].item() if (hasattr(data_dict["fft_real"], "ndim") and data_dict["fft_real"].ndim == 0) else data_dict["fft_real"]
+        im_obj = data_dict["fft_imag"].item() if (hasattr(data_dict["fft_imag"], "ndim") and data_dict["fft_imag"].ndim == 0) else data_dict["fft_imag"]
+        if isinstance(re_obj, dict):
+            if ch_key in re_obj and ch_key in im_obj:
+                return np.asarray(re_obj[ch_key], dtype=float) + 1j * np.asarray(im_obj[ch_key], dtype=float), True, channel_id
+            elif len(re_obj) > 0:
+                first_k = next(iter(re_obj.keys()))
+                first_ch = int(first_k.replace("chan", "")) if "chan" in first_k else None
+                return np.asarray(re_obj[first_k], dtype=float) + 1j * np.asarray(im_obj[first_k], dtype=float), True, first_ch
+
+    # 2. fft_unroll (dict, 2D array, or 1D array)
+    if "fft_unroll" in data_dict:
+        fft_val = data_dict["fft_unroll"]
+        if hasattr(fft_val, "ndim") and fft_val.ndim == 0 and isinstance(fft_val.item(), dict):
+            d = fft_val.item()
+            if ch_key in d:
+                return np.asarray(d[ch_key], dtype=complex), True, channel_id
+            elif len(d) > 0:
+                first_k = next(iter(d.keys()))
+                first_ch = int(first_k.replace("chan", "")) if "chan" in first_k else None
+                return np.asarray(d[first_k], dtype=complex), True, first_ch
+        elif hasattr(fft_val, "ndim") and fft_val.ndim == 2:
+            if fft_val.shape[1] > fft_val.shape[0] and channel_id < fft_val.shape[0]:
+                return np.asarray(fft_val[channel_id, :], dtype=complex), True, channel_id
+            elif channel_id < fft_val.shape[1]:
+                return np.asarray(fft_val[:, channel_id], dtype=complex), True, channel_id
+            else:
+                return np.asarray(fft_val[:, 0], dtype=complex), True, 0
+        elif hasattr(fft_val, "ndim") and fft_val.ndim == 1:
+            det_ch = int(data_dict["channel"]) if "channel" in data_dict else None
+            return np.asarray(fft_val, dtype=complex), False, det_ch
+
+    # 3. Multi-channel raw demodulation: 'data' dict
+    if "data" in data_dict:
+        data_obj = data_dict["data"].item() if (hasattr(data_dict["data"], "ndim") and data_dict["data"].ndim == 0) else data_dict["data"]
+        if isinstance(data_obj, dict):
+            raw_ch = None
+            detected_ch = None
+            if ch_key in data_obj:
+                raw_ch = np.asarray(data_obj[ch_key], dtype=float)
+                detected_ch = channel_id
+            elif len(data_obj) > 0:
+                first_k = next(iter(data_obj.keys()))
+                raw_ch = np.asarray(data_obj[first_k], dtype=float)
+                detected_ch = int(first_k.replace("chan", "")) if "chan" in first_k else None
+            if raw_ch is not None:
+                raw_amps = arb_to_amp(raw_ch)
+                n_pts = len(raw_amps)
+                freqs_fft = rfftfreq(n_pts, 1.0 / fs_global)
+                fft_dc = rfft(raw_amps - np.mean(raw_amps)) * np.exp(-2j * np.pi * freqs_fft * tau_shift)
+                u_fft = np.array([fft_dc[np.argmin(np.abs(freqs_fft - f))] for f in fs_sch])
+                return u_fft, True, detected_ch
+
+    # 4. Single-channel raw_data demodulation
+    if "raw_data" in data_dict:
+        fs_sample = float(data_dict.get("fs_global", fs_global))
+        raw_amps = arb_to_amp(np.asarray(data_dict["raw_data"], dtype=float))
+        n_pts = len(raw_amps)
+        freqs_fft = rfftfreq(n_pts, 1.0 / fs_sample)
+        tau = float(data_dict.get("tau_shift", tau_shift))
+        fft_dc = rfft(raw_amps - np.mean(raw_amps)) * np.exp(-2j * np.pi * freqs_fft * tau)
+        u_fft = np.array([fft_dc[np.argmin(np.abs(freqs_fft - f))] for f in fs_sch])
+        det_ch = int(data_dict["channel"]) if "channel" in data_dict else None
+        return u_fft, False, det_ch
+
+    return None, False, None
+
+
 def load_cz_sweep_dataset(
     raw_dir: Path,
     channel_id: int = 63,
     rshunt_uohm: float = 250.0,
-    lnyq_nh: float = 74.8,
+    lnyq_nh: Optional[float] = None,
     flip_bias: bool = True,
 ) -> Dict[str, Any]:
     """
@@ -212,20 +295,14 @@ def load_cz_sweep_dataset(
         raise ValueError(f"Missing 'fs_sch' frequencies in {npz_0v_files[0]}")
 
     fs_sch_ref = np.asarray(data_0v["fs_sch"], dtype=float)
-    u0_fft = None
-    if "fft_unroll" in data_0v:
-        u0_fft = np.asarray(data_0v["fft_unroll"], dtype=complex)
-    elif "raw_data" in data_0v:
-        # Fallback demodulation
-        fs_sample = float(data_0v.get("fs_global", 250000.0))
-        raw_amps = arb_to_amp(np.asarray(data_0v["raw_data"], dtype=float))
-        n_pts = len(raw_amps)
-        freqs_fft = rfftfreq(n_pts, 1.0 / fs_sample)
-        tau_shift = float(data_0v.get("tau_shift", 0.0))
-        fft_dc = rfft(raw_amps - np.mean(raw_amps)) * np.exp(-2j * np.pi * freqs_fft * tau_shift)
-        u0_fft = np.array([fft_dc[np.argmin(np.abs(freqs_fft - f))] for f in fs_sch_ref])
-    else:
-        raise ValueError(f"Neither 'fft_unroll' nor 'raw_data' present in {npz_0v_files[0]}")
+    tau_shift_0v = float(data_0v.get("tau_shift", 0.0))
+    fs_global_0v = float(data_0v.get("fs_global", 250000.0))
+
+    u0_fft, is_multichannel, detected_channel = _extract_channel_fft(
+        data_0v, channel_id, fs_sch_ref, tau_shift=tau_shift_0v, fs_global=fs_global_0v
+    )
+    if u0_fft is None:
+        raise ValueError(f"Neither 'fft_unroll', 'fft_real'/'fft_imag', nor 'raw_data' present in {npz_0v_files[0]}")
 
     # 1.5. Extract or predict f_roll and L_nyq from 0V SC transfer function
     f_roll_0v = None
@@ -252,16 +329,35 @@ def load_cz_sweep_dataset(
                 )
                 f_roll_0v = float(popt[1])
         except Exception as e:
-            logger.warning(f"Could not fit f_roll from 0V reference data: {e}")
+            pass
 
     predicted_lnyq_nh = None
     if f_roll_0v is not None and f_roll_0v > 0:
         # L = R_shunt / (2 * pi * f_roll)
         predicted_lnyq_nh = (rshunt_uohm * 1e3) / (2.0 * np.pi * f_roll_0v)
 
-    # 2. Process all non-zero bias points
+    # 2. Check channel mismatch for single-channel datasets:
+    # Channels < 32 have 220 nH bonded inductors (nominal f_roll ~ 181 Hz at Rshunt=250 uOhm)
+    # Channels >= 32 have ~120 nH bonded inductors (nominal f_roll ~ 334 Hz at Rshunt=250 uOhm)
+    nominal_lnyq_nh = 220.0 if channel_id < 32 else 119.13
+    is_channel_mismatch = False
+    if not is_multichannel and f_roll_0v is not None:
+        if channel_id < 32 and f_roll_0v > 260.0:
+            is_channel_mismatch = True
+        elif channel_id >= 32 and f_roll_0v <= 260.0:
+            is_channel_mismatch = True
+
+    if lnyq_nh is not None:
+        lnyq_val_nh = float(lnyq_nh)
+    elif is_channel_mismatch:
+        lnyq_val_nh = float(nominal_lnyq_nh)
+    elif predicted_lnyq_nh is not None:
+        lnyq_val_nh = float(predicted_lnyq_nh)
+    else:
+        lnyq_val_nh = float(nominal_lnyq_nh)
+
     R_shunt = rshunt_uohm * 1e-6
-    L_nyq = (predicted_lnyq_nh * 1e-9) if predicted_lnyq_nh else (lnyq_nh * 1e-9)
+    L_nyq = lnyq_val_nh * 1e-9
 
     bias_points_dict = {}
     bias_voltages = []
@@ -282,18 +378,11 @@ def load_cz_sweep_dataset(
         try:
             data_bias = np.load(npz_files[0], allow_pickle=True)
             fs_bias = np.asarray(data_bias.get("fs_sch", fs_sch_ref), dtype=float)
-            u_bias = None
-
-            if "fft_unroll" in data_bias:
-                u_bias = np.asarray(data_bias["fft_unroll"], dtype=complex)
-            elif "raw_data" in data_bias:
-                fs_sample = float(data_bias.get("fs_global", 250000.0))
-                raw_amps = arb_to_amp(np.asarray(data_bias["raw_data"], dtype=float))
-                n_pts = len(raw_amps)
-                freqs_fft = rfftfreq(n_pts, 1.0 / fs_sample)
-                tau_shift = float(data_bias.get("tau_shift", 0.0))
-                fft_dc = rfft(raw_amps - np.mean(raw_amps)) * np.exp(-2j * np.pi * freqs_fft * tau_shift)
-                u_bias = np.array([fft_dc[np.argmin(np.abs(freqs_fft - f))] for f in fs_bias])
+            tau_shift_bias = float(data_bias.get("tau_shift", tau_shift_0v))
+            fs_global_bias = float(data_bias.get("fs_global", fs_global_0v))
+            u_bias, _, _ = _extract_channel_fft(
+                data_bias, channel_id, fs_bias, tau_shift=tau_shift_bias, fs_global=fs_global_bias
+            )
 
             if u_bias is None or len(u_bias) != len(fs_bias):
                 continue
@@ -349,8 +438,13 @@ def load_cz_sweep_dataset(
         "u0_fft": u0_fft,
         "f_roll_0v": f_roll_0v,
         "predicted_lnyq_nh": predicted_lnyq_nh,
+        "nominal_lnyq_nh": nominal_lnyq_nh,
+        "is_multichannel": is_multichannel,
+        "is_channel_mismatch": is_channel_mismatch,
+        "detected_channel": detected_channel,
+        "channel_id": channel_id,
         "rshunt_uohm": rshunt_uohm,
-        "lnyq_nh": (predicted_lnyq_nh if predicted_lnyq_nh else lnyq_nh),
+        "lnyq_nh": lnyq_val_nh,
         "bias_points": bias_points_dict,
         "bias_voltages": bias_voltages,
         "num_biases": len(bias_voltages),

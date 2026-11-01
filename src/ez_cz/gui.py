@@ -937,7 +937,9 @@ class CZWorker(QThread):
                     fs_global=fs_global,
                     time_per_flux_ramp=time_per_flux_ramp,
                     dc_source=dc_source,
-                    flip_bias=flip_bias
+                    flip_bias=flip_bias,
+                    channel=p.get("channel", 63),
+                    f_roll=f_roll if f_roll is not None else np.nan,
                 )
 
                 plot_data = {
@@ -1574,7 +1576,7 @@ class CZMainWindow(QMainWindow):
         self.analyze_sweep_data = None
         self.analyze_iv_data = None
         self.active_model = get_model("Simple (1-body)")
-        self.current_model_params = self.active_model.get_parameter_defs()
+        self.current_model_params = self.active_model.get_parameter_defs(channel=63)
         self.current_fit_result = None
         self.current_selected_bias = None
         self.param_table_widgets = {}
@@ -3282,8 +3284,25 @@ class CZMainWindow(QMainWindow):
             self.on_load_analyze_iv()
 
     def on_analyze_channel_changed(self):
+        new_ch = self.spin_analyze_channel.value()
+        old_ch = getattr(self, "_last_analyzed_channel", None)
+        self._last_analyzed_channel = new_ch
+
+        if old_ch is not None and "L_nyq" in self.current_model_params:
+            curr_l = self.current_model_params["L_nyq"].value
+            # When switching from >=32 to <32, if L_nyq is at nominal ~119.1 nH, switch to 220.0 nH
+            if new_ch < 32 and old_ch >= 32 and abs(curr_l - 119.13) < 5.0:
+                self.current_model_params["L_nyq"].value = 220.0
+                self.sync_param_to_table("L_nyq", 220.0)
+                self.log_analyze("INFO", f"Channel {new_ch} (< 32): set nominal bonded L_nyq = 220.0 nH.")
+            # When switching from <32 to >=32, if L_nyq is at nominal 220.0 nH, switch to 119.13 nH
+            elif new_ch >= 32 and old_ch < 32 and abs(curr_l - 220.0) < 5.0:
+                self.current_model_params["L_nyq"].value = 119.13
+                self.sync_param_to_table("L_nyq", 119.13)
+                self.log_analyze("INFO", f"Channel {new_ch} (>= 32): set nominal bonded L_nyq = 119.13 nH.")
+
         if hasattr(self, "spin_analyze_pixel"):
-            self.spin_analyze_pixel.setValue(self.spin_analyze_channel.value())
+            self.spin_analyze_pixel.setValue(new_ch)
         if hasattr(self, "edit_analyze_raw_dir") and Path(self.edit_analyze_raw_dir.text().strip()).exists():
             self.on_load_analyze_sweep()
 
@@ -3292,7 +3311,8 @@ class CZMainWindow(QMainWindow):
             rsh = 250.0
             if "R_shunt" in self.current_model_params:
                 rsh = self.current_model_params["R_shunt"].value
-            lnyq = 74.8
+            nom_l = 220.0 if (hasattr(self, "spin_analyze_channel") and self.spin_analyze_channel.value() < 32) else 119.13
+            lnyq = nom_l
             if "L_nyq" in self.current_model_params:
                 lnyq = self.current_model_params["L_nyq"].value
             flip = self.chk_analyze_flip_bias.isChecked()
@@ -3406,15 +3426,38 @@ class CZMainWindow(QMainWindow):
             n_biases = self.analyze_sweep_data["num_biases"]
             self.log_analyze("INFO", f"Loaded {n_biases} bias points from {raw_dir.name} (Ch {ch}, tones={len(self.analyze_sweep_data['fs_sch'])})")
 
-            # Auto-predict / populate Lnyq from 0V SC transfer function
+            # Auto-predict / populate Lnyq from 0V SC transfer function or channel nominal
             f_roll_0v = self.analyze_sweep_data.get("f_roll_0v")
+            is_mismatch = self.analyze_sweep_data.get("is_channel_mismatch", False)
+            nominal_lnyq = 220.0 if ch < 32 else 119.13
             rshunt_uohm = 250.0
             if "R_shunt" in self.current_model_params:
                 rshunt_uohm = self.current_model_params["R_shunt"].value
 
+            pred_lnyq = None
             if f_roll_0v is not None and f_roll_0v > 0:
                 pred_lnyq = (rshunt_uohm * 1e3) / (2.0 * np.pi * f_roll_0v)
                 self.analyze_sweep_data["predicted_lnyq_nh"] = pred_lnyq
+
+            if is_mismatch:
+                # Loaded 0V SC reference was measured on a different channel group (e.g. Ch 63 data loaded for Ch < 32)
+                # Channels < 32 have 220 nH bonded inductors; do NOT clobber with Ch 63's 119 nH fit!
+                chosen_lnyq = nominal_lnyq
+                if "L_nyq" in self.current_model_params:
+                    self.current_model_params["L_nyq"].value = float(chosen_lnyq)
+                    self.sync_param_to_table("L_nyq", float(chosen_lnyq))
+                if hasattr(self, "lbl_analyze_sc_info"):
+                    self.lbl_analyze_sc_info.setText(
+                        f"SC 0V ref: f_roll = {f_roll_0v:.1f} Hz ({pred_lnyq:.1f} nH, Ch>=32 data) | Active Ch {ch}: {chosen_lnyq:.1f} nH (bonded)"
+                    )
+                self.log_analyze(
+                    "WARN",
+                    f"Notice: Loaded sweep 0V reference has f_roll = {f_roll_0v:.1f} Hz (L_nyq = {pred_lnyq:.1f} nH, recorded for Ch >= 32). "
+                    f"Channel {ch} (< 32) has a bonded 220 nH inductor (nominal f_roll ~ 181 Hz). "
+                    f"Setting L_nyq = {chosen_lnyq:.1f} nH for Channel {ch}."
+                )
+                recompute_dataset_circuit_impedance(self.analyze_sweep_data, rshunt_uohm, chosen_lnyq, flip_bias=flip)
+            elif pred_lnyq is not None and pred_lnyq > 0:
                 if "L_nyq" in self.current_model_params:
                     self.current_model_params["L_nyq"].value = float(pred_lnyq)
                     self.sync_param_to_table("L_nyq", float(pred_lnyq))
@@ -3424,7 +3467,7 @@ class CZMainWindow(QMainWindow):
                     )
                 self.log_analyze("INFO", f"SC 0V Transfer Function: f_roll = {f_roll_0v:.1f} Hz -> Auto-predicted L_nyq = {pred_lnyq:.2f} nH (R_shunt = {rshunt_uohm:.2f} µΩ)")
             elif hasattr(self, "lbl_analyze_sc_info"):
-                self.lbl_analyze_sc_info.setText("SC 0V: No f_roll roll-off detected")
+                self.lbl_analyze_sc_info.setText(f"SC 0V: No f_roll roll-off detected | Ch {ch} nominal Lnyq = {nominal_lnyq:.1f} nH")
 
             # Update bias points dropdown
             self.combo_analyze_bias_points.blockSignals(True)
@@ -3472,14 +3515,29 @@ class CZMainWindow(QMainWindow):
         if "R_shunt" in self.current_model_params:
             rshunt = self.current_model_params["R_shunt"].value
         pred_lnyq = (rshunt * 1e3) / (2.0 * np.pi * f_roll)
+        ch = self.spin_analyze_channel.value() if hasattr(self, "spin_analyze_channel") else 63
+
         if "L_nyq" in self.current_model_params:
             self.current_model_params["L_nyq"].value = pred_lnyq
             self.sync_param_to_table("L_nyq", pred_lnyq)
+
+        note = ""
+        if ch < 32 and pred_lnyq < 160.0:
+            note = f" (loaded SC 0V is from Ch >= 32; Ch {ch} bonded is 220 nH)"
+            self.log_analyze(
+                "WARN",
+                f"Predicted L_nyq = {pred_lnyq:.2f} nH from SC f_roll = {f_roll:.1f} Hz. "
+                f"Note: Channel {ch} (< 32) has a bonded 220 nH inductor (expected f_roll ~ 181 Hz). "
+                f"Overwriting L_nyq = {pred_lnyq:.1f} nH from this 0V reference. "
+                f"If you wish to use the 220 nH bonded hardware value, edit L_nyq directly in the parameter table."
+            )
+        else:
+            self.log_analyze("INFO", f"Predicted L_nyq = {pred_lnyq:.2f} nH from SC f_roll = {f_roll:.1f} Hz (R_shunt = {rshunt:.2f} µΩ)")
+
         if hasattr(self, "lbl_analyze_sc_info"):
             self.lbl_analyze_sc_info.setText(
-                f"SC 0V: f_roll = {f_roll:.1f} Hz | Pred Lnyq = {pred_lnyq:.1f} nH (R_sh = {rshunt:.1f} µΩ)"
+                f"SC 0V: f_roll = {f_roll:.1f} Hz | Pred Lnyq = {pred_lnyq:.1f} nH (R_sh = {rshunt:.1f} µΩ){note}"
             )
-        self.log_analyze("INFO", f"Predicted L_nyq = {pred_lnyq:.2f} nH from SC f_roll = {f_roll:.1f} Hz (R_shunt = {rshunt:.2f} µΩ)")
         flip = self.chk_analyze_flip_bias.isChecked() if hasattr(self, "chk_analyze_flip_bias") else True
         recompute_dataset_circuit_impedance(self.analyze_sweep_data, rshunt, pred_lnyq, flip_bias=flip)
         self.update_live_model_prediction()
@@ -3586,7 +3644,8 @@ class CZMainWindow(QMainWindow):
     def on_reset_limits_clicked(self):
         """Resets parameter Min/Max limits to default physical bounds for active model."""
         m_name = self.active_model.name
-        defs = self.active_model.get_parameter_defs()
+        ch_curr = self.spin_analyze_channel.value() if hasattr(self, "spin_analyze_channel") else 63
+        defs = self.active_model.get_parameter_defs(channel=ch_curr)
         self.is_updating_params = True
         for k, p_def in defs.items():
             if k in self.current_model_params:
@@ -3727,7 +3786,8 @@ class CZMainWindow(QMainWindow):
         m_name = self.combo_analyze_model.currentText()
         self.active_model = get_model(m_name)
         old_params = self.current_model_params
-        new_params = self.active_model.get_parameter_defs()
+        ch_curr = self.spin_analyze_channel.value() if hasattr(self, "spin_analyze_channel") else 63
+        new_params = self.active_model.get_parameter_defs(channel=ch_curr)
         for k, p in new_params.items():
             if k in old_params:
                 p.value = old_params[k].value
@@ -3827,7 +3887,7 @@ class CZMainWindow(QMainWindow):
             rsh = 250.0
             if "R_shunt" in self.current_model_params:
                 rsh = self.current_model_params["R_shunt"].value
-            lnyq = 74.8
+            lnyq = 220.0 if (hasattr(self, "spin_analyze_channel") and self.spin_analyze_channel.value() < 32) else 119.13
             if "L_nyq" in self.current_model_params:
                 lnyq = self.current_model_params["L_nyq"].value
             flip = self.chk_analyze_flip_bias.isChecked() if hasattr(self, "chk_analyze_flip_bias") else True

@@ -173,7 +173,7 @@ class ThermalModelBase:
         """
         z_tes = self.calc_z_tes(f, params, flip_bias=flip_bias)
         rshunt = params.get("R_shunt", 250.0) * 1e-6
-        lnyq = params.get("L_nyq", 74.8) * 1e-9
+        lnyq = params.get("L_nyq", 119.13) * 1e-9
         omega = 2.0 * np.pi * f
         return z_tes + rshunt + 1j * omega * lnyq
 
@@ -253,10 +253,10 @@ class ThermalModelBase:
             if fit_target == "Y_tes":
                 diff = y_clean - y_pred
             elif fit_target == "Z_total":
-                target_ztot = ztot_clean if ztot_clean is not None else (z_clean + (current_vals.get("R_shunt", 250.0)*1e-6 + 1j*2*np.pi*f_clean*current_vals.get("L_nyq", 74.8)*1e-9))
+                target_ztot = ztot_clean if ztot_clean is not None else (z_clean + (current_vals.get("R_shunt", 250.0)*1e-6 + 1j*2*np.pi*f_clean*current_vals.get("L_nyq", 119.13)*1e-9))
                 diff = target_ztot - ztot_pred
             elif fit_target == "Y_total":
-                target_ztot = ztot_clean if ztot_clean is not None else (z_clean + (current_vals.get("R_shunt", 250.0)*1e-6 + 1j*2*np.pi*f_clean*current_vals.get("L_nyq", 74.8)*1e-9))
+                target_ztot = ztot_clean if ztot_clean is not None else (z_clean + (current_vals.get("R_shunt", 250.0)*1e-6 + 1j*2*np.pi*f_clean*current_vals.get("L_nyq", 119.13)*1e-9))
                 target_ytot = 1.0 / np.where(np.abs(target_ztot) > 1e-15, target_ztot, np.nan + 1j * np.nan)
                 diff = target_ytot - (1.0 / ztot_pred)
             else:
@@ -308,14 +308,14 @@ class ThermalModelBase:
                 diff = y_clean - y_mod
             elif fit_target == "Z_total":
                 rsh = cand.get("R_shunt", 250.0) * 1e-6
-                lnyq = cand.get("L_nyq", 74.8) * 1e-9
+                lnyq = cand.get("L_nyq", 119.13) * 1e-9
                 z_circ = rsh + 1j * 2.0 * np.pi * f_clean * lnyq
                 z_tot_mod = z_mod + z_circ
                 target_ztot = ztot_clean if ztot_clean is not None else (z_clean + z_circ)
                 diff = target_ztot - z_tot_mod
             elif fit_target == "Y_total":
                 rsh = cand.get("R_shunt", 250.0) * 1e-6
-                lnyq = cand.get("L_nyq", 74.8) * 1e-9
+                lnyq = cand.get("L_nyq", 119.13) * 1e-9
                 z_circ = rsh + 1j * 2.0 * np.pi * f_clean * lnyq
                 z_tot_mod = z_mod + z_circ
                 y_tot_mod = 1.0 / np.where(np.abs(z_tot_mod) > 1e-15, z_tot_mod, 1e-15)
@@ -431,7 +431,9 @@ class SimpleModel(ThermalModelBase):
         P0 = kwargs.get("P0", kwargs.get("P_0", 2.85))  # pW
         n = kwargs.get("n", kwargs.get("n_mem", 3.5))
         Rshunt = kwargs.get("Rshunt", kwargs.get("R_shunt", 250.0))  # uOhm
-        Lnyq = kwargs.get("Lnyq", kwargs.get("L_nyq", 119.13))  # nH (from SC fit)
+        channel = kwargs.get("channel", kwargs.get("channel_id", None))
+        default_lnyq = 220.0 if (channel is not None and channel < 32) else 119.13
+        Lnyq = kwargs.get("Lnyq", kwargs.get("L_nyq", default_lnyq))  # nH (from SC fit or channel nominal)
 
         defs = [
             ParameterDef("C_tes", "C_tes (pJ/K)", C_tes, 0.0001, 50.0, vary=True, unit="pJ/K", unit_scale=1e-12,
