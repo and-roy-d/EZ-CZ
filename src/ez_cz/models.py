@@ -63,66 +63,78 @@ class FitResult:
     z_total_dense: Optional[np.ndarray] = None
 
 
-def predict_ttes(P_tes_W: float, G_W_per_K: float, n: float, T_bath_K: float, Tc_max_K: Optional[float] = None) -> float:
+def predict_tc(P_tes_W: float, G_W_per_K: float, n: float, T_bath_K: float) -> float:
     """
-    Predicts TES temperature T_tes (in Kelvin) from steady-state power balance:
-        P_tes = (G / n) * T_tes * (1 - (T_bath / T_tes)^n)
-    where:
-        P_tes_W: TES Joule power in Watts (from IV curve P0 = I0^2 * R0)
-        G_W_per_K: Thermal conductance dP/dT at T_tes in W/K (e.g. G_tes_bath * 1e-9)
-        n: Thermal conductance exponent n_mem (dimensionless, typically 3-4)
-        T_bath_K: Bath temperature in Kelvin (T_bath)
-        Tc_max_K: Optional critical temperature ceiling in Kelvin. If specified,
-                 T_tes is bounded by Tc. If None, power balance is unconstrained.
+    Calculates critical / operating temperature Tc explicitly from thermal conductance G,
+    TES Joule power P_tes, thermal exponent n, and bath temperature T_bath via power balance:
+        P_tes = (G / n) * Tc * (1 - (T_bath / Tc)^n)
     """
     T_bath_K = max(T_bath_K, 1e-4)
-    if Tc_max_K is not None:
-        Tc_max_K = max(Tc_max_K, T_bath_K)
-        if P_tes_W <= 0 or G_W_per_K <= 0 or n <= 0:
-            return float(min(T_bath_K, Tc_max_K))
-    elif P_tes_W <= 0 or G_W_per_K <= 0 or n <= 0:
+    if P_tes_W <= 0 or G_W_per_K <= 0 or n <= 0:
         return float(T_bath_K)
 
     t_guess = (n * P_tes_W) / G_W_per_K
     low = max(T_bath_K * 1.000001, 1e-4)
-    high = max(T_bath_K + t_guess * 5.0, 2.0)
+    high = max(T_bath_K + t_guess * 5.0, 5.0)
 
     def func(T):
         return (G_W_per_K / n) * T * (1.0 - (T_bath_K / max(T, 1e-6))**n) - P_tes_W
 
     try:
         from scipy.optimize import brentq
-        sol = float(brentq(func, low, high, xtol=1e-7, maxiter=100))
-        if Tc_max_K is not None:
-            return float(min(sol, Tc_max_K))
-        return float(sol)
+        return float(brentq(func, low, high, xtol=1e-8, maxiter=200))
     except Exception:
         # Fallback fixed-point iteration
         T = max(t_guess, T_bath_K * 1.2)
-        for _ in range(50):
+        for _ in range(100):
             k = G_W_per_K / (n * max(T, 1e-5)**(n - 1.0))
             T_next = (T_bath_K**n + P_tes_W / max(k, 1e-15))**(1.0 / n)
-            if abs(T_next - T) < 1e-7:
-                if Tc_max_K is not None:
-                    return float(min(T_next, Tc_max_K))
+            if abs(T_next - T) < 1e-8:
                 return float(T_next)
             T = 0.5 * (T + T_next)
-        if Tc_max_K is not None:
-            return float(min(T, Tc_max_K))
         return float(T)
+
+
+def predict_ttes(
+    P_tes_W: float,
+    G_W_per_K: float,
+    n: float,
+    T_bath_K: float,
+    Tc_max_K: Optional[float] = None,
+    rn_fraction: Optional[float] = None,
+    transition_width_K: float = 0.0005,
+) -> float:
+    """
+    Explicit power balance operating temperature solver:
+        P_tes = (G / n) * T_tes * (1 - (T_bath / T_tes)^n)
+    """
+    return predict_tc(P_tes_W, G_W_per_K, n, T_bath_K)
+
+
+def predict_g(P_tes_W: float, Tc_K: float, n: float, T_bath_K: float) -> float:
+    """
+    Calculates thermal conductance G explicitly from critical / operating temperature Tc,
+    TES Joule power P_tes, thermal exponent n, and bath temperature T_bath via power balance:
+        G = (n * P_tes) / (Tc * (1 - (T_bath / Tc)^n))
+    """
+    T_bath_K = max(T_bath_K, 1e-4)
+    if Tc_K <= T_bath_K or P_tes_W <= 0 or n <= 0:
+        return 0.0
+    factor = 1.0 - (T_bath_K / Tc_K)**n
+    if factor <= 1e-9:
+        return 0.0
+    return float((n * P_tes_W) / (Tc_K * factor))
 
 
 def get_p0_and_ttes(params: Dict[str, float], g_w_per_k: float) -> Tuple[float, float]:
     """
     Returns (P0_Watts, T_tes_Kelvin) ensuring both reflect the current operating point.
-    If P_0 (in pW) is present in params and > 0, calculates T_tes from power balance:
+    If P_0 (in pW) is present in params and > 0, calculates T_tes / Tc explicitly from power balance:
         P0 = (g / n) * T_tes * (1 - (T_bath / T_tes)^n)
-    bounded by model Tc limit if specified.
     Otherwise computes P0 from T_tes.
     """
     n = params.get("n_mem", 3.5)
     tbath = max(params.get("T_bath", 0.020), 1e-4)
-    tc_cap = params.get("Tc", params.get("Tc_max", None))
 
     p0_val = None
     if "P_0" in params and params["P_0"] > 0:
@@ -134,13 +146,9 @@ def get_p0_and_ttes(params: Dict[str, float], g_w_per_k: float) -> Tuple[float, 
 
     if p0_val is not None:
         p0_w = float(p0_val)
-        ttes_k = predict_ttes(p0_w, g_w_per_k, n, tbath, Tc_max_K=tc_cap)
-        if tc_cap is not None and tc_cap > tbath:
-            ttes_k = min(ttes_k, tc_cap)
+        ttes_k = predict_tc(p0_w, g_w_per_k, n, tbath)
     else:
-        ttes_k = max(params.get("T_tes", 0.045), 1e-4)
-        if tc_cap is not None and tc_cap > tbath:
-            ttes_k = min(ttes_k, tc_cap)
+        ttes_k = max(params.get("T_tes", 0.050), 1e-4)
         k = g_w_per_k / (n * ttes_k**(n - 1.0))
         p0_w = k * (ttes_k**n - tbath**n)
 
@@ -431,9 +439,7 @@ class SimpleModel(ThermalModelBase):
         P0 = kwargs.get("P0", kwargs.get("P_0", 2.85))  # pW
         n = kwargs.get("n", kwargs.get("n_mem", 3.5))
         Rshunt = kwargs.get("Rshunt", kwargs.get("R_shunt", 250.0))  # uOhm
-        channel = kwargs.get("channel", kwargs.get("channel_id", None))
-        default_lnyq = 220.0 if (channel is not None and channel < 32) else 119.13
-        Lnyq = kwargs.get("Lnyq", kwargs.get("L_nyq", default_lnyq))  # nH (from SC fit or channel nominal)
+        Lnyq = kwargs.get("Lnyq", kwargs.get("L_nyq", 119.13))  # nH (from SC fit)
 
         defs = [
             ParameterDef("C_tes", "C_tes (pJ/K)", C_tes, 0.0001, 50.0, vary=True, unit="pJ/K", unit_scale=1e-12,
@@ -452,7 +458,7 @@ class SimpleModel(ThermalModelBase):
                          category="circuit", description="Thevenin shunt resistance"),
             ParameterDef("L_nyq", "Lnyq (nH)", Lnyq, 1.0, 2000.0, vary=False, unit="nH", unit_scale=1e-9,
                          category="circuit", description="Total Nyquist loop inductance"),
-            ParameterDef("T_tes", "Tc / T_tes (K)", Tc, 0.005, 1.0, vary=False, unit="K", unit_scale=1.0,
+            ParameterDef("T_tes", "T_tes (K)", Tc, 0.005, 1.0, vary=False, unit="K", unit_scale=1.0,
                          category="operating", description="Operating temperature / critical temperature of the TES"),
             ParameterDef("T_bath", "Tbath (K)", Tbath, 0.001, 0.5, vary=False, unit="K", unit_scale=1.0,
                          category="operating", description="Bath temperature"),

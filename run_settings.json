@@ -41,16 +41,16 @@
     "output_dir": "/data"
   },
   "analyze": {
-    "raw_dir": "/data/20261030/Complex_Z/20261030_171549",
+    "raw_dir": "/data/20260714/Complex_Z/20260714_130145",
     "iv_file": "/data/20261023/iv/20261023_181330_iv_IV_19.9mK.npz",
     "channel_id": 63,
     "zero_bias_time_shift": -0.0270625,
-    "tc": 0.045,
+    "tc": 0.08,
     "tbath": 0.02,
     "n_thermal": 3.5,
     "dummy_g_tes_b": 2.2e-10,
     "rbias_iv": 1000.0,
-    "rnormal_mohm": 25.35,
+    "rnormal_mohm": 25.39,
     "rshunt_uOhm": 250.0,
     "l_nyq_nH": 119.13,
     "save_in_raw": true,
@@ -109,16 +109,16 @@
       },
       "Simple (1-body)": {
         "C_tes": [
-          0.0001,
-          0.06
+          0.01,
+          0.1
         ],
         "G_tes_bath": [
-          0.0001,
-          1.0
+          0.005,
+          0.5
         ],
         "alpha": [
           0.0,
-          5000.0
+          10000.0
         ],
         "beta": [
           0.0,
@@ -150,10 +150,11 @@
         ],
         "n_mem": [
           1.5,
-          4.0
+          6.0
         ]
       }
     },
-    "fit_target": "Z_tes (TES Impedance)"
+    "fit_target": "Z_tes (TES Impedance)",
+    "sc_ref": ""
   }
 }

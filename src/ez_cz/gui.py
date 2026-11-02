@@ -59,7 +59,15 @@ from matplotlib.backends.backend_qt5agg import NavigationToolbar2QT as Navigatio
 from matplotlib.figure import Figure
 import matplotlib.image as mpimg
 
-from ez_cz.models import AVAILABLE_MODELS, get_model, ParameterDef, FitResult, predict_ttes
+from ez_cz.models import (
+    AVAILABLE_MODELS,
+    get_model,
+    ParameterDef,
+    FitResult,
+    predict_ttes,
+    predict_tc,
+    predict_g,
+)
 from ez_cz.data_io import load_iv_curve, load_cz_sweep_dataset, recompute_dataset_circuit_impedance
 
 # ---------------------------------------------------------------------------
@@ -214,7 +222,7 @@ def query_time_per_flux_ramp_point(cfg_path=DEFAULT_CONFIG_PATH, default_dt=TIME
         except Exception as e:
             logger.debug(f"Could not parse ctrl settings from {cfg_path}: {e}")
 
-    if ctrl_addr:
+    if ctrl_addr and not os.environ.get("PYTEST_CURRENT_TEST") and os.environ.get("QT_QPA_PLATFORM") != "offscreen":
         try:
             import argparse
             import qsdumux.user.abaco_setup as abaco_setup
@@ -1895,7 +1903,7 @@ class CZMainWindow(QMainWindow):
         # Save settings button
         self.btn_save_config = QPushButton("Save Settings as Default (run_settings.json)")
         self.btn_save_config.setStyleSheet("background-color: #37474f; color: #cfd8dc; font-size: 9pt;")
-        self.btn_save_config.clicked.connect(self.save_settings_to_json)
+        self.btn_save_config.clicked.connect(lambda: self.save_settings_to_json(show_dialog=True))
         left_layout.addWidget(self.btn_save_config)
 
         # Console Log
@@ -1981,14 +1989,37 @@ class CZMainWindow(QMainWindow):
         iv_h.addWidget(self.btn_load_analyze_iv)
         data_layout.addLayout(iv_h, 1, 1, 1, 3)
 
-        data_layout.addWidget(QLabel("Channel ID:"), 2, 0)
+        data_layout.addWidget(QLabel("SC 0V Ref (Optional):"), 2, 0)
+        self.edit_analyze_sc_ref = QLineEdit("")
+        self.edit_analyze_sc_ref.setPlaceholderText("Auto: <Raw Complex Z Dir>/bias_0v00")
+        self.btn_browse_analyze_sc_ref = QPushButton("Browse")
+        self.btn_browse_analyze_sc_ref.setFixedWidth(75)
+        self.btn_browse_analyze_sc_ref.clicked.connect(self.on_browse_analyze_sc_ref)
+        sc_ref_h = QHBoxLayout()
+        sc_ref_h.addWidget(self.edit_analyze_sc_ref)
+        sc_ref_h.addWidget(self.btn_browse_analyze_sc_ref)
+        data_layout.addLayout(sc_ref_h, 2, 1, 1, 3)
+
+        data_layout.addWidget(QLabel("Channel ID:"), 3, 0)
         self.spin_analyze_channel = QSpinBox()
         self.spin_analyze_channel.setRange(0, 127)
         self.spin_analyze_channel.setValue(63)
         self.spin_analyze_channel.valueChanged.connect(self.on_analyze_channel_changed)
-        data_layout.addWidget(self.spin_analyze_channel, 2, 1)
+        data_layout.addWidget(self.spin_analyze_channel, 3, 1)
 
-        data_layout.addWidget(QLabel("Rbias:"), 2, 2)
+        data_layout.addWidget(QLabel("Tc:"), 3, 2)
+        self.spin_analyze_tc = QDoubleSpinBox()
+        self.spin_analyze_tc.setRange(1.0, 5000.0)
+        self.spin_analyze_tc.setDecimals(1)
+        self.spin_analyze_tc.setSingleStep(1.0)
+        self.spin_analyze_tc.setValue(45.0)
+        self.spin_analyze_tc.setSuffix(" mK")
+        self.spin_analyze_tc.setKeyboardTracking(False)
+        self.spin_analyze_tc.setToolTip("Critical temperature Tc of the active channel (mK). Sets the transition temperature ceiling for T_tes estimation.")
+        self.spin_analyze_tc.valueChanged.connect(self.on_analyze_tc_changed)
+        data_layout.addWidget(self.spin_analyze_tc, 3, 3)
+
+        data_layout.addWidget(QLabel("Rbias:"), 4, 0)
         self.spin_analyze_rbias = QDoubleSpinBox()
         self.spin_analyze_rbias.setRange(1.0, 1000000.0)
         self.spin_analyze_rbias.setDecimals(1)
@@ -1997,9 +2028,9 @@ class CZMainWindow(QMainWindow):
         self.spin_analyze_rbias.setSuffix(" Ω")
         self.spin_analyze_rbias.setKeyboardTracking(False)
         self.spin_analyze_rbias.valueChanged.connect(self.on_load_analyze_iv)
-        data_layout.addWidget(self.spin_analyze_rbias, 2, 3)
+        data_layout.addWidget(self.spin_analyze_rbias, 4, 1)
 
-        data_layout.addWidget(QLabel("Normal Rn:"), 3, 0)
+        data_layout.addWidget(QLabel("Normal Rn:"), 4, 2)
         self.spin_analyze_rn = QDoubleSpinBox()
         self.spin_analyze_rn.setRange(0.01, 2000.0)
         self.spin_analyze_rn.setDecimals(2)
@@ -2009,13 +2040,13 @@ class CZMainWindow(QMainWindow):
         self.spin_analyze_rn.setKeyboardTracking(False)
         self.spin_analyze_rn.setToolTip("Normal state resistance Rn (mΩ). Auto-calculated as Rshunt*(slope_sc/slope_n - 1), or update manually if IV fails to find it.")
         self.spin_analyze_rn.valueChanged.connect(self.on_analyze_rn_changed)
-        data_layout.addWidget(self.spin_analyze_rn, 3, 1)
+        data_layout.addWidget(self.spin_analyze_rn, 4, 3)
 
-        data_layout.addWidget(QLabel("Bias Point:"), 3, 2)
+        data_layout.addWidget(QLabel("Bias Point:"), 5, 0)
         self.combo_analyze_bias_points = QComboBox()
         self.combo_analyze_bias_points.addItem("Click 'Load Sweep' to populate")
         self.combo_analyze_bias_points.currentIndexChanged.connect(self.on_analyze_bias_changed)
-        data_layout.addWidget(self.combo_analyze_bias_points, 3, 3)
+        data_layout.addWidget(self.combo_analyze_bias_points, 5, 1, 1, 3)
 
         flags_h = QHBoxLayout()
         self.chk_analyze_flip_bias = QCheckBox("Flip bias (ensure Re(Z) > 0 at DC)")
@@ -2026,7 +2057,7 @@ class CZMainWindow(QMainWindow):
         self.chk_analyze_save_in_raw = QCheckBox("Save in <Complex_Z_Dir>/analysis/")
         self.chk_analyze_save_in_raw.setChecked(True)
         flags_h.addWidget(self.chk_analyze_save_in_raw)
-        data_layout.addLayout(flags_h, 4, 0, 1, 4)
+        data_layout.addLayout(flags_h, 6, 0, 1, 4)
 
         left_layout.addWidget(data_box)
 
@@ -2050,11 +2081,17 @@ class CZMainWindow(QMainWindow):
         self.btn_predict_lnyq.clicked.connect(self.on_predict_lnyq_clicked)
         m_top_h.addWidget(self.btn_predict_lnyq)
 
-        self.btn_predict_ttes = QPushButton("Predict Ttes")
-        self.btn_predict_ttes.setToolTip("Predict T_tes from thermal balance: P_tes = (G/n)*T_tes*(1 - (T_bath/T_tes)^n)")
+        self.btn_predict_ttes = QPushButton("Predict Tc")
+        self.btn_predict_ttes.setToolTip("Calculate Tc explicitly from power balance: P_tes = (G/n)*Tc*(1 - (T_bath/Tc)^n)")
         self.btn_predict_ttes.setStyleSheet("background-color: #00897b; color: #ffffff; font-weight: bold; padding: 4px 10px;")
         self.btn_predict_ttes.clicked.connect(self.on_predict_ttes_clicked)
         m_top_h.addWidget(self.btn_predict_ttes)
+
+        self.btn_predict_g = QPushButton("Predict G")
+        self.btn_predict_g.setToolTip("Calculate G explicitly from Tc: G = (n * P_tes) / (Tc * (1 - (T_bath/Tc)^n))")
+        self.btn_predict_g.setStyleSheet("background-color: #5c6bc0; color: #ffffff; font-weight: bold; padding: 4px 10px;")
+        self.btn_predict_g.clicked.connect(self.on_predict_g_clicked)
+        m_top_h.addWidget(self.btn_predict_g)
         model_layout.addLayout(m_top_h)
 
         self.lbl_analyze_sc_info = QLabel("SC 0V Transfer Function: Not loaded")
@@ -3170,8 +3207,15 @@ class CZMainWindow(QMainWindow):
                 self.edit_analyze_raw_dir.setText(str(a["raw_dir"]))
             if "iv_file" in a and a["iv_file"] and hasattr(self, "edit_analyze_iv_file"):
                 self.edit_analyze_iv_file.setText(str(a["iv_file"]))
+            if "sc_ref" in a and hasattr(self, "edit_analyze_sc_ref"):
+                self.edit_analyze_sc_ref.setText(str(a["sc_ref"]))
             if "channel_id" in a and hasattr(self, "spin_analyze_channel"):
                 self.spin_analyze_channel.setValue(int(a["channel_id"]))
+            if "tc" in a and hasattr(self, "spin_analyze_tc"):
+                tc_val = float(a["tc"])
+                if tc_val < 1.0:
+                    tc_val *= 1000.0  # Convert Kelvin to mK
+                self.spin_analyze_tc.setValue(tc_val)
             if ("rbias" in a or "rbias_iv" in a) and hasattr(self, "spin_analyze_rbias"):
                 self.spin_analyze_rbias.setValue(float(a.get("rbias", a.get("rbias_iv", 1000.0))))
             if "rnormal_mohm" in a and hasattr(self, "spin_analyze_rn"):
@@ -3195,7 +3239,7 @@ class CZMainWindow(QMainWindow):
         except Exception as e:
             self.log("WARN", f"Could not load {path}: {e}")
 
-    def save_settings_to_json(self, filepath=None):
+    def save_settings_to_json(self, filepath=None, show_dialog=False):
         """Saves current GUI configuration back to run_settings.json."""
         path = Path(filepath or SETTINGS_FILE_PATH)
         existing = {}
@@ -3239,8 +3283,12 @@ class CZMainWindow(QMainWindow):
             analyze_cfg["raw_dir"] = self.edit_analyze_raw_dir.text().strip()
         if hasattr(self, "edit_analyze_iv_file"):
             analyze_cfg["iv_file"] = self.edit_analyze_iv_file.text().strip()
+        if hasattr(self, "edit_analyze_sc_ref"):
+            analyze_cfg["sc_ref"] = self.edit_analyze_sc_ref.text().strip()
         if hasattr(self, "spin_analyze_channel"):
             analyze_cfg["channel_id"] = self.spin_analyze_channel.value()
+        if hasattr(self, "spin_analyze_tc"):
+            analyze_cfg["tc"] = self.spin_analyze_tc.value() * 1e-3  # Persist in Kelvin
         if hasattr(self, "spin_analyze_rbias"):
             analyze_cfg["rbias_iv"] = self.spin_analyze_rbias.value()
         if hasattr(self, "spin_analyze_rn"):
@@ -3261,10 +3309,12 @@ class CZMainWindow(QMainWindow):
             with open(path, "w") as f:
                 json.dump(existing, f, indent=2)
             self.log("INFO", f"Configuration successfully saved to {path}")
-            QMessageBox.information(self, "Settings Saved", f"Successfully saved defaults to {path}")
+            if show_dialog and os.environ.get("QT_QPA_PLATFORM") != "offscreen" and not os.environ.get("PYTEST_CURRENT_TEST"):
+                QMessageBox.information(self, "Settings Saved", f"Successfully saved defaults to {path}")
         except Exception as e:
             self.log("ERROR", f"Failed to save settings: {e}")
-            QMessageBox.critical(self, "Save Error", str(e))
+            if show_dialog and os.environ.get("QT_QPA_PLATFORM") != "offscreen" and not os.environ.get("PYTEST_CURRENT_TEST"):
+                QMessageBox.critical(self, "Save Error", str(e))
 
     # -----------------------------------------------------------------------
     # Analyze Tab Handlers (Interactive MDT Model Fitting & Sweeps)
@@ -3283,23 +3333,21 @@ class CZMainWindow(QMainWindow):
             self.edit_analyze_iv_file.setText(f)
             self.on_load_analyze_iv()
 
+    def on_browse_analyze_sc_ref(self):
+        curr = self.edit_analyze_sc_ref.text().strip() or self.edit_analyze_raw_dir.text().strip() or "/data"
+        choice = QFileDialog.getExistingDirectory(self, "Select SC Reference Directory", curr)
+        if choice:
+            self.edit_analyze_sc_ref.setText(choice)
+            self.on_load_analyze_sweep()
+        else:
+            f, _ = QFileDialog.getOpenFileName(self, "Select SC Reference NPZ File", curr, "NPZ Files (*.npz);;All Files (*)")
+            if f:
+                self.edit_analyze_sc_ref.setText(f)
+                self.on_load_analyze_sweep()
+
     def on_analyze_channel_changed(self):
         new_ch = self.spin_analyze_channel.value()
-        old_ch = getattr(self, "_last_analyzed_channel", None)
         self._last_analyzed_channel = new_ch
-
-        if old_ch is not None and "L_nyq" in self.current_model_params:
-            curr_l = self.current_model_params["L_nyq"].value
-            # When switching from >=32 to <32, if L_nyq is at nominal ~119.1 nH, switch to 220.0 nH
-            if new_ch < 32 and old_ch >= 32 and abs(curr_l - 119.13) < 5.0:
-                self.current_model_params["L_nyq"].value = 220.0
-                self.sync_param_to_table("L_nyq", 220.0)
-                self.log_analyze("INFO", f"Channel {new_ch} (< 32): set nominal bonded L_nyq = 220.0 nH.")
-            # When switching from <32 to >=32, if L_nyq is at nominal 220.0 nH, switch to 119.13 nH
-            elif new_ch >= 32 and old_ch < 32 and abs(curr_l - 220.0) < 5.0:
-                self.current_model_params["L_nyq"].value = 119.13
-                self.sync_param_to_table("L_nyq", 119.13)
-                self.log_analyze("INFO", f"Channel {new_ch} (>= 32): set nominal bonded L_nyq = 119.13 nH.")
 
         if hasattr(self, "spin_analyze_pixel"):
             self.spin_analyze_pixel.setValue(new_ch)
@@ -3311,10 +3359,7 @@ class CZMainWindow(QMainWindow):
             rsh = 250.0
             if "R_shunt" in self.current_model_params:
                 rsh = self.current_model_params["R_shunt"].value
-            nom_l = 220.0 if (hasattr(self, "spin_analyze_channel") and self.spin_analyze_channel.value() < 32) else 119.13
-            lnyq = nom_l
-            if "L_nyq" in self.current_model_params:
-                lnyq = self.current_model_params["L_nyq"].value
+            lnyq = self.current_model_params["L_nyq"].value if "L_nyq" in self.current_model_params else 119.13
             flip = self.chk_analyze_flip_bias.isChecked()
             recompute_dataset_circuit_impedance(self.analyze_sweep_data, rsh, lnyq, flip_bias=flip)
             self.current_fit_result = None
@@ -3391,6 +3436,24 @@ class CZMainWindow(QMainWindow):
         else:
             self.log_analyze("INFO", f"Set manual normal resistance Rn to {new_rn*1e3:.2f} mΩ")
 
+    def on_analyze_tc_changed(self):
+        new_tc_mK = self.spin_analyze_tc.value()
+        new_tc_K = new_tc_mK * 1e-3
+        ch = self.spin_analyze_channel.value() if hasattr(self, "spin_analyze_channel") else 63
+        self.log_analyze("INFO", f"Updated Tc to {new_tc_mK:.1f} mK for Ch {ch}")
+        if "T_tes" in self.current_model_params:
+            if self.current_model_params["T_tes"].value > new_tc_K:
+                self.current_model_params["T_tes"].value = new_tc_K
+                self.sync_param_to_table("T_tes", new_tc_K)
+            self.current_model_params["T_tes"].max_val = max(new_tc_K * 1.5, 0.100)
+            if "T_tes" in self.param_table_widgets and "spin_max" in self.param_table_widgets["T_tes"]:
+                smax = self.param_table_widgets["T_tes"]["spin_max"]
+                smax.blockSignals(True)
+                smax.setValue(self.current_model_params["T_tes"].max_val)
+                smax.blockSignals(False)
+        self.save_settings_to_json()
+        self.update_live_model_prediction()
+
     def on_load_analyze_sweep(self):
         raw_dir = Path(self.edit_analyze_raw_dir.text().strip())
         if not raw_dir.exists():
@@ -3422,52 +3485,45 @@ class CZMainWindow(QMainWindow):
                 elif hasattr(self, "spin_analyze_rn"):
                     self.analyze_iv_data["rnormal"] = self.spin_analyze_rn.value() * 1e-3
 
-            self.analyze_sweep_data = load_cz_sweep_dataset(raw_dir, channel_id=ch, flip_bias=flip)
-            n_biases = self.analyze_sweep_data["num_biases"]
-            self.log_analyze("INFO", f"Loaded {n_biases} bias points from {raw_dir.name} (Ch {ch}, tones={len(self.analyze_sweep_data['fs_sch'])})")
+            sc_ref_str = self.edit_analyze_sc_ref.text().strip() if hasattr(self, "edit_analyze_sc_ref") else ""
+            sc_ref_path = Path(sc_ref_str) if sc_ref_str else None
 
-            # Auto-predict / populate Lnyq from 0V SC transfer function or channel nominal
-            f_roll_0v = self.analyze_sweep_data.get("f_roll_0v")
-            is_mismatch = self.analyze_sweep_data.get("is_channel_mismatch", False)
-            nominal_lnyq = 220.0 if ch < 32 else 119.13
             rshunt_uohm = 250.0
             if "R_shunt" in self.current_model_params:
                 rshunt_uohm = self.current_model_params["R_shunt"].value
 
-            pred_lnyq = None
-            if f_roll_0v is not None and f_roll_0v > 0:
-                pred_lnyq = (rshunt_uohm * 1e3) / (2.0 * np.pi * f_roll_0v)
-                self.analyze_sweep_data["predicted_lnyq_nh"] = pred_lnyq
+            self.analyze_sweep_data = load_cz_sweep_dataset(
+                raw_dir,
+                channel_id=ch,
+                rshunt_uohm=rshunt_uohm,
+                lnyq_nh=None,
+                flip_bias=flip,
+                sc_ref_path=sc_ref_path,
+            )
+            n_biases = self.analyze_sweep_data["num_biases"]
+            self.log_analyze("INFO", f"Loaded {n_biases} bias points from {raw_dir.name} (Ch {ch}, tones={len(self.analyze_sweep_data['fs_sch'])})")
 
-            if is_mismatch:
-                # Loaded 0V SC reference was measured on a different channel group (e.g. Ch 63 data loaded for Ch < 32)
-                # Channels < 32 have 220 nH bonded inductors; do NOT clobber with Ch 63's 119 nH fit!
-                chosen_lnyq = nominal_lnyq
-                if "L_nyq" in self.current_model_params:
-                    self.current_model_params["L_nyq"].value = float(chosen_lnyq)
-                    self.sync_param_to_table("L_nyq", float(chosen_lnyq))
-                if hasattr(self, "lbl_analyze_sc_info"):
-                    self.lbl_analyze_sc_info.setText(
-                        f"SC 0V ref: f_roll = {f_roll_0v:.1f} Hz ({pred_lnyq:.1f} nH, Ch>=32 data) | Active Ch {ch}: {chosen_lnyq:.1f} nH (bonded)"
-                    )
-                self.log_analyze(
-                    "WARN",
-                    f"Notice: Loaded sweep 0V reference has f_roll = {f_roll_0v:.1f} Hz (L_nyq = {pred_lnyq:.1f} nH, recorded for Ch >= 32). "
-                    f"Channel {ch} (< 32) has a bonded 220 nH inductor (nominal f_roll ~ 181 Hz). "
-                    f"Setting L_nyq = {chosen_lnyq:.1f} nH for Channel {ch}."
-                )
-                recompute_dataset_circuit_impedance(self.analyze_sweep_data, rshunt_uohm, chosen_lnyq, flip_bias=flip)
-            elif pred_lnyq is not None and pred_lnyq > 0:
+            # Hardware-agnostic Lnyq prediction from SC transfer function
+            f_roll_0v = self.analyze_sweep_data.get("f_roll_0v")
+            pred_lnyq = self.analyze_sweep_data.get("predicted_lnyq_nh")
+
+            if pred_lnyq is not None and pred_lnyq > 0:
                 if "L_nyq" in self.current_model_params:
                     self.current_model_params["L_nyq"].value = float(pred_lnyq)
                     self.sync_param_to_table("L_nyq", float(pred_lnyq))
                 if hasattr(self, "lbl_analyze_sc_info"):
                     self.lbl_analyze_sc_info.setText(
-                        f"SC 0V: f_roll = {f_roll_0v:.1f} Hz | Pred Lnyq = {pred_lnyq:.1f} nH (R_sh = {rshunt_uohm:.1f} µΩ)"
+                        f"SC 0V: f_roll = {f_roll_0v:.1f} Hz | Lnyq = {pred_lnyq:.1f} nH (R_sh = {rshunt_uohm:.1f} µΩ)"
                     )
-                self.log_analyze("INFO", f"SC 0V Transfer Function: f_roll = {f_roll_0v:.1f} Hz -> Auto-predicted L_nyq = {pred_lnyq:.2f} nH (R_shunt = {rshunt_uohm:.2f} µΩ)")
-            elif hasattr(self, "lbl_analyze_sc_info"):
-                self.lbl_analyze_sc_info.setText(f"SC 0V: No f_roll roll-off detected | Ch {ch} nominal Lnyq = {nominal_lnyq:.1f} nH")
+                self.log_analyze("INFO", f"SC 0V Transfer Function: f_roll = {f_roll_0v:.1f} Hz -> Calculated L_nyq = {pred_lnyq:.2f} nH (R_shunt = {rshunt_uohm:.2f} µΩ)")
+                recompute_dataset_circuit_impedance(self.analyze_sweep_data, rshunt_uohm, pred_lnyq, flip_bias=flip)
+            else:
+                curr_l = self.current_model_params["L_nyq"].value if "L_nyq" in self.current_model_params else 100.0
+                if hasattr(self, "lbl_analyze_sc_info"):
+                    self.lbl_analyze_sc_info.setText(
+                        f"SC 0V: No roll-off detected | Current Lnyq = {curr_l:.1f} nH"
+                    )
+                recompute_dataset_circuit_impedance(self.analyze_sweep_data, rshunt_uohm, curr_l, flip_bias=flip)
 
             # Update bias points dropdown
             self.combo_analyze_bias_points.blockSignals(True)
@@ -3508,35 +3564,29 @@ class CZMainWindow(QMainWindow):
             self.log_analyze("WARN", "No Complex Z sweep data loaded to predict L_nyq.")
             return
         f_roll = self.analyze_sweep_data.get("f_roll_0v")
+
         if f_roll is None or f_roll <= 0:
-            self.log_analyze("WARN", "No valid 0V SC roll-off frequency (f_roll) found in dataset.")
+            self.log_analyze(
+                "WARN",
+                "Cannot predict L_nyq: No roll-off detected in loaded SC reference. "
+                "Enter L_nyq manually in the parameter table."
+            )
             return
+
         rshunt = 250.0
         if "R_shunt" in self.current_model_params:
             rshunt = self.current_model_params["R_shunt"].value
         pred_lnyq = (rshunt * 1e3) / (2.0 * np.pi * f_roll)
-        ch = self.spin_analyze_channel.value() if hasattr(self, "spin_analyze_channel") else 63
 
         if "L_nyq" in self.current_model_params:
             self.current_model_params["L_nyq"].value = pred_lnyq
             self.sync_param_to_table("L_nyq", pred_lnyq)
 
-        note = ""
-        if ch < 32 and pred_lnyq < 160.0:
-            note = f" (loaded SC 0V is from Ch >= 32; Ch {ch} bonded is 220 nH)"
-            self.log_analyze(
-                "WARN",
-                f"Predicted L_nyq = {pred_lnyq:.2f} nH from SC f_roll = {f_roll:.1f} Hz. "
-                f"Note: Channel {ch} (< 32) has a bonded 220 nH inductor (expected f_roll ~ 181 Hz). "
-                f"Overwriting L_nyq = {pred_lnyq:.1f} nH from this 0V reference. "
-                f"If you wish to use the 220 nH bonded hardware value, edit L_nyq directly in the parameter table."
-            )
-        else:
-            self.log_analyze("INFO", f"Predicted L_nyq = {pred_lnyq:.2f} nH from SC f_roll = {f_roll:.1f} Hz (R_shunt = {rshunt:.2f} µΩ)")
+        self.log_analyze("INFO", f"Calculated L_nyq = {pred_lnyq:.2f} nH from SC f_roll = {f_roll:.1f} Hz (R_shunt = {rshunt:.2f} µΩ)")
 
         if hasattr(self, "lbl_analyze_sc_info"):
             self.lbl_analyze_sc_info.setText(
-                f"SC 0V: f_roll = {f_roll:.1f} Hz | Pred Lnyq = {pred_lnyq:.1f} nH (R_sh = {rshunt:.1f} µΩ){note}"
+                f"SC 0V: f_roll = {f_roll:.1f} Hz | Lnyq = {pred_lnyq:.1f} nH (R_sh = {rshunt:.1f} µΩ)"
             )
         flip = self.chk_analyze_flip_bias.isChecked() if hasattr(self, "chk_analyze_flip_bias") else True
         recompute_dataset_circuit_impedance(self.analyze_sweep_data, rshunt, pred_lnyq, flip_bias=flip)
@@ -3544,13 +3594,13 @@ class CZMainWindow(QMainWindow):
 
     def on_predict_ttes_clicked(self):
         """
-        Predicts operating temperature T_tes from steady-state power balance:
-            P_tes = (G / n) * T_tes * (1 - (T_bath / T_tes)^n)
+        Calculates Tc / T_tes explicitly from steady-state power balance:
+            P_tes = (G / n) * Tc * (1 - (T_bath / Tc)^n)
         P_tes is obtained from the IV operating point (P0 = I0^2 * R0) or user input.
-        Conductance G, thermal exponent n, and bath temperature T_bath are taken from the active model table.
+        Conductance G, thermal exponent n, and bath temperature T_bath are taken from active model params.
         """
         g_param = None
-        for g_candidate in ("G_tes_bath", "G_int_bath", "G_tb"):
+        for g_candidate in ("G_tes_bath", "G_int_bath", "G_tb", "G_tes_int"):
             if g_candidate in self.current_model_params:
                 g_param = self.current_model_params[g_candidate]
                 break
@@ -3561,7 +3611,7 @@ class CZMainWindow(QMainWindow):
         g_nW_per_K = g_param.value
         g_W_per_K = g_nW_per_K * 1e-9
 
-        n_val = 3.2
+        n_val = 3.5
         if "n_mem" in self.current_model_params:
             n_val = self.current_model_params["n_mem"].value
 
@@ -3570,16 +3620,18 @@ class CZMainWindow(QMainWindow):
             tbath_K = self.current_model_params["T_bath"].value
 
         p_tes_W = None
+        rn_pct = None
         if self.analyze_iv_data and self.current_selected_bias is not None:
             op = self.analyze_iv_data["lookup_op"](self.current_selected_bias)
             p_tes_W = float(op.get("p0", 0.0))
+            rn_pct = float(op.get("rn_pct", 50.0))
 
         if p_tes_W is None or p_tes_W <= 0:
-            init_val_pW = 15.0
+            init_val_pW = 7.27
             val, ok = QInputDialog.getDouble(
                 self,
-                "Predict T_tes",
-                "Enter TES Joule power P_tes (pW):\n(P_tes = G/n * T_tes * [1 - (T_bath/T_tes)^n])",
+                "Predict Tc",
+                "Enter TES Joule power P_tes (pW):\n(P_tes = (G/n) * Tc * [1 - (T_bath/Tc)^n])",
                 init_val_pW,
                 0.001,
                 100000.0,
@@ -3589,21 +3641,94 @@ class CZMainWindow(QMainWindow):
                 return
             p_tes_W = val * 1e-12
 
-        tc_cap = None
-        if "T_tes" in self.current_model_params:
-            m_val = self.current_model_params["T_tes"].max_val
-            if m_val is not None and m_val < 0.99:
-                tc_cap = m_val
-        t_tes_pred = predict_ttes(p_tes_W, g_W_per_K, n_val, tbath_K, Tc_max_K=tc_cap)
+        tc_pred = predict_tc(p_tes_W, g_W_per_K, n_val, tbath_K)
 
         if "T_tes" in self.current_model_params:
-            self.current_model_params["T_tes"].value = t_tes_pred
-            self.sync_param_to_table("T_tes", t_tes_pred)
+            self.current_model_params["T_tes"].value = tc_pred
+            self.sync_param_to_table("T_tes", tc_pred)
 
+        if hasattr(self, "spin_analyze_tc"):
+            self.spin_analyze_tc.blockSignals(True)
+            self.spin_analyze_tc.setValue(tc_pred * 1e3)
+            self.spin_analyze_tc.blockSignals(False)
+
+        rn_str = f"({rn_pct:.1f}% Rn)" if rn_pct is not None else ""
         self.log_analyze(
             "INFO",
-            f"Predicted T_tes = {t_tes_pred*1e3:.2f} mK from P_tes = {p_tes_W*1e12:.2f} pW, "
-            f"G = {g_nW_per_K:.2f} nW/K, n = {n_val:.2f}, T_bath = {tbath_K*1e3:.2f} mK"
+            f"Calculated Tc = {tc_pred*1e3:.2f} mK {rn_str} explicitly from "
+            f"P_tes = {p_tes_W*1e12:.2f} pW, G = {g_nW_per_K*1e3:.1f} pW/K, n = {n_val:.2f}, T_bath = {tbath_K*1e3:.1f} mK."
+        )
+        self.update_live_model_prediction()
+
+    def on_predict_g_clicked(self):
+        """
+        Calculates thermal conductance G explicitly from critical / operating temperature Tc:
+            G = (n * P_tes) / (Tc * (1 - (T_bath / Tc)^n))
+        where Tc is taken from spin_analyze_tc (or T_tes in model params),
+        P_tes is taken from the IV operating point (P0 = I0^2 * R0),
+        and n and T_bath are taken from active model params.
+        """
+        g_param_name = None
+        for gc in ("G_tes_bath", "G_int_bath", "G_tb", "G_tes_int"):
+            if gc in self.current_model_params:
+                g_param_name = gc
+                break
+        if g_param_name is None:
+            self.log_analyze("WARN", "Current model does not include bath thermal conductance (G_tes_bath / G_int_bath).")
+            return
+
+        if hasattr(self, "spin_analyze_tc") and self.spin_analyze_tc.value() > 1.0:
+            tc_K = self.spin_analyze_tc.value() * 1e-3
+        elif "T_tes" in self.current_model_params and self.current_model_params["T_tes"].value > 0.005:
+            tc_K = self.current_model_params["T_tes"].value
+        else:
+            tc_K = 0.045
+
+        n_val = 3.5
+        if "n_mem" in self.current_model_params:
+            n_val = self.current_model_params["n_mem"].value
+
+        tbath_K = 0.020
+        if "T_bath" in self.current_model_params:
+            tbath_K = self.current_model_params["T_bath"].value
+
+        p_tes_W = None
+        rn_pct = None
+        if self.analyze_iv_data and self.current_selected_bias is not None:
+            op = self.analyze_iv_data["lookup_op"](self.current_selected_bias)
+            p_tes_W = float(op.get("p0", 0.0))
+            rn_pct = float(op.get("rn_pct", 50.0))
+
+        if p_tes_W is None or p_tes_W <= 0:
+            init_val_pW = 7.27
+            val, ok = QInputDialog.getDouble(
+                self,
+                "Predict G",
+                f"Enter TES Joule power P_tes (pW) at Tc = {tc_K*1e3:.2f} mK:\n(G = n * P_tes / (Tc * [1 - (T_bath/Tc)^n]))",
+                init_val_pW,
+                0.001,
+                100000.0,
+                3,
+            )
+            if not ok:
+                return
+            p_tes_W = val * 1e-12
+
+        g_calc_W = predict_g(p_tes_W, tc_K, n_val, tbath_K)
+        g_calc_nW = g_calc_W * 1e9
+
+        self.current_model_params[g_param_name].value = g_calc_nW
+        self.sync_param_to_table(g_param_name, g_calc_nW)
+
+        if "T_tes" in self.current_model_params:
+            self.current_model_params["T_tes"].value = tc_K
+            self.sync_param_to_table("T_tes", tc_K)
+
+        rn_str = f"({rn_pct:.1f}% Rn)" if rn_pct is not None else ""
+        self.log_analyze(
+            "INFO",
+            f"Calculated {g_param_name} = {g_calc_nW*1e3:.1f} pW/K ({g_calc_nW:.4f} nW/K) explicitly from "
+            f"Tc = {tc_K*1e3:.2f} mK {rn_str}, P_tes = {p_tes_W*1e12:.2f} pW, n = {n_val:.2f}, T_bath = {tbath_K*1e3:.1f} mK."
         )
         self.update_live_model_prediction()
 
@@ -3737,13 +3862,8 @@ class CZMainWindow(QMainWindow):
                 g_val = g_param.value * 1e-9
                 n_val = self.current_model_params["n_mem"].value if "n_mem" in self.current_model_params else 3.5
                 tb_val = self.current_model_params["T_bath"].value if "T_bath" in self.current_model_params else 0.020
-                tc_cap = None
-                if "T_tes" in self.current_model_params:
-                    m_val = self.current_model_params["T_tes"].max_val
-                    if m_val is not None and m_val < 0.99:
-                        tc_cap = m_val
                 try:
-                    ttes_k = predict_ttes(p0_w, g_val, n_val, tb_val, Tc_max_K=tc_cap)
+                    ttes_k = predict_tc(p0_w, g_val, n_val, tb_val)
                     if "T_tes" in self.current_model_params:
                         self.current_model_params["T_tes"].value = ttes_k
                         self.sync_param_to_table("T_tes", ttes_k)
@@ -3887,9 +4007,7 @@ class CZMainWindow(QMainWindow):
             rsh = 250.0
             if "R_shunt" in self.current_model_params:
                 rsh = self.current_model_params["R_shunt"].value
-            lnyq = 220.0 if (hasattr(self, "spin_analyze_channel") and self.spin_analyze_channel.value() < 32) else 119.13
-            if "L_nyq" in self.current_model_params:
-                lnyq = self.current_model_params["L_nyq"].value
+            lnyq = self.current_model_params["L_nyq"].value if "L_nyq" in self.current_model_params else 119.13
             flip = self.chk_analyze_flip_bias.isChecked() if hasattr(self, "chk_analyze_flip_bias") else True
             recompute_dataset_circuit_impedance(self.analyze_sweep_data, rsh, lnyq, flip_bias=flip)
 
@@ -4171,13 +4289,8 @@ class CZMainWindow(QMainWindow):
                     g_val = g_param.value * 1e-9
                     n_val = self.current_model_params["n_mem"].value if "n_mem" in self.current_model_params else 3.5
                     tb_val = self.current_model_params["T_bath"].value if "T_bath" in self.current_model_params else 0.020
-                    tc_cap = None
-                    if "T_tes" in self.current_model_params:
-                        m_val = self.current_model_params["T_tes"].max_val
-                        if m_val is not None and m_val < 0.99:
-                            tc_cap = m_val
                     try:
-                        ttes_k = predict_ttes(p0_w, g_val, n_val, tb_val, Tc_max_K=tc_cap)
+                        ttes_k = predict_tc(p0_w, g_val, n_val, tb_val)
                         self.current_model_params["T_tes"].value = ttes_k
                     except Exception:
                         pass

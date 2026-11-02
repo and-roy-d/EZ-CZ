@@ -3,9 +3,11 @@ data_io.py: Robust I/O and processing utilities for Complex Impedance (CZ) sweep
 """
 
 import os
+import re
+import json
 import glob
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Any
+from typing import Dict, List, Optional, Tuple, Any, Union
 import numpy as np
 import scipy.constants
 from scipy.fft import rfft, irfft, rfftfreq
@@ -180,62 +182,83 @@ def _extract_channel_fft(
     Extracts complex tone FFT array for the requested channel from a CZ dataset npz.
     Returns: (u_fft, is_multichannel, detected_channel_id)
     """
-    ch_key = f"chan{channel_id}"
+    candidate_keys = [
+        f"chan{channel_id}",
+        f"ch{channel_id}",
+        f"channel_{channel_id}",
+        f"channel{channel_id}",
+        str(channel_id),
+        channel_id,
+    ]
 
     # 1. Multi-channel dictionary: fft_real and fft_imag
     if "fft_real" in data_dict and "fft_imag" in data_dict:
         re_obj = data_dict["fft_real"].item() if (hasattr(data_dict["fft_real"], "ndim") and data_dict["fft_real"].ndim == 0) else data_dict["fft_real"]
         im_obj = data_dict["fft_imag"].item() if (hasattr(data_dict["fft_imag"], "ndim") and data_dict["fft_imag"].ndim == 0) else data_dict["fft_imag"]
         if isinstance(re_obj, dict):
-            if ch_key in re_obj and ch_key in im_obj:
-                return np.asarray(re_obj[ch_key], dtype=float) + 1j * np.asarray(im_obj[ch_key], dtype=float), True, channel_id
-            elif len(re_obj) > 0:
-                first_k = next(iter(re_obj.keys()))
-                first_ch = int(first_k.replace("chan", "")) if "chan" in first_k else None
-                return np.asarray(re_obj[first_k], dtype=float) + 1j * np.asarray(im_obj[first_k], dtype=float), True, first_ch
+            matched_key = None
+            for k in candidate_keys:
+                if k in re_obj and (im_obj is None or k in im_obj):
+                    matched_key = k
+                    break
+            if matched_key is not None:
+                return np.asarray(re_obj[matched_key], dtype=float) + 1j * np.asarray(im_obj[matched_key], dtype=float), True, channel_id
+            return None, True, None
 
     # 2. fft_unroll (dict, 2D array, or 1D array)
     if "fft_unroll" in data_dict:
         fft_val = data_dict["fft_unroll"]
         if hasattr(fft_val, "ndim") and fft_val.ndim == 0 and isinstance(fft_val.item(), dict):
             d = fft_val.item()
-            if ch_key in d:
-                return np.asarray(d[ch_key], dtype=complex), True, channel_id
-            elif len(d) > 0:
-                first_k = next(iter(d.keys()))
-                first_ch = int(first_k.replace("chan", "")) if "chan" in first_k else None
-                return np.asarray(d[first_k], dtype=complex), True, first_ch
+            matched_key = None
+            for k in candidate_keys:
+                if k in d:
+                    matched_key = k
+                    break
+            if matched_key is not None:
+                return np.asarray(d[matched_key], dtype=complex), True, channel_id
+            return None, True, None
         elif hasattr(fft_val, "ndim") and fft_val.ndim == 2:
-            if fft_val.shape[1] > fft_val.shape[0] and channel_id < fft_val.shape[0]:
-                return np.asarray(fft_val[channel_id, :], dtype=complex), True, channel_id
-            elif channel_id < fft_val.shape[1]:
-                return np.asarray(fft_val[:, channel_id], dtype=complex), True, channel_id
+            sh = fft_val.shape
+            if sh[0] > sh[1]:
+                # (freqs, channels)
+                if channel_id < sh[1]:
+                    return np.asarray(fft_val[:, channel_id], dtype=complex), True, channel_id
+                return None, True, None
             else:
-                return np.asarray(fft_val[:, 0], dtype=complex), True, 0
+                # (channels, freqs)
+                if channel_id < sh[0]:
+                    return np.asarray(fft_val[channel_id, :], dtype=complex), True, channel_id
+                return None, True, None
         elif hasattr(fft_val, "ndim") and fft_val.ndim == 1:
-            det_ch = int(data_dict["channel"]) if "channel" in data_dict else None
+            det_ch = None
+            for k in ("channel", "channel_id", "chan"):
+                if k in data_dict:
+                    try:
+                        det_ch = int(data_dict[k])
+                        break
+                    except Exception:
+                        pass
             return np.asarray(fft_val, dtype=complex), False, det_ch
 
     # 3. Multi-channel raw demodulation: 'data' dict
     if "data" in data_dict:
         data_obj = data_dict["data"].item() if (hasattr(data_dict["data"], "ndim") and data_dict["data"].ndim == 0) else data_dict["data"]
         if isinstance(data_obj, dict):
-            raw_ch = None
-            detected_ch = None
-            if ch_key in data_obj:
-                raw_ch = np.asarray(data_obj[ch_key], dtype=float)
-                detected_ch = channel_id
-            elif len(data_obj) > 0:
-                first_k = next(iter(data_obj.keys()))
-                raw_ch = np.asarray(data_obj[first_k], dtype=float)
-                detected_ch = int(first_k.replace("chan", "")) if "chan" in first_k else None
-            if raw_ch is not None:
+            matched_key = None
+            for k in candidate_keys:
+                if k in data_obj:
+                    matched_key = k
+                    break
+            if matched_key is not None:
+                raw_ch = np.asarray(data_obj[matched_key], dtype=float)
                 raw_amps = arb_to_amp(raw_ch)
                 n_pts = len(raw_amps)
                 freqs_fft = rfftfreq(n_pts, 1.0 / fs_global)
                 fft_dc = rfft(raw_amps - np.mean(raw_amps)) * np.exp(-2j * np.pi * freqs_fft * tau_shift)
                 u_fft = np.array([fft_dc[np.argmin(np.abs(freqs_fft - f))] for f in fs_sch])
-                return u_fft, True, detected_ch
+                return u_fft, True, channel_id
+            return None, True, None
 
     # 4. Single-channel raw_data demodulation
     if "raw_data" in data_dict:
@@ -246,7 +269,14 @@ def _extract_channel_fft(
         tau = float(data_dict.get("tau_shift", tau_shift))
         fft_dc = rfft(raw_amps - np.mean(raw_amps)) * np.exp(-2j * np.pi * freqs_fft * tau)
         u_fft = np.array([fft_dc[np.argmin(np.abs(freqs_fft - f))] for f in fs_sch])
-        det_ch = int(data_dict["channel"]) if "channel" in data_dict else None
+        det_ch = None
+        for k in ("channel", "channel_id", "chan"):
+            if k in data_dict:
+                try:
+                    det_ch = int(data_dict[k])
+                    break
+                except Exception:
+                    pass
         return u_fft, False, det_ch
 
     return None, False, None
@@ -258,10 +288,12 @@ def load_cz_sweep_dataset(
     rshunt_uohm: float = 250.0,
     lnyq_nh: Optional[float] = None,
     flip_bias: bool = True,
+    sc_ref_path: Optional[Union[str, Path]] = None,
 ) -> Dict[str, Any]:
     """
     Scans a raw Complex Z measurement directory, locates the zero-bias superconducting
-    reference, and computes complex impedance Z_tes(f) for every bias point.
+    reference (or uses an external SC reference if provided), and computes complex impedance
+    Z_tes(f) for every bias point for the specified channel.
     """
     base_dir = Path(raw_dir)
     if not base_dir.exists():
@@ -271,28 +303,68 @@ def load_cz_sweep_dataset(
     if not bias_folders:
         raise ValueError(f"No bias_* subfolders found in {base_dir}")
 
-    # 1. Identify 0V superconducting reference folder
-    ref_0v_folder = None
-    for bf in bias_folders:
-        try:
-            vb_val = float(bf.name.split("_", 1)[-1].replace("v", "."))
-            if np.isclose(vb_val, 0.0, atol=1e-3):
-                ref_0v_folder = bf
-                break
-        except Exception:
-            continue
+    # 1. Locate 0V superconducting reference file
+    ref_0v_npz: Optional[Path] = None
+    ref_0v_folder: Optional[Path] = None
 
-    if ref_0v_folder is None:
-        raise ValueError(f"Could not locate 0V superconducting reference folder (bias_0v00) in {base_dir}")
+    if sc_ref_path:
+        sc_p = Path(sc_ref_path)
+        if sc_p.is_file() and sc_p.suffix == ".npz":
+            ref_0v_npz = sc_p
+            ref_0v_folder = sc_p.parent
+        elif sc_p.is_dir():
+            ref_0v_folder = sc_p
+            ch_candidates = [
+                f"*chan{channel_id}*.npz",
+                f"*ch{channel_id}*.npz",
+                f"*channel_{channel_id}*.npz",
+                f"*{channel_id}*.npz",
+            ]
+            for pat in ch_candidates:
+                matched = sorted(sc_p.glob(pat))
+                if matched:
+                    ref_0v_npz = matched[0]
+                    break
+            if ref_0v_npz is None:
+                all_npzs = sorted(sc_p.glob("*.npz"))
+                if all_npzs:
+                    ref_0v_npz = all_npzs[0]
+
+    # If no external sc_ref specified or not found, search in base_dir
+    if ref_0v_npz is None:
+        for bf in bias_folders:
+            try:
+                vb_val = float(bf.name.split("_", 1)[-1].replace("v", "."))
+                if np.isclose(vb_val, 0.0, atol=1e-3):
+                    ref_0v_folder = bf
+                    break
+            except Exception:
+                continue
+
+        if ref_0v_folder is not None:
+            ch_candidates = [
+                f"*chan{channel_id}*.npz",
+                f"*ch{channel_id}*.npz",
+                f"*channel_{channel_id}*.npz",
+                f"*{channel_id}*.npz",
+            ]
+            for pat in ch_candidates:
+                matched = sorted(ref_0v_folder.glob(pat))
+                if matched:
+                    ref_0v_npz = matched[0]
+                    break
+            if ref_0v_npz is None:
+                all_npzs = sorted(ref_0v_folder.glob("*.npz"))
+                if all_npzs:
+                    ref_0v_npz = all_npzs[0]
+
+    if ref_0v_npz is None or not ref_0v_npz.exists():
+        raise ValueError(f"Could not locate 0V superconducting reference file in {base_dir}")
 
     # Load 0V reference tones and FFT
-    npz_0v_files = list(ref_0v_folder.glob("*.npz"))
-    if not npz_0v_files:
-        raise ValueError(f"No .npz file in reference folder {ref_0v_folder}")
-
-    data_0v = np.load(npz_0v_files[0], allow_pickle=True)
+    data_0v = np.load(ref_0v_npz, allow_pickle=True)
     if "fs_sch" not in data_0v:
-        raise ValueError(f"Missing 'fs_sch' frequencies in {npz_0v_files[0]}")
+        raise ValueError(f"Missing 'fs_sch' frequencies in {ref_0v_npz}")
 
     fs_sch_ref = np.asarray(data_0v["fs_sch"], dtype=float)
     tau_shift_0v = float(data_0v.get("tau_shift", 0.0))
@@ -301,60 +373,47 @@ def load_cz_sweep_dataset(
     u0_fft, is_multichannel, detected_channel = _extract_channel_fft(
         data_0v, channel_id, fs_sch_ref, tau_shift=tau_shift_0v, fs_global=fs_global_0v
     )
-    if u0_fft is None:
-        raise ValueError(f"Neither 'fft_unroll', 'fft_real'/'fft_imag', nor 'raw_data' present in {npz_0v_files[0]}")
+    is_channel_mismatch = (u0_fft is None)
 
-    # 1.5. Extract or predict f_roll and L_nyq from 0V SC transfer function
+    # Extract or predict f_roll and L_nyq from the SC transfer function (hardware-agnostic)
     f_roll_0v = None
-    if "f_roll" in data_0v:
-        try:
-            f_roll_0v = float(data_0v["f_roll"])
-        except Exception:
-            f_roll_0v = None
+    if u0_fft is not None:
+        if "f_roll" in data_0v and not is_multichannel:
+            try:
+                f_roll_0v = float(data_0v["f_roll"])
+            except Exception:
+                f_roll_0v = None
 
-    if f_roll_0v is None and u0_fft is not None:
-        try:
-            from scipy.optimize import curve_fit
-            y_mag = np.abs(u0_fft)
-            valid = np.isfinite(fs_sch_ref) & np.isfinite(y_mag) & (fs_sch_ref > 0) & (y_mag > 0)
-            if np.sum(valid) > 4:
-                def _mag_lorentz(f, a0, fr):
-                    return a0 / np.sqrt(1.0 + (f / fr)**2)
-                popt, _ = curve_fit(
-                    _mag_lorentz,
-                    fs_sch_ref[valid],
-                    y_mag[valid],
-                    p0=[float(np.max(y_mag[valid])), 1000.0],
-                    bounds=([0.0, 1.0], [np.inf, 1e6])
-                )
-                f_roll_0v = float(popt[1])
-        except Exception as e:
-            pass
+        if f_roll_0v is None:
+            try:
+                from scipy.optimize import curve_fit
+                y_mag = np.abs(u0_fft)
+                valid = np.isfinite(fs_sch_ref) & np.isfinite(y_mag) & (fs_sch_ref > 0) & (y_mag > 0)
+                if np.sum(valid) > 4:
+                    def _mag_lorentz(f, a0, fr):
+                        return a0 / np.sqrt(1.0 + (f / fr)**2)
+                    popt, _ = curve_fit(
+                        _mag_lorentz,
+                        fs_sch_ref[valid],
+                        y_mag[valid],
+                        p0=[float(np.max(y_mag[valid])), 1000.0],
+                        bounds=([0.0, 1.0], [np.inf, 1e6])
+                    )
+                    f_roll_0v = float(popt[1])
+            except Exception:
+                pass
 
     predicted_lnyq_nh = None
     if f_roll_0v is not None and f_roll_0v > 0:
         # L = R_shunt / (2 * pi * f_roll)
         predicted_lnyq_nh = (rshunt_uohm * 1e3) / (2.0 * np.pi * f_roll_0v)
 
-    # 2. Check channel mismatch for single-channel datasets:
-    # Channels < 32 have 220 nH bonded inductors (nominal f_roll ~ 181 Hz at Rshunt=250 uOhm)
-    # Channels >= 32 have ~120 nH bonded inductors (nominal f_roll ~ 334 Hz at Rshunt=250 uOhm)
-    nominal_lnyq_nh = 220.0 if channel_id < 32 else 119.13
-    is_channel_mismatch = False
-    if not is_multichannel and f_roll_0v is not None:
-        if channel_id < 32 and f_roll_0v > 260.0:
-            is_channel_mismatch = True
-        elif channel_id >= 32 and f_roll_0v <= 260.0:
-            is_channel_mismatch = True
-
     if lnyq_nh is not None:
         lnyq_val_nh = float(lnyq_nh)
-    elif is_channel_mismatch:
-        lnyq_val_nh = float(nominal_lnyq_nh)
     elif predicted_lnyq_nh is not None:
         lnyq_val_nh = float(predicted_lnyq_nh)
     else:
-        lnyq_val_nh = float(nominal_lnyq_nh)
+        lnyq_val_nh = 100.0
 
     R_shunt = rshunt_uohm * 1e-6
     L_nyq = lnyq_val_nh * 1e-9
@@ -387,12 +446,23 @@ def load_cz_sweep_dataset(
             if u_bias is None or len(u_bias) != len(fs_bias):
                 continue
 
+            if u0_fft is not None:
+                if len(u0_fft) != len(fs_bias) or not np.allclose(fs_sch_ref, fs_bias):
+                    u0_re = np.interp(fs_bias, fs_sch_ref, np.real(u0_fft))
+                    u0_im = np.interp(fs_bias, fs_sch_ref, np.imag(u0_fft))
+                    u0_eff = u0_re + 1j * u0_im
+                else:
+                    u0_eff = u0_fft
+            else:
+                # Synthesize ideal single-pole SC response if u0_fft was missing
+                u0_eff = 1.0 / (R_shunt + 1j * 2.0 * np.pi * fs_bias * L_nyq)
+
             # Calculate complex impedance:
             # Transfer function ratio: I_bias / I_0 = Z_circuit / Z_total
             # where Z_circuit = R_shunt + 1j * omega * L_nyq
             # and Z_total = Z_tes + R_shunt + 1j * omega * L_nyq = Z_tes + Z_circuit
             Z_circuit = 1j * 2.0 * np.pi * fs_bias * L_nyq + R_shunt
-            ratio_I = u_bias / u0_fft
+            ratio_I = u_bias / u0_eff
             safe_ratio = np.where(np.abs(ratio_I) > 1e-12, ratio_I, np.nan + 1j * np.nan)
             Z_total = Z_circuit / safe_ratio
             Z_tes = Z_total - Z_circuit
@@ -421,12 +491,12 @@ def load_cz_sweep_dataset(
                 "y_total": Y_total,
                 "r0_dc": r0_dc,
                 "u_bias": u_bias,
-                "u0_fft": u0_fft,
+                "u0_fft": u0_eff,
                 "safe_ratio": safe_ratio,
                 "valid_mask": np.isfinite(Z_tes),
             }
             bias_voltages.append(vb_val)
-        except Exception as e:
+        except Exception:
             continue
 
     bias_voltages.sort()
@@ -434,11 +504,11 @@ def load_cz_sweep_dataset(
     return {
         "raw_dir": base_dir,
         "ref_0v_folder": ref_0v_folder,
+        "ref_0v_npz": ref_0v_npz,
         "fs_sch": fs_sch_ref,
         "u0_fft": u0_fft,
         "f_roll_0v": f_roll_0v,
         "predicted_lnyq_nh": predicted_lnyq_nh,
-        "nominal_lnyq_nh": nominal_lnyq_nh,
         "is_multichannel": is_multichannel,
         "is_channel_mismatch": is_channel_mismatch,
         "detected_channel": detected_channel,
@@ -489,3 +559,32 @@ def recompute_dataset_circuit_impedance(
         b_info["y_tes"] = 1.0 / np.where(np.abs(Z_t) > 1e-15, Z_t, np.nan + 1j * np.nan)
         b_info["y_total"] = 1.0 / np.where(np.abs(Z_tot) > 1e-15, Z_tot, np.nan + 1j * np.nan)
         b_info["valid_mask"] = np.isfinite(Z_t)
+
+
+def compute_lindeman_two_state_impedance(
+    u_bias: np.ndarray,
+    u_sc: np.ndarray,
+    u_normal: np.ndarray,
+    r_normal: float,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Computes TES complex impedance Z_tes(f) and equivalent circuit impedance Z_eq(f)
+    using the empirical 2-state calibration method from Lindeman et al. (2007) [arXiv:0704.3066],
+    Eq. (8) & Section III.
+
+    Given a superconducting transfer function u_sc(f) and a normal-state transfer function
+    u_normal(f) with normal resistance r_normal:
+        Z_eq(f) = r_normal / ( (u_sc(f) / u_normal(f)) - 1 )
+        Z_tes(f) = Z_eq(f) * ( (u_sc(f) / u_bias(f)) - 1 )
+
+    Returns:
+        (Z_tes, Z_eq)
+    """
+    ratio_norm = np.where(np.abs(u_normal) > 1e-15, u_sc / u_normal, np.nan + 1j * np.nan)
+    denom_eq = ratio_norm - 1.0
+    safe_denom_eq = np.where(np.abs(denom_eq) > 1e-12, denom_eq, np.nan + 1j * np.nan)
+    Z_eq = r_normal / safe_denom_eq
+
+    ratio_bias = np.where(np.abs(u_bias) > 1e-15, u_sc / u_bias, np.nan + 1j * np.nan)
+    Z_tes = Z_eq * (ratio_bias - 1.0)
+    return Z_tes, Z_eq
