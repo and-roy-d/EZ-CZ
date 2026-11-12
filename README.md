@@ -94,6 +94,7 @@ ez-cz-measure [OPTIONS]
 | `--normal-first` | Pulse TES to normal state for 1 s after 0V calibration | `False` |
 | `--bias-range` | `START STOP STEP` for bias ranges (can be repeated) | `0.5 1.5 0.01` |
 | `--flip-bias` | Invert stimulus phase / demodulation polarity | `False` |
+| `--save-raw-all` | Also save the averaged time record of every channel (float32) | `False` |
 | `--dry-run` | Run in simulation mode without hardware | `False` |
 | `--config`, `-cfg` | Path to JSON settings file | `run_settings.json` |
 
@@ -242,6 +243,7 @@ To measure complex impedance $Z_{\text{tes}}(f)$ rapidly across decades of frequ
 
 ### 3. Synchronous Acquisition and Coherent Demodulation
 - **DASTARD Streaming**: Raw SQUID feedback counts are acquired synchronously over an exact integer number of flux-ramp cycles.
+- **All Channels Saved**: Every channel DASTARD returns is processed at every bias. Each `vbias_*_data.npz` keeps the `--channel` response in `fft_unroll`/`raw_data` and adds, keyed `chanNN`, the tone responses of all channels (`fft_real`, `fft_imag`), their DC levels (`dc_mean_all`, the TES current for the operating point) and spreads (`raw_std_all`), plus `channel` and `channels`. The readout delay from the 0 V calibration of `--channel` is applied to all channels. `ez-cz-analyze --channel-id N` reads any recorded channel.
 - **Coherent Matched-Filter Delay Recovery**: Readout cables, room-temperature electronics, and digital decimation introduce a propagation delay $\tau$. EZ-CZ recovers $\tau$ during the zero-bias superconducting calibration using an equalized matched filter:
   1. Derotate the raw FFT by the stimulus phases:
      $$u_{\text{raw}}[k] = \text{FFT}(I)[f_k] \cdot \exp(-j \phi_k)$$

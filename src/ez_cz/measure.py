@@ -351,6 +351,18 @@ def verify_awg_voltage_limits(bias_points, ac_amp_vpp, load="INFinity", dc_sourc
 # ---------------------------------------------------------------------------
 # Configuration Loader
 # ---------------------------------------------------------------------------
+def channel_keys(data_all):
+    """DASTARD channel keys ('chanNN') in a getNewData() result, in numeric order."""
+    keys = [k for k in data_all if isinstance(k, str) and k.startswith("chan") and k[4:].isdigit()]
+    return sorted(keys, key=lambda k: int(k[4:]))
+
+
+def average_records(raw, n_samples, n_averages, first_frame_index):
+    """Average n_averages consecutive measurement windows and align them to the stimulus start."""
+    raw = np.asarray(raw, dtype=float)[: n_samples * n_averages]
+    return np.roll(raw.reshape((n_averages, n_samples)).mean(axis=0), first_frame_index)
+
+
 def load_config_defaults(config_path="run_settings.json"):
     try:
         p = Path(config_path)
@@ -406,6 +418,11 @@ def parse_args():
     parser.add_argument(
         "--normal-first", action="store_true", default=get_default("normal_first", False),
         help="Drive TES normal for 1.0 s after 0V calibration before sweep."
+    )
+    parser.add_argument(
+        "--save-raw-all", action="store_true", default=get_default("save_raw_all", False),
+        help="Also save the averaged time record of every channel (float32, ~0.14 MB per channel per bias). "
+             "Tone responses, DC level and spread are saved for every channel regardless."
     )
     parser.add_argument(
         "--awg-rate", type=float, default=get_default("awg_rate", 5e6),
@@ -723,9 +740,8 @@ def main():
                 raw_mean = float(np.mean(data_raw))
                 if raw_std > 3000.0:
                     print(f"  WARNING: SQUID flux jump / demodulation unlock detected at {bias:.3f} V (std={raw_std:.0f}, mean={raw_mean:.0f})!")
-                data_mean = data_raw[:N_samples * args.n_averages].reshape((args.n_averages, N_samples)).mean(axis=0)
                 first_frame_index = data_all["firstFrameIndex"][0] % N_samples
-                data = np.roll(data_mean, first_frame_index)
+                data = average_records(data_raw, N_samples, args.n_averages, first_frame_index)
             else:
                 t = np.arange(N_samples) * time_per_flux_ramp
                 data = np.zeros(N_samples)
@@ -742,6 +758,18 @@ def main():
             fft_freqs = scipy.fft.rfftfreq(N_samples, d=time_per_flux_ramp)
             f_sch_idx = np.argmin(np.abs(fft_freqs[:, None] - all_freqs[None, :]), axis=0)
             tone_data_raw = fft_data_raw[f_sch_idx] * np.exp(-1j * phases)
+
+            # Every channel DASTARD returned: tone responses, DC level and spread.  The DC level of each channel is
+            # its TES current (4096 counts per Phi0, modulo flux jumps) and is needed for the operating point.
+            ffi_all = data_all["firstFrameIndex"][0] % N_samples
+            tones_all, dc_mean_all, raw_std_all, raw_all = {}, {}, {}, {}
+            for ch_k in channel_keys(data_all):
+                d_ch = average_records(data_all[ch_k], N_samples, args.n_averages, ffi_all)
+                tones_all[ch_k] = scipy.fft.rfft(d_ch)[f_sch_idx] * np.exp(-1j * phases)
+                dc_mean_all[ch_k] = float(np.mean(d_ch))
+                raw_std_all[ch_k] = float(np.std(np.asarray(data_all[ch_k], dtype=float)))
+                if args.save_raw_all:
+                    raw_all[ch_k] = d_ch.astype(np.float32)
 
             # 0 V Calibration
             if np.isclose(bias, 0.0):
@@ -808,6 +836,8 @@ def main():
             # Ensure Re(Z) is positive at DC: if flip_bias is True, invert unrolled response
             model_sign = -1.0 if args.flip_bias else 1.0
             fft_unroll = model_sign * raw_unroll
+            # Same readout delay for every channel (one DAQ pipeline), taken from the 0 V calibration of --channel
+            unroll_all = {k: model_sign * v * np.exp(-2j * np.pi * all_freqs * applied_tau) for k, v in tones_all.items()}
 
             bias_str = f"{bias:.2f}".replace(".", "v")
             bias_dir = base_dir / f"bias_{bias_str}"
@@ -824,7 +854,16 @@ def main():
                 fs_global=fs_global,
                 time_per_flux_ramp=time_per_flux_ramp,
                 dc_source=dc_source,
-                flip_bias=args.flip_bias
+                flip_bias=args.flip_bias,
+                # all channels (dicts keyed 'chanNN'; load with allow_pickle=True).  data_io picks these up by
+                # channel id through fft_real / fft_imag.
+                channel=args.channel,
+                channels=np.array([int(k[4:]) for k in unroll_all], dtype=int),
+                fft_real=np.array({k: v.real for k, v in unroll_all.items()}, dtype=object),
+                fft_imag=np.array({k: v.imag for k, v in unroll_all.items()}, dtype=object),
+                dc_mean_all=np.array(dc_mean_all, dtype=object),
+                raw_std_all=np.array(raw_std_all, dtype=object),
+                **({"raw_all": np.array(raw_all, dtype=object)} if args.save_raw_all else {})
             )
 
         print(f"\nMeasurement complete! All datasets saved to {base_dir}")
