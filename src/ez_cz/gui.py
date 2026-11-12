@@ -69,6 +69,7 @@ from ez_cz.models import (
     predict_g,
 )
 from ez_cz.data_io import load_iv_curve, load_cz_sweep_dataset, recompute_dataset_circuit_impedance
+from ez_cz.measure import channel_keys, average_records
 
 # ---------------------------------------------------------------------------
 # Hardware Imports with Mock Fallbacks for Simulation / Offline Use
@@ -787,6 +788,19 @@ class CZWorker(QThread):
                 tone_data_raw = fft_data_raw[f_sch_idx] * np.exp(-1j * phases)
                 sc_tone_data_raw = tone_data_raw
 
+                # Every channel DASTARD returned (same block as the selected channel): tone responses, DC level
+                # (TES current, 4096 counts per Phi0) and spread
+                n_avg_all = p.get("n_averages", 4)
+                ffi_all = data_all["firstFrameIndex"][0] % N_samples
+                tones_all, dc_mean_all, raw_std_all, raw_all = {}, {}, {}, {}
+                for ch_k in channel_keys(data_all):
+                    d_ch = average_records(data_all[ch_k], N_samples, n_avg_all, ffi_all)
+                    tones_all[ch_k] = scipy.fft.rfft(d_ch)[f_sch_idx] * np.exp(-1j * phases)
+                    dc_mean_all[ch_k] = float(np.mean(d_ch))
+                    raw_std_all[ch_k] = float(np.std(np.asarray(data_all[ch_k], dtype=float)))
+                    if p.get("save_raw_all", False):
+                        raw_all[ch_k] = d_ch.astype(np.float32)
+
                 # 0 V Calibration & Superconducting Transfer Function Health Check
                 if np.isclose(bias, 0.0):
                     self.log_signal.emit("INFO", "Evaluating Superconducting (0 V) Transfer Function...")
@@ -928,9 +942,11 @@ class CZWorker(QThread):
                 model_sign = -1.0 if flip_bias else 1.0
                 # Invert unrolled response if flip_bias is True so Re(Z) is positive at DC
                 fft_unroll = model_sign * raw_unroll
+                # Same readout delay for every channel (one DAQ pipeline), from the 0 V calibration of this channel
+                unroll_all = {k: model_sign * v * np.exp(-2j * np.pi * fs_sch * applied_tau_shift) for k, v in tones_all.items()}
 
                 # Save step data
-                bias_str = f"{bias:.2f}".replace(".", "v")
+                bias_str = f"{bias:.3f}".replace(".", "v")
                 bias_dir = base_dir / f"bias_{bias_str}"
                 bias_dir.mkdir(parents=True, exist_ok=True)
 
@@ -948,6 +964,13 @@ class CZWorker(QThread):
                     flip_bias=flip_bias,
                     channel=p.get("channel", 63),
                     f_roll=f_roll if f_roll is not None else np.nan,
+                    # all channels (dicts keyed 'chanNN'; load with allow_pickle=True), read by data_io by channel id
+                    channels=np.array([int(k[4:]) for k in unroll_all], dtype=int),
+                    fft_real=np.array({k: v.real for k, v in unroll_all.items()}, dtype=object),
+                    fft_imag=np.array({k: v.imag for k, v in unroll_all.items()}, dtype=object),
+                    dc_mean_all=np.array(dc_mean_all, dtype=object),
+                    raw_std_all=np.array(raw_std_all, dtype=object),
+                    **({"raw_all": np.array(raw_all, dtype=object)} if p.get("save_raw_all", False) else {}),
                 )
 
                 plot_data = {

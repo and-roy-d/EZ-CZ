@@ -839,7 +839,7 @@ def main():
             # Same readout delay for every channel (one DAQ pipeline), taken from the 0 V calibration of --channel
             unroll_all = {k: model_sign * v * np.exp(-2j * np.pi * all_freqs * applied_tau) for k, v in tones_all.items()}
 
-            bias_str = f"{bias:.2f}".replace(".", "v")
+            bias_str = f"{bias:.3f}".replace(".", "v")
             bias_dir = base_dir / f"bias_{bias_str}"
             bias_dir.mkdir(parents=True, exist_ok=True)
 
